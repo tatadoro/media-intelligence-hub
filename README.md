@@ -28,11 +28,49 @@
 - `requirements.txt` — список Python-зависимостей проекта
 - `venv/` — виртуальное окружение (не хранится в git)
 
+
+## Формат сырых данных (data/raw)
+
+Файлы `data/raw/articles_*.json` содержат список объектов (JSON-массив), каждый объект — одна статья/новость со следующими полями:
+
+- `id` — идентификатор записи (если в RSS есть `id`, иначе используется ссылка `link`);
+- `title` — заголовок статьи;
+- `link` — ссылка на исходный материал;
+- `published_at` — дата и время публикации (как отданы в RSS: `published` или `updated`);
+- `source` — название источника (например, `lenta.ru`);
+- `raw_text` — исходный текст/аннотация из RSS (`summary` или `description`).
+
 ### Templates
 Папка `templates/` будет использоваться для шаблонов:
 - отчетов (например, Jinja2 для HTML/Markdown),
 - SQL-запросов,
 - текстов/конфигов, которые переиспользуются.
+
+### Установка и запуск
+
+1. Клонировать репозиторий:
+
+```bash
+git clone https://github.com/<user>/media-intelligence-hub-.git
+cd media-intelligence-hub-
+```
+	2.	Создать и активировать виртуальное окружение (пример для Unix/macOS):
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+	3.	Установить зависимости:
+```bash
+pip install -r requirements.txt
+```
+Запустить первый сбор данных из RSS:
+```bash
+python -m src.collectors.rss_collector
+```
+После успешного запуска в папке data/raw появится файл вида:
+```bash
+data/raw/articles_YYYYMMDD_HHMMSS.json
+```
 
 ### Работа с проектом на нескольких устройствах
 

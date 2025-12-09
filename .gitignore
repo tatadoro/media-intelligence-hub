@@ -29,3 +29,6 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+
+# raw_data from parser
+data/raw/
