@@ -54,12 +54,12 @@
 git clone https://github.com/<user>/media-intelligence-hub-.git
 cd media-intelligence-hub-
 ```
-	2.	Создать и активировать виртуальное окружение (пример для Unix/macOS):
+2.	Создать и активировать виртуальное окружение (пример для Unix/macOS):
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 ```
-	3.	Установить зависимости:
+3.	Установить зависимости:
 ```bash
 pip install -r requirements.txt
 ```
