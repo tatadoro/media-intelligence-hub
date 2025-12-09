@@ -1,2 +1,31 @@
-# Ignore virtual environment
+# Virtual environment
 venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# IDE and editor settings
+.vscode/
+.idea/
+
+# macOS system files
+.DS_Store
+
+# Temporary files
+*.log
+*.tmp
+
+# Environment and secret files
+.env
+*.env
+
+# Build and distribution artifacts
+build/
+dist/
+*.egg-info/
