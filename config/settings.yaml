@@ -1,0 +1,4 @@
+project_name: "Media Intelligence Hub"
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
