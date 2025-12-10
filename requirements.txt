@@ -1,3 +1,5 @@
 PyYAML==6.0.3
 feedparser
 pandas
+boto3
+python-dotenv

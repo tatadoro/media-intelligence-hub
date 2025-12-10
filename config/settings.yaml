@@ -1,4 +1,13 @@
 project_name: "Media Intelligence Hub"
+
 data:
   raw_dir: "data/raw"
   processed_dir: "data/processed"
+
+storage:
+  type: "minio"   # в будущем тут можно сделать "local", "s3", "gcs" и т.д.
+
+  minio:
+    endpoint: "http://localhost:9000"
+    bucket: "media-intel"
+    region: "us-east-1"

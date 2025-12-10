@@ -40,6 +40,16 @@
 - `source` — название источника (например, `lenta.ru`);
 - `raw_text` — исходный текст/аннотация из RSS (`summary` или `description`).
 
+### Хранилище данных (Data Lake на MinIO)
+
+Сырые данные новостей (RSS) сохраняются в S3-совместимое хранилище MinIO.
+
+- Бакет: `media-intel`
+- Структура raw-зоны: `raw/<YYYY-MM-DD>/<source_name>/articles_<YYYYMMDD_HHMMSS>.json`
+- Пример: `raw/2025-12-10/lenta.ru/articles_20251210_123456.json`
+
+Параметры доступа к MinIO задаются в `config/settings.yaml` и `config/.env` (последний не хранится в Git).
+
 ### Templates
 Папка `templates/` будет использоваться для шаблонов:
 - отчетов (например, Jinja2 для HTML/Markdown),
