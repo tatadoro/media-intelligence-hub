@@ -3,11 +3,19 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
 from src.utils.s3_client import upload_json_bytes, MINIO_BUCKET
-
+import json
+import yaml
 import feedparser
 import pandas as pd
 
+# Путь к корню проекта: .../media_intel_hub
+BASE_DIR = Path(__file__).resolve().parents[2]
+SETTINGS_PATH = BASE_DIR / "config" / "settings.yaml"
 
+def load_settings() -> dict:
+    """Читает настройки проекта из config/settings.yaml."""
+    with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 # Один источник на День 2: RSS новостей Lenta.ru
 RSS_URL = "https://lenta.ru/rss/news"
@@ -54,26 +62,28 @@ def feed_to_dataframe(feed, source_name: str = SOURCE_NAME) -> pd.DataFrame:
     return df
 
 
-def save_dataframe_to_json(
-    df: pd.DataFrame,
-    folder: str = "data/raw",
-) -> Path:
+def save_dataframe_to_json(df: pd.DataFrame, raw_dir_cfg: str | None = None) -> str:
     """
-    Сохраняет DataFrame в JSON-файл вида
-    data/raw/articles_YYYYMMDD_HHMMSS.json
-    и возвращает путь к файлу.
+    Сохраняет DataFrame с сырыми статьями в локальный JSON.
+
+    :param df: данные со статьями
+    :param raw_dir_cfg: относительный путь к каталогу raw из конфига (например, "data/raw").
+                        Если не задан, используется значение по умолчанию "data/raw".
+    :return: путь к сохранённому файлу в виде строки
     """
-    folder_path = Path(folder)
-    folder_path.mkdir(parents=True, exist_ok=True)
+    if raw_dir_cfg is None:
+        raw_dir_cfg = "data/raw"
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = folder_path / f"articles_{ts}.json"
+    # Каталог относительно корня проекта
+    raw_dir = BASE_DIR / raw_dir_cfg
+    raw_dir.mkdir(parents=True, exist_ok=True)
 
-    # orient="records" — список объектов
-    # force_ascii=False — чтобы кириллица не была \u043f\u0440\u0438...
-    df.to_json(filename, orient="records", force_ascii=False)
+    ts_str = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = raw_dir / f"articles_{ts_str}.json"
 
-    return filename
+    df.to_json(filename, orient="records", force_ascii=False, indent=2)
+
+    return str(filename)
 
 def save_raw_to_s3(df: pd.DataFrame, source_name: str) -> str:
     """
@@ -93,8 +103,18 @@ def save_raw_to_s3(df: pd.DataFrame, source_name: str) -> str:
 
     return key
 
-def main():
+def main() -> None:
+    # Загружаем настройки
+    settings = load_settings()
+    storage_cfg = settings.get("storage", {})
+    data_cfg = settings.get("data", {})
+
+    raw_backend = storage_cfg.get("raw_backend", "s3")
+    raw_dir_cfg = data_cfg.get("raw_dir", "data/raw")
+
+    print(f"[CONFIG] RAW backend = {raw_backend}")
     print(f"Fetching RSS from {RSS_URL} ...")
+
     feed = fetch_rss()
 
     print("Converting feed to DataFrame ...")
@@ -105,15 +125,19 @@ def main():
         print("No items to save, exiting.")
         return
 
-    # 1) Сохраняем в MinIO (raw-зона Data Lake)
-    print("Saving raw data to MinIO (S3)...")
-    key = save_raw_to_s3(df, source_name=SOURCE_NAME)
-    print(f"Saved {len(df)} items to s3://{MINIO_BUCKET}/{key}")
+    # Ветвление по конфигу: куда писать сырые данные
+    if raw_backend in ("s3", "both"):
+        print("Saving raw data to MinIO (S3)...")
+        key = save_raw_to_s3(df, source_name=SOURCE_NAME)
+        print(f"Saved {len(df)} items to s3://{MINIO_BUCKET}/{key}")
 
-    # 2) По желанию — локальный бэкап в data/raw
-    print("Saving local backup JSON ...")
-    filename = save_dataframe_to_json(df)
-    print(f"Saved local copy with {len(df)} items to {filename}")
+    if raw_backend in ("local", "both"):
+        print("Saving local backup JSON ...")
+        filename = save_dataframe_to_json(df, raw_dir_cfg)
+        print(f"Saved local copy with {len(df)} items to {filename}")
+
+    if raw_backend not in ("s3", "local", "both"):
+        print(f"[WARN] Unknown raw_backend='{raw_backend}', nothing was saved.")
 
 
 if __name__ == "__main__":
