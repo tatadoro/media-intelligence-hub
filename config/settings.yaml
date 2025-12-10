@@ -5,7 +5,14 @@ data:
   processed_dir: "data/processed"
 
 storage:
-  type: "minio"   # в будущем тут можно сделать "local", "s3", "gcs" и т.д.
+  # Тип хранилища для проекта в целом (пока используем MinIO)
+  type: "minio"
+
+  # Куда сохранять сырые данные:
+  # - "s3"    — только в S3/MinIO
+  # - "local" — только в локальную папку data/raw
+  # - "both"  — и в S3, и локально
+  raw_backend: "s3"
 
   minio:
     endpoint: "http://localhost:9000"
