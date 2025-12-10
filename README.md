@@ -50,6 +50,59 @@
 
 Параметры доступа к MinIO задаются в `config/settings.yaml` и `config/.env` (последний не хранится в Git).
 
+### Настройка S3 / MinIO (Data Lake)
+
+Проект использует S3-совместимое хранилище (MinIO) для хранения сырых данных (raw layer).  
+Все реальные ключи и пароли хранятся только локально в `.env` и не попадают в репозиторий.
+
+#### 1. Запуск MinIO в Docker
+
+Установите Docker и запустите MinIO, указав свои логин и пароль:
+
+```bash
+docker run -d \
+  --name minio \
+  -p 9000:9000 \
+  -p 9001:9001 \
+  -e "MINIO_ROOT_USER=<YOUR_MINIO_USER>" \
+  -e "MINIO_ROOT_PASSWORD=<YOUR_MINIO_PASSWORD>" \
+  minio/minio server /data --console-address ":9001"
+```
+	•	S3-эндпоинт: http://localhost:9000
+	•	Веб-консоль MinIO: http://localhost:9001
+
+Логин и пароль задаются только на вашей машине и не должны попадать в Git.
+
+2. Создание бакета для проекта
+Проект ожидает бакет с именем media-intel.
+
+Через веб-консоль MinIO:
+	1.	Откройте http://localhost:9001
+	2.	Авторизуйтесь с вашим логином/паролем
+	3.	Создайте бакет media-intel
+
+Либо через MinIO Client (mc):
+
+```bash
+# добавить алиас для локального MinIO
+mc alias set local http://localhost:9000 <YOUR_MINIO_USER> <YOUR_MINIO_PASSWORD>
+
+# создать бакет
+mc mb local/media-intel
+```
+3. Локальный .env с настройками S3
+Для подключения к MinIO проект использует файл окружения (например, config/.env), который добавлен в .gitignore и не коммитится.
+
+Пример содержимого (со своими значениями):
+```bash
+MINIO_ENDPOINT=http://localhost:9000
+MINIO_ACCESS_KEY=<YOUR_MINIO_USER>
+MINIO_SECRET_KEY=<YOUR_MINIO_PASSWORD>
+MINIO_BUCKET=media-intel
+MINIO_REGION=us-east-1
+MINIO_SECURE=false
+```
+
 ### Templates
 Папка `templates/` будет использоваться для шаблонов:
 - отчетов (например, Jinja2 для HTML/Markdown),
