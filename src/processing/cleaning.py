@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from typing import Iterable
-
+import html
 import pandas as pd
 from bs4 import BeautifulSoup
 
@@ -15,22 +15,32 @@ def clean_html(raw_html: str) -> str:
     2. Парсим HTML через BeautifulSoup.
     3. Удаляем теги <script> и <style>.
     4. Достаём текст.
-    5. Нормализуем пробелы и переносы строк.
+    5. Раскодируем HTML-сущности (&nbsp; и т.п.).
+    6. Чистим пробелы вокруг знаков препинания.
+    7. Нормализуем пробельные символы.
     """
+    # 1. Пустые значения
     if not isinstance(raw_html, str) or not raw_html.strip():
         return ""
 
-    # Парсим HTML
+    # 2. Парсим HTML
     soup = BeautifulSoup(raw_html, "html.parser")
 
-    # Удаляем скрипты и стили
+    # 3. Удаляем скрипты и стили
     for tag in soup(["script", "style"]):
         tag.decompose()
 
-    # Получаем текст, между блоками ставим пробел
+    # 4. Получаем текст, между блоками ставим пробел
     text = soup.get_text(separator=" ")
 
-    # Заменяем любые последовательности пробельных символов на один пробел
+    # 5. Раскодируем HTML-сущности (&nbsp;, &amp; и т.п.)
+    text = html.unescape(text)
+
+    # 6. Убираем пробелы перед знаками препинания
+    # "слово , слово" -> "слово, слово"
+    text = re.sub(r"\s+([,.!?;:])", r"\1", text)
+
+    # 7. Нормализуем пробельные символы (переносы, табы, множественные пробелы)
     text = re.sub(r"\s+", " ", text)
 
     # Обрезаем пробелы по краям
