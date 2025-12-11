@@ -32,3 +32,4 @@ dist/
 
 # raw_data from parser
 data/raw/
+data/silver/
