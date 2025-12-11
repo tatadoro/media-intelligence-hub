@@ -6,3 +6,10 @@ pyarrow
 boto3
 python-dotenv
 beautifulsoup4
+pymorphy2
+pymorphy2-dicts-ru
+tabulate
+numpy
+matplotlib
+jupiter
+ipykernel
