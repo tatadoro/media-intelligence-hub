@@ -8,6 +8,79 @@ import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+# Попробуем подключить pymorphy2 для лемматизации
+try:
+    import pymorphy2
+    _MORPH = pymorphy2.MorphAnalyzer()
+except ImportError:
+    _MORPH = None
+
+
+# Простейший токенайзер: берем слова из русских/латинских букв и цифр
+_TOKEN_REGEX = re.compile(r"\b[а-яёa-z0-9]+\b", re.IGNORECASE)
+
+
+# Небольшой набор русских стоп-слов (можно потом расширить)
+RU_STOPWORDS = {
+    "и", "но", "или", "а", "же", "то", "что", "чтобы",
+    "как", "так", "также",
+    "в", "на", "к", "от", "по", "из", "у", "за", "для",
+    "о", "об", "про", "при", "над", "под", "между",
+    "же", "ли", "бы", "же",
+    "это", "этот", "эта", "эти", "того", "этого", "тому",
+    "он", "она", "оно", "они", "мы", "вы", "ты",
+    "тот", "та", "те", "который", "которые", "какой",
+    "свой", "наш", "ваш", "их", "его", "ее",
+    "там", "тут", "здесь", "сюда", "туда",
+    "где", "когда", "пока", "уже", "еще",
+    "да", "нет",
+}
+
+
+def _lemmatize_token(token: str) -> str:
+    """
+    Приводим слово к начальной форме, если доступен pymorphy2.
+    Если нет — возвращаем как есть.
+    """
+    if _MORPH is None:
+        return token
+    p = _MORPH.parse(token)
+    if not p:
+        return token
+    return p[0].normal_form
+
+
+def normalize_for_tfidf(text: str) -> str:
+    """
+    Подготовка текста для TF-IDF:
+    - приводим к нижнему регистру,
+    - разбиваем на токены (слова),
+    - лемматизируем,
+    - выкидываем стоп-слова и очень короткие токены.
+    Возвращаем строку с токенами через пробел.
+    """
+    if not isinstance(text, str):
+        return ""
+
+    text = text.lower()
+    tokens = _TOKEN_REGEX.findall(text)
+
+    norm_tokens: list[str] = []
+    for token in tokens:
+        if token in RU_STOPWORDS:
+            continue
+
+        lemma = _lemmatize_token(token)
+        if lemma in RU_STOPWORDS:
+            continue
+
+        # отсечем совсем короткие штуки типа "с", "в", "на"
+        if len(lemma) <= 2:
+            continue
+
+        norm_tokens.append(lemma)
+
+    return " ".join(norm_tokens)
 
 # --- 1. Разбиение текста на предложения ---
 
@@ -75,44 +148,49 @@ def extract_keywords_tfidf(
     Принимает список текстов (по одному на документ) и
     возвращает для каждого документа список ключевых слов (top_k по TF-IDF).
 
-    texts[i] -> [kw1, kw2, ..., kw_top_k]
+    Перед TF-IDF:
+    - нормализуем текст (лемматизация + удаление стоп-слов),
+    - считаем TF-IDF по нормализованным токенам.
     """
     cleaned_texts = [
         t if isinstance(t, str) else ""
         for t in texts
     ]
 
-    # Базовый TF-IDF без стоп-слов и лемматизации (это можно будет добавить позднее)
+    # Нормализуем тексты для TF-IDF
+    normalized_texts = [normalize_for_tfidf(t) for t in cleaned_texts]
+
+    # Если все тексты пустые после нормализации — возвращаем пустые списки
+    if all(not nt for nt in normalized_texts):
+        return [[] for _ in normalized_texts]
+
     vectorizer = TfidfVectorizer(
         max_features=max_features,
-        ngram_range=(1, 2),  # учитываем униграммы и биграммы
-        lowercase=True,
+        ngram_range=(1, 2),        # униграммы и биграммы
+        lowercase=False,           # уже привели к lower
+        token_pattern=r"(?u)\b\w+\b",
     )
 
-    tfidf_matrix = vectorizer.fit_transform(cleaned_texts)
+    tfidf_matrix = vectorizer.fit_transform(normalized_texts)
     feature_names = np.array(vectorizer.get_feature_names_out())
 
     keywords_per_doc: List[List[str]] = []
 
     for row in tfidf_matrix:
-        # если в документе нет ни одной "содержательной" фичи
         if row.nnz == 0:
             keywords_per_doc.append([])
             continue
 
         row_array = row.toarray().ravel()
-        # индексы top_k самых больших значений TF-IDF
         top_indices = row_array.argsort()[-top_k:][::-1]
         top_scores = row_array[top_indices]
 
-        # отфильтруем нулевые веса (на всякий случай)
         mask = top_scores > 0
         top_terms = feature_names[top_indices][mask]
 
         keywords_per_doc.append(top_terms.tolist())
 
     return keywords_per_doc
-
 
 # --- 4. Обогащение DataFrame: silver -> gold (summary + keywords) ---
 
