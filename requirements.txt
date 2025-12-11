@@ -3,3 +3,4 @@ feedparser
 pandas
 boto3
 python-dotenv
+beautifulsoup4
