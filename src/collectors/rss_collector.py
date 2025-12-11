@@ -43,6 +43,12 @@ def feed_to_dataframe(feed, source_name: str = SOURCE_NAME) -> pd.DataFrame:
     items = []
 
     for entry in feed.entries:
+        # 1. Пытаемся взять текст: сначала summary/description, если есть
+        summary = entry.get("summary") or entry.get("description")
+
+        # 2. Если summary нет или он пустой — берём title как fallback
+        raw_text = summary or entry.get("title") or ""
+
         item = {
             # id: сначала пробуем явный id, если нет — используем ссылку
             "id": entry.get("id") or entry.get("link"),
@@ -51,10 +57,7 @@ def feed_to_dataframe(feed, source_name: str = SOURCE_NAME) -> pd.DataFrame:
             # published_at: в RSS бывает published или updated
             "published_at": entry.get("published") or entry.get("updated"),
             "source": source_name,
-            # raw_text: берём summary / description, что есть
-            "raw_text": entry.get("summary")
-            or entry.get("description")
-            or "",
+            "raw_text": raw_text,
         }
         items.append(item)
 
