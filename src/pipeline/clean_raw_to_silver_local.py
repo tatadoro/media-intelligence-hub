@@ -1,12 +1,25 @@
 from __future__ import annotations
-
 from pathlib import Path
 import json
-
 import pandas as pd
-
 from src.processing.cleaning import clean_articles_df
+import argparse
+from typing import Optional
 
+
+def find_latest_raw_file(raw_dir: Path) -> Path:
+    """
+    Находит самый новый raw-файл формата articles_*.json в каталоге raw_dir.
+
+    Критерий "самый новый" — по времени модификации файла (mtime).
+    Если файлов нет, поднимает FileNotFoundError.
+    """
+    candidates = list(raw_dir.glob("articles_*.json"))
+    if not candidates:
+        raise FileNotFoundError(f"Не найдено ни одного файла articles_*.json в {raw_dir}")
+
+    latest = max(candidates, key=lambda p: p.stat().st_mtime)
+    return latest
 
 def transform_raw_to_silver(input_path: Path, output_path: Path) -> None:
     """
@@ -63,13 +76,54 @@ def build_output_path_from_input(input_path: Path) -> Path:
     return silver_dir / filename_clean
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """
+    Точка входа для шага raw -> silver.
+
+    Запуск:
+      - с явным input:
+          python -m src.pipeline.clean_raw_to_silver_local \
+              --input data/raw/articles_20251211_153500.json
+
+      - без input (возьмёт последний raw-файл в data/raw):
+          python -m src.pipeline.clean_raw_to_silver_local
+    """
+    parser = argparse.ArgumentParser(
+        description="Преобразование raw JSON-файла сarticleями в silver-слой "
+                    "(добавление clean_text)."
+    )
+    parser.add_argument(
+        "-i",
+        "--input",
+        type=str,
+        help="Путь к raw JSON-файлу (от корня проекта или абсолютный). "
+             "Если не указан, будет использован последний файл в data/raw.",
+    )
+
+    args = parser.parse_args()
+
     project_root = Path(__file__).resolve().parents[2]
+    raw_dir = project_root / "data" / "raw"
 
-    # ВАЖНО: тут подставь реальное имя raw-файла, который у тебя уже лежит в data/raw
-    input_file = project_root / "data" / "raw" / "articles_20251210_153232.json"
+    if args.input:
+        input_path = Path(args.input)
+        # если путь относительный — считаем его от корня проекта
+        if not input_path.is_absolute():
+            input_path = project_root / input_path
+    else:
+        input_path = find_latest_raw_file(raw_dir)
+        print(f"[INFO] input не указан, используем последний raw-файл: {input_path}")
 
-    output_file = build_output_path_from_input(input_file)
+    output_path = build_output_path_from_input(input_path)
 
-    transform_raw_to_silver(input_file, output_file)
-    print(f"Готово. Очищенные данные сохранены в {output_file}")
+    print(f"[INFO] Преобразуем raw -> silver")
+    print(f"       raw:    {input_path}")
+    print(f"       silver: {output_path}")
+
+    transform_raw_to_silver(input_path, output_path)
+
+    print(f"[OK] Готово. Очищенные данные сохранены в {output_path}")
+
+
+if __name__ == "__main__":
+    main()
