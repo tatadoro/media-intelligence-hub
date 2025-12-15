@@ -23,20 +23,15 @@ __pycache__/
 
 # Environment and secret files
 .env
-*.env
+.env.*
+!.env.example
 
 # Build and distribution artifacts
 build/
 dist/
 *.egg-info/
 
-# raw_data from parser
-data/raw/
-data/silver/
-data/gold/
-
-
-# local data/artifacts
-/data/
+# Local data/artifacts (do not commit)
+data/
 *_backup*
-*.tsv
+load_log_backup.tsv

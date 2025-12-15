@@ -15,6 +15,6 @@ storage:
   raw_backend: "s3"
 
   minio:
-    endpoint: "http://localhost:9000"
-    bucket: "media-intel"
-    region: "us-east-1"
+    endpoint: ${MINIO_ENDPOINT:-"http://localhost:9000"}
+    bucket: ${MINIO_BUCKET:-"media-intel"}
+    region: ${MINIO_REGION:-"us-east-1"}

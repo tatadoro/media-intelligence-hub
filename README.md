@@ -3,372 +3,184 @@
 Учебный пет-проект на стыке Data Analytics и Data Science.
 
 Цель: построить автоматизированный пайплайн мониторинга медиа:
-- сбор статей и материалов из разных источников (RSS, API, парсеры);
-- сохранение данных в Data Lake (S3);
-- очистка текстов и извлечение ключевой информации;
-- суммаризация и базовая NLP-обработка;
+- сбор материалов из разных источников (RSS / API / парсеры);
+- хранение данных в Data Lake (S3/MinIO) и локально;
+- очистка текста и извлечение ключевой информации;
+- семантическое обогащение (summary, keywords, фичи);
 - загрузка витрин в ClickHouse;
-- визуализация в Superset и DataLens;
-- формирование ежедневного отчета и отправка на почту.
+- аналитика/дашборды (Superset, DataLens) и ежедневные отчёты (в планах).
 
-Технологии (планируемые):
-- Python, pandas
-- S3 / MinIO (Data Lake)
-- ClickHouse
-- Apache Airflow
-- Apache Superset
-- Yandex DataLens
+Статус: **MVP в разработке** (raw → silver → gold → ClickHouse + базовые SQL-проверки).
 
-## Структура проекта
-
-- `src/` — исходный код проекта (основная логика)
-- `config/` — файлы конфигурации (пути к данным, параметры запуска и т.д.)
-- `data/` — данные (сырые и обработанные, большие файлы в git не добавляем)
-- `notebooks/` — Jupyter-ноутбуки для экспериментов и исследования данных
-- `templates/` — шаблоны (репорты, SQL, Jinja2 и т.п.)
-- `requirements.txt` — список Python-зависимостей проекта
-- `venv/` — виртуальное окружение (не хранится в git)
+## Что уже реализовано (MVP)
+- Ingestion RSS → raw (локально и/или MinIO)
+- Raw → Silver: очистка текста
+- Silver → Gold: summary + keywords (TF-IDF), текстовые фичи
+- Gold → ClickHouse: загрузка витрин локально
+- SQL-набор для healthcheck/quality/keywords/дедупликации и аналитики в `sql/`
+- EDA-ноутбук по gold-слою: `notebooks/03_gold_eda.ipynb`
 
 ## Архитектура пайплайна
-
-Пайплайн данных в проекте построен по многоуровневой схеме: **raw → silver → gold → витрины/BI**.
-
-### Сбор данных (коллектор RSS)
-
-Первый шаг — сбор материалов из внешних источников. Сейчас реализован один источник:
-
-- `src/collectors/rss_collector.py`:
-  - `fetch_rss()` — скачивает RSS-ленту (например, новости `lenta.ru`).
-  - `feed_to_dataframe()` — превращает RSS-ленту в `pandas.DataFrame` с базовыми полями:
-    - `id` — идентификатор записи (id из RSS или ссылка),
-    - `title` — заголовок,
-    - `link` — ссылка на материал,
-    - `published_at` — время публикации/обновления,
-    - `source` — имя источника,
-    - `raw_text` — сырой текст из фида (summary/description или заголовок — в зависимости от возможностей источника).
-  - `main()` — точка входа, читает настройки из `config/settings.yaml` и сохраняет сырые данные:
-    - локально в `data/raw/...`,
-    - и/или в MinIO (S3-совместимое хранилище) в префикс `raw/...` — в зависимости от параметра `storage.raw_backend`.
-
-### Raw-слой
-
-**Raw-зона** — минимально обработанные данные «как пришли» из источника.
-
-- Локально: `data/raw/*.json`
-- В MinIO: `raw/YYYY-MM-DD/<source_name>/articles_YYYYMMDD_HHMMSS.json`
-
-Формат файла:
-
-- JSON-массив словарей, каждая запись — одна статья/элемент ленты.
-- На этом уровне могут присутствовать HTML-разметка, дубликаты, мусорные поля — никаких «умных» преобразований здесь не делается.
-
-Raw-слой нужен для:
-
-- воспроизводимости (можно переиграть весь пайплайн с нуля),
-- отладки следующих шагов обработки,
-- подключения новых витрин/моделей без повторного запроса к внешним API.
-
-### Silver-слой (очистка текста)
-
-**Silver-зона** — следующий уровень, где данные уже приведены к более аккуратному виду и готовы к дальнейшей NLP-обработке и моделям.
-
-Очистка реализована на двух уровнях:
-
-- `src/processing/cleaning.py`:
-  - `clean_html(text: str) -> str` — удаляет HTML-теги, скрипты/стили, нормализует пробелы.
-  - `clean_articles_df(df: pd.DataFrame, text_column="raw_text", new_column="clean_text") -> pd.DataFrame` — добавляет к DataFrame колонку с очищенным текстом.
-
-- `src/pipeline/clean_raw_to_silver_local.py`:
-  - читает raw-файл из `data/raw/...`,
-  - превращает его в `DataFrame`,
-  - вызывает `clean_articles_df(...)`,
-  - сохраняет результат в `data/silver/...` с суффиксом `_clean.json`.
-
-Пример:
-
-- вход: `data/raw/articles_20251211_153500.json`
-- выход: `data/silver/articles_20251211_153500_clean.json`
-
-На уровне silver у записей появляются поля:
-
-- `raw_text` — исходный текст из источника (как есть),
-- `clean_text` — очищенный текст, пригодный для дальнейшей NLP-обработки, суммаризации и моделей.
-
-### Gold-слой (семантическое обогащение: summary + keywords)
-
-**Gold-зона** — слой, где к очищенным текстам добавляется смысловое обогащение:
-краткие саммари и ключевые слова/фразы. Это уже витрина, пригодная для
-аналитики, дашбордов и дальнейших ML-моделей.
-
-Обогащение реализовано в модуле:
-
-- `src/processing/summarization.py`:
-  - `split_into_sentences(text: str) -> list[str]` — разбивает текст на предложения,
-  - `extractive_summary(text: str, ...) -> str` — простая extractive-саммаризация
-    (берём первые 1–3 предложения с ограничением по длине),
-  - `extract_keywords_tfidf(texts: list[str], ...) -> list[list[str]]` — извлекает
-    ключевые слова/фразы по TF-IDF (унеграммы и биграммы) для всего корпуса текстов,
-  - `enrich_articles_with_summary_and_keywords(df: pd.DataFrame) -> pd.DataFrame` —
-    добавляет к DataFrame новые поля `nlp_text`, `summary`, `keywords` и простые
-    текстовые фичи.
-
-Для запуска шага **silver → gold** используется пайплайн-скрипт:
-
-- `src/pipeline/silver_to_gold_local.py`:
-  - читает silver-файл из `data/silver/...` (JSON/CSV/Parquet),
-  - загружает его в `DataFrame`,
-  - вызывает `enrich_articles_with_summary_and_keywords(...)`,
-  - сохраняет результат в `data/gold/...` в формате Parquet с суффиксом `_processed.parquet`.
-
-Пример:
-
-- вход: `data/silver/articles_20251210_155554_clean.json`
-- выход: `data/gold/articles_20251210_155554_processed.parquet`
-
-На уровне gold у записей появляются дополнительные поля:
-
-- `nlp_text` — текст, с которым работают NLP-алгоритмы:
-  - если есть полноценный `clean_text`, используется он;
-  - если `clean_text` пустой (как в RSS-ленте `lenta.ru`, где приходит только заголовок),
-    в качестве `nlp_text` берётся `title` (и в будущем может дополняться `description`),
-- `summary` — краткое саммари текста (1–3 предложения, для заголовков — фактически сам заголовок),
-- `keywords` — список ключевых слов/фраз, объединённых в строку `"слово1; слово2; ..."` —
-  это top-k n-грамм по TF-IDF для каждого документа,
-- `text_length_chars` — длина `nlp_text` в символах,
-- `num_sentences` — количество предложений в `nlp_text`,
-- `num_keywords` — число ключевых слов (после разбиения строки `keywords` по `";"`).
-
-Таким образом, gold-слой фиксирует первый уровень **семантического обогащения**: поверх сухих
-RSS-записей появляются summary и keywords, которые можно использовать:
-
-- для построения тематических срезов и топ-слов по дням/источникам,
-- для формирования текстовых дайджестов (заголовок + краткое описание тем),
-- как базовые признаки для более сложных моделей (классификация, кластеризация и т.п.).
-
-## Примеры аналитики (EDA gold-слоя)
-
-В репозитории есть пример аналитики поверх gold-слоя — ноутбук:
-
-- `notebooks/03_gold_eda.ipynb`
-
-Этот ноутбук показывает, как работать с семантически обогащёнными данными, которые формирует пайплайн
-(`nlp_text`, `summary`, `keywords` и текстовые фичи), и решает несколько задач:
-
-1. **Проверка структуры и качества gold-слоя**
-   - загрузка одного gold-файла из `data/gold/...` (формат Parquet),
-   - базовый обзор колонок и типов,
-   - описательная статистика по `text_length_chars`, `num_sentences`, `num_keywords`.
-
-2. **Анализ ключевых слов (keywords) для одного дня**
-   - преобразование строки `"слово1; слово2; ..."` в список ключевых слов,
-   - разворот (explode) `keywords_list` в "длинный" формат,
-   - расчёт топ-ключевых слов за день,
-   - визуализация самых частых ключевых слов (горизонтальные bar chart).
-
-3. **Объединение нескольких gold-файлов**
-   - загрузка всех файлов `*_processed.parquet` из `data/gold/`,
-   - извлечение даты из имени файла (например, `20251210` → `2025-12-10`) и сохранение в колонку `file_date`,
-   - объединение данных по нескольким дням в единый DataFrame.
-
-4. **Динамика ключевых слов по дням**
-   - подсчёт частот ключевых слов по дням,
-   - расчёт глобального топа ключевых слов по всему периоду,
-   - построение сводной таблицы (pivot) "день × ключевое слово",
-   - визуализация heatmap частоты ключевых слов по дням (простая реализация на matplotlib).
-
-Таким образом, ноутбук иллюстрирует типичный сценарий использования gold-слоя:
-
-- как витрины для аналитика (быстрый EDA и проверка качества признаков),
-- как прототип будущих витрин в ClickHouse / BI-инструментах (Superset, Yandex DataLens),
-- как базу для более сложных моделей (классификация, тематический анализ и т.п.).
-
-### Как запустить EDA-ноутбук
-
-1. Активировать виртуальное окружение:
-
-   ```bash
-   cd /Users/tanadorofeeva/projects/media_intel_hub
-   source venv/bin/activate
-   ```
-	2.	Запустить Jupyter Notebook:
-
-    ```bash
-   jupyter notebook
-   ```
-  3. Открыть файл notebooks/03_gold_eda.ipynb и последовательно выполнить ячейки.
-  
-### Дальнейшие шаги (в планах)
-
-- развитие **gold/feature-слоя**:
-  - дополнительные признаки поверх `nlp_text` (эмбеддинги, тематическое моделирование и т.п.),
-  - более продвинутые модели саммаризации и извлечения ключевых фраз,
-- выгрузка обработанных данных в ClickHouse (отдельные витрины для дашбордов),
-- связка с BI-инструментами (Superset, Yandex DataLens),
-- формирование ежедневных отчётов и уведомлений (дайджесты по темам, источникам, тональности).
-
-### 1. Слой сбора (ingestion)
-
-За сбор новостей отвечает модуль:
-
-- `src/collectors/rss_collector.py`
-
-Основные шаги внутри `rss_collector`:
-
-1. **Загрузка RSS-ленты**
-
-   ```python
-   feed = fetch_rss()
-   ```
-2.	**Преобразование в табличный вид**
-   ```
-   df = feed_to_dataframe(feed)
-   ```
-На этом шаге RSS-запись приводится к единому формату с полями:
-id, title, link, published_at, source, raw_text.
-3.	**Сохранение результатов**
-Логика сохранения управляется конфигом config/settings.yaml через флаг:
-   ```
-   storage:
-   raw_backend: "s3"  # варианты: "s3", "local", "both"
-   ```
-
-## Формат сырых данных
-
-Сырые данные новостей могут сохраняться:
-- локально в `data/raw/articles_*.json`;
-- и/или в S3/MinIO в бакете `media-intel` (raw-зона Data Lake).
-
-Файлы `articles_*.json` содержат список объектов (JSON-массив), каждый объект — одна статья/новость со следующими полями:
-
-- `id` — идентификатор записи (если в RSS есть `id`, иначе используется ссылка `link`);
-- `title` — заголовок статьи;
-- `link` — ссылка на исходный материал;
-- `published_at` — дата и время публикации (как отданы в RSS: `published` или `updated`);
-- `source` — название источника (например, `lenta.ru`);
-- `raw_text` — исходный текст/аннотация из RSS (`summary` или `description`).
-
-### Хранилище данных (Data Lake на MinIO)
-
-Сырые данные новостей (RSS) могут сохраняться в S3-совместимое хранилище MinIO.
-
-- Бакет: `media-intel`
-- Структура raw-зоны: `raw/<YYYY-MM-DD>/<source_name>/articles_<YYYYMMDD_HHMMSS>.json`
-- Пример: `raw/2025-12-10/lenta.ru/articles_20251210_123456.json`
-
-То, куда именно будут сохраняться данные (только локально, только в S3 или в оба места), задаётся в `config/settings.yaml`:
-
-```yaml
-data:
-  raw_dir: "data/raw"
-
-storage:
-  type: "minio"
-  # Куда сохранять сырые данные:
-  # - "s3"    — только в S3/MinIO
-  # - "local" — только в локальную папку data/raw
-  # - "both"  — и в S3, и локально
-  raw_backend: "s3"
-
-  minio:
-    endpoint: "http://localhost:9000"
-    bucket: "media-intel"
-    region: "us-east-1"
-```
-### Настройка S3 / MinIO (Data Lake)
-
-Проект использует S3-совместимое хранилище (MinIO) для хранения сырых данных (raw layer).  
-Все реальные ключи и пароли хранятся только локально в `.env` и не попадают в репозиторий.
-
-#### 1. Запуск MinIO в Docker
-
-Установите Docker и запустите MinIO, указав свои логин и пароль:
-
+Слои данных: `raw → silver → gold → ClickHouse/BI`
+
+- **raw**: данные “как пришли” (минимум преобразований)
+- **silver**: очищенный текст (готов к NLP)
+- **gold**: семантическое обогащение (summary, keywords, фичи)
+- **витрины**: загрузка в ClickHouse + SQL-проверки/аналитика
+
+### Где лежат данные
+- локально: `data/` (в git **не добавляем**)
+- в MinIO: `raw/YYYY-MM-DD/<source>/...`
+
+### Форматы данных (по слоям)
+- **raw**: `data/raw/*.json` (JSON-массив записей)
+- **silver**: `data/silver/*_clean.json` (очищенный текст)
+- **gold**: `data/gold/*_processed.parquet` (обогащённые данные)
+
+## Структура репозитория
+- `src/` — код (коллекторы, обработка, пайплайны)
+- `config/` — конфигурация (настройки запуска, параметры)
+- `sql/` — SQL для ClickHouse (проверки качества, аналитика)
+- `scripts/` — вспомогательные скрипты
+- `notebooks/` — EDA/эксперименты
+- `data/` — локальные данные (не коммитятся)
+- `docker-compose.yml` — локальная инфраструктура (MinIO/ClickHouse)
+- `Makefile` — удобные команды для запуска типовых действий (если используется)
+- `requirements.txt` — зависимости Python
+
+## Требования
+- Python 3.11+
+- Docker (для MinIO/ClickHouse)
+
+## Быстрый старт (локально)
 ```bash
-docker run -d \
-  --name minio \
-  -p 9000:9000 \
-  -p 9001:9001 \
-  -e "MINIO_ROOT_USER=<YOUR_MINIO_USER>" \
-  -e "MINIO_ROOT_PASSWORD=<YOUR_MINIO_PASSWORD>" \
-  minio/minio server /data --console-address ":9001"
+git clone https://github.com/tatadoro/media-intelligence-hub-.git
+cd media-intelligence-hub-
+
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# создать локальный env-файл из шаблона (если добавлен в репо)
+cp .env.example .env
+
+# поднять сервисы (MinIO/ClickHouse)
+docker compose up -d
+docker compose ps
 ```
-	•	S3-эндпоинт: http://localhost:9000
-	•	Веб-консоль MinIO: http://localhost:9001
 
-Логин и пароль задаются только на вашей машине и не должны попадать в Git.
+### Проверка сервисов
+- MinIO S3 endpoint: `http://localhost:9000`
+- MinIO Console: `http://localhost:9001`
+- ClickHouse HTTP: `http://localhost:8123`
 
-2. Создание бакета для проекта
-Проект ожидает бакет с именем media-intel.
+## Конфигурация и переменные окружения
 
-Через веб-консоль MinIO:
-	1.	Откройте http://localhost:9001
-	2.	Авторизуйтесь с вашим логином/паролем
-	3.	Создайте бакет media-intel
+Секреты не коммитятся. Локально создай файл `.env` (он должен быть в `.gitignore`).
+В репозитории хранится только шаблон `.env.example`.
 
-Либо через MinIO Client (mc):
-
+### Переменные окружения (пример)
 ```bash
-# добавить алиас для локального MinIO
-mc alias set local http://localhost:9000 <YOUR_MINIO_USER> <YOUR_MINIO_PASSWORD>
-
-# создать бакет
-mc mb local/media-intel
-```
-3. Локальный .env с настройками S3
-Для подключения к MinIO проект использует файл окружения (например, config/.env), который добавлен в .gitignore и не коммитится.
-
-Пример содержимого (со своими значениями):
-```bash
+# MinIO / S3
 MINIO_ENDPOINT=http://localhost:9000
-MINIO_ACCESS_KEY=<YOUR_MINIO_USER>
-MINIO_SECRET_KEY=<YOUR_MINIO_PASSWORD>
+MINIO_ACCESS_KEY=YOUR_MINIO_USER
+MINIO_SECRET_KEY=YOUR_MINIO_PASSWORD
 MINIO_BUCKET=media-intel
 MINIO_REGION=us-east-1
 MINIO_SECURE=false
+
+# ClickHouse
+CLICKHOUSE_HOST=localhost
+CLICKHOUSE_PORT=8123
+CLICKHOUSE_USER=default
+CLICKHOUSE_PASSWORD=YOUR_CLICKHOUSE_PASSWORD
+CLICKHOUSE_DATABASE=default
 ```
 
-### Templates
-Папка `templates/` будет использоваться для шаблонов:
-- отчетов (например, Jinja2 для HTML/Markdown),
-- SQL-запросов,
-- текстов/конфигов, которые переиспользуются.
+В `config/settings.yaml` управляется, куда писать raw-данные:
+- `raw_backend: local | s3 | both`
 
-### Установка и запуск
+## MinIO: бакет для проекта
+Проект ожидает бакет `media-intel` (или значение из `MINIO_BUCKET` / `config/settings.yaml`).
 
-1. Клонировать репозиторий:
+Способ 1: через MinIO Console
+1) открой `http://localhost:9001`
+2) зайди под своими кредами
+3) создай бакет `media-intel`
 
+Способ 2: через MinIO Client (если установлен `mc`)
 ```bash
-git clone https://github.com/<user>/media-intelligence-hub-.git
-cd media-intelligence-hub-
+mc alias set local http://localhost:9000 YOUR_MINIO_USER YOUR_MINIO_PASSWORD
+mc mb local/media-intel
 ```
-2.	Создать и активировать виртуальное окружение (пример для Unix/macOS):
-```bash
-python3 -m venv venv
-source venv/bin/activate
-```
-3.	Установить зависимости:
-```bash
-pip install -r requirements.txt
-```
-Запустить первый сбор данных из RSS:
+
+## Запуск пайплайна
+
+### 1 Сбор RSS → raw
 ```bash
 python -m src.collectors.rss_collector
 ```
-После успешного запуска в папке data/raw появится файл вида:
+
+### 2 raw → silver (очистка)
 ```bash
-data/raw/articles_YYYYMMDD_HHMMSS.json
+python -m src.pipeline.clean_raw_to_silver_local --input data/raw/<raw_file>.json
 ```
 
-### Работа с проектом на нескольких устройствах
+### 3 silver → gold (summary + keywords)
+```bash
+python -m src.pipeline.silver_to_gold_local --input data/silver/<silver_file>.json
+```
 
-1. Перед началом работы на любом устройстве:
-   - перейти в папку проекта;
-   - активировать виртуальное окружение;
-   - выполнить `git pull`.
+### 4 gold → ClickHouse
+```bash
+python -m src.pipeline.gold_to_clickhouse_local --input data/gold/<gold_file>.parquet
+```
 
-2. После окончания работы:
-   - проверить изменения через `git status`;
-   - сделать `git add` и `git commit`;
-   - выполнить `git push`.
+Примечание: если при первой загрузке в ClickHouse не хватает таблиц/вьюх, выполни подготовительные SQL-скрипты из `sql/` (в первую очередь `sql/00_views.sql`, если он используется в твоей схеме).
 
-Таким образом изменения синхронизируются через GitHub.
+## SQL: проверки качества и аналитика (ClickHouse)
+
+Файлы в `sql/` предназначены для контроля качества и аналитики поверх загруженных данных.
+
+Рекомендуемый порядок:
+1) `sql/00_views.sql` (если используются вьюхи/представления)
+2) `sql/01_healthcheck.sql`
+3) `sql/02_content_quality.sql`
+4) `sql/03_top_keywords.sql`
+5) дополнительные проверки: дедупликация и аналитика по батчам (файлы `03_*`, `05_*`, `06_*`, `07_*`)
+
+Пример запуска через `clickhouse-client`:
+```bash
+clickhouse-client --query "$(cat sql/01_healthcheck.sql)"
+```
+
+## Быстрая проверка, что всё работает
+После шага 4 (загрузка в ClickHouse) запусти:
+- `sql/01_healthcheck.sql` — базовый healthcheck по данным
+- `sql/02_content_quality.sql` — проверка качества контента
+- `sql/03_top_keywords.sql` — топ ключевых слов
+
+Если healthcheck не показывает данные, сначала проверь:
+1) что gold-файл действительно создан в `data/gold/`
+2) что загрузка в ClickHouse отработала без ошибок
+3) что подключение к ClickHouse соответствует `.env`
+
+## Примеры аналитики
+- `notebooks/03_gold_eda.ipynb` — EDA gold-слоя (keywords, динамика по дням, базовые проверки)
+
+Запуск:
+```bash
+source venv/bin/activate
+jupyter notebook
+```
+
+## Безопасность и артефакты
+- `.env` и любые секреты **не коммитятся**
+- `data/` и локальные артефакты **не коммитятся**
+
+## Roadmap
+- обогащение gold: эмбеддинги, тематическое моделирование, тональность
+- улучшение извлечения ключевых фраз и саммаризации
+- стабильные витрины ClickHouse под BI (Superset/DataLens)
+- ежедневные отчёты/уведомления (дайджесты)
+- оркестрация (Airflow) и расписания
