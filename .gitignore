@@ -35,3 +35,8 @@ data/raw/
 data/silver/
 data/gold/
 
+
+# local data/artifacts
+/data/
+*_backup*
+*.tsv
