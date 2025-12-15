@@ -1,10 +1,13 @@
 from __future__ import annotations
-from pathlib import Path
-import json
-import pandas as pd
-from src.processing.cleaning import clean_articles_df
+
 import argparse
-from typing import Optional
+import json
+import subprocess
+from pathlib import Path
+
+import pandas as pd
+
+from src.processing.cleaning import clean_articles_df
 
 
 def find_latest_raw_file(raw_dir: Path) -> Path:
@@ -18,8 +21,8 @@ def find_latest_raw_file(raw_dir: Path) -> Path:
     if not candidates:
         raise FileNotFoundError(f"Не найдено ни одного файла articles_*.json в {raw_dir}")
 
-    latest = max(candidates, key=lambda p: p.stat().st_mtime)
-    return latest
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
 
 def transform_raw_to_silver(input_path: Path, output_path: Path) -> None:
     """
@@ -28,30 +31,20 @@ def transform_raw_to_silver(input_path: Path, output_path: Path) -> None:
     input_path  — путь к сырым данным (data/raw/...json)
     output_path — путь к файлу silver (data/silver/...json)
     """
-    # 1. Читаем сырой JSON
     with input_path.open("r", encoding="utf-8") as f:
         raw_data = json.load(f)
 
-    # Ожидаем список словарей:
-    # [{"title": ..., "raw_text": ..., ...}, ...]
-
-    # 2. Превращаем в DataFrame
     df = pd.DataFrame(raw_data)
 
-    # 3. Чистим тексты
     df_clean = clean_articles_df(
         df,
-        text_column="raw_text",   # здесь важно, чтобы совпадало с тем, как колонка называется в rss_collector
+        text_column="raw_text",  # важно, чтобы совпадало с названием колонки в rss_collector
         new_column="clean_text",
     )
 
-    # 4. Назад в список словарей
     cleaned_records = df_clean.to_dict(orient="records")
 
-    # 5. Создаём папку под выходной файл, если её ещё нет
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # 6. Сохраняем в JSON
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(cleaned_records, f, ensure_ascii=False, indent=2)
 
@@ -64,7 +57,6 @@ def build_output_path_from_input(input_path: Path) -> Path:
     → data/silver/articles_20251209_212948_clean.json
     """
     filename = input_path.name
-
     if filename.endswith(".json"):
         filename_clean = filename[:-5] + "_clean.json"
     else:
@@ -72,7 +64,6 @@ def build_output_path_from_input(input_path: Path) -> Path:
 
     project_root = Path(__file__).resolve().parents[2]
     silver_dir = project_root / "data" / "silver"
-
     return silver_dir / filename_clean
 
 
@@ -89,15 +80,21 @@ def main() -> None:
           python -m src.pipeline.clean_raw_to_silver_local
     """
     parser = argparse.ArgumentParser(
-        description="Преобразование raw JSON-файла сarticleями в silver-слой "
-                    "(добавление clean_text)."
+        description="Преобразование raw JSON-файла со статьями в silver-слой (добавление clean_text)."
     )
     parser.add_argument(
         "-i",
         "--input",
         type=str,
-        help="Путь к raw JSON-файлу (от корня проекта или абсолютный). "
-             "Если не указан, будет использован последний файл в data/raw.",
+        help=(
+            "Путь к raw JSON-файлу (от корня проекта или абсолютный). "
+            "Если не указан, будет использован последний файл в data/raw."
+        ),
+    )
+    parser.add_argument(
+        "--upload-minio",
+        action="store_true",
+        help="Если указан, после сохранения silver-файла загрузить его в MinIO (bucket media-intel, prefix silver/).",
     )
 
     args = parser.parse_args()
@@ -107,22 +104,36 @@ def main() -> None:
 
     if args.input:
         input_path = Path(args.input)
-        # если путь относительный — считаем его от корня проекта
         if not input_path.is_absolute():
             input_path = project_root / input_path
     else:
         input_path = find_latest_raw_file(raw_dir)
         print(f"[INFO] input не указан, используем последний raw-файл: {input_path}")
 
+    if not input_path.exists():
+        raise FileNotFoundError(f"Не найден входной raw-файл: {input_path}")
+
     output_path = build_output_path_from_input(input_path)
 
-    print(f"[INFO] Преобразуем raw -> silver")
+    print("[INFO] Преобразуем raw -> silver")
     print(f"       raw:    {input_path}")
     print(f"       silver: {output_path}")
 
     transform_raw_to_silver(input_path, output_path)
 
-    print(f"[OK] Готово. Очищенные данные сохранены в {output_path}")
+    if args.upload_minio:
+        # Проверим, что mc доступен
+        try:
+            subprocess.run(["mc", "--version"], check=True, capture_output=True, text=True)
+        except FileNotFoundError as e:
+            raise FileNotFoundError("Команда 'mc' не найдена. Установи MinIO Client (mc) и повтори.") from e
+
+        bucket = "media-intel"
+        dst = f"local/{bucket}/silver/{output_path.name}"
+
+        print(f"[INFO] Загружаем silver в MinIO: {dst}")
+        subprocess.run(["mc", "cp", str(output_path), dst], check=True)
+        print("[OK] Silver загружен в MinIO")
 
 
 if __name__ == "__main__":

@@ -10,8 +10,8 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 # Попробуем подключить pymorphy2 для лемматизации
 try:
-    import pymorphy2
-    _MORPH = pymorphy2.MorphAnalyzer()
+    import pymorphy3
+    _MORPH = pymorphy3.MorphAnalyzer()
 except ImportError:
     _MORPH = None
 
