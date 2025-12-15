@@ -1,6 +1,6 @@
 # Media Intelligence Hub
 
-Учебный пет-проект на стыке Data Analytics и Data Science.
+Пет-проект на стыке Data Analytics и Data Science.
 
 Цель: построить автоматизированный пайплайн мониторинга медиа:
 - сбор материалов из разных источников (RSS / API / парсеры);
@@ -65,8 +65,24 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-## Быстрый старт (one-liner, запуск с нуля)
+## Быстрый старт через Makefile (рекомендуется)
+Если у тебя установлен `make`, можно прогонять инфраструктуру + DDL + пайплайн одной командой.
 
+```bash
+# Поднять сервисы, дождаться готовности, накатить DDL + views, (опционально) создать bucket в MinIO
+make bootstrap
+
+# Полный прогон: silver -> gold -> ClickHouse -> SQL-отчёты
+make etl IN=data/silver/<silver_file>_clean.json
+
+# Только отчётные SQL (health/quality/keywords и т.д.)
+make report
+```
+
+Примечание: при повторном запуске `make etl` загрузка в ClickHouse может показать
+`[SKIP] ... уже загружен` — это ожидаемо (идемпотентность по `load_log` и факту строк).
+
+## Быстрый старт (one-liner, запуск с нуля)
 ```bash
 # Полный чистый старт: инфраструктура + DDL + views + (опционально) бакет MinIO
 make reset && make bootstrap
@@ -76,7 +92,6 @@ make etl IN=data/silver/articles_20251210_155554_enriched_clean.json
 ```
 
 ### Что должно получиться после запуска
-
 ```bash
 make health
 make quality
@@ -89,7 +104,6 @@ make dupes
 - `make dupes`: `duplicate_rows = 0` (как минимум внутри одного батча)
 
 ## Конфигурация и переменные окружения
-
 Секреты не коммитятся. Локально создай файл `.env` (он должен быть в `.gitignore`).
 В репозитории хранится только шаблон `.env.example`.
 
@@ -104,14 +118,13 @@ MINIO_SECURE=false
 ```
 
 ### ClickHouse (пример)
-
 Важно: SQL-раннер `scripts/ch_run_sql.sh` читает переменные `CH_*`.
 
 ```bash
 CH_CONTAINER=clickhouse
-CH_USER=CH_USER
-CH_PASSWORD=CH_PASSWORD
-CH_DATABASE=CH_DATABASE
+CH_USER=YOUR_CH_USER
+CH_PASSWORD=YOUR_CH_PASSWORD
+CH_DATABASE=media_intel
 ```
 
 В `config/settings.yaml` управляется, куда писать raw-данные:
@@ -172,7 +185,6 @@ make init
 ```
 
 ## SQL: проверки качества и аналитика (ClickHouse)
-
 Файлы в `sql/` предназначены для контроля качества и аналитики поверх загруженных данных.
 
 Рекомендуемый порядок:
