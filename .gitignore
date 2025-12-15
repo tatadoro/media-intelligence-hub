@@ -1,25 +1,41 @@
-# Virtual environment
+# Virtual environments
 venv/
+.venv/
+env/
 
-# Python cache
+# Python cache / bytecode
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 
-# Jupyter Notebook checkpoints
+# Jupyter
 .ipynb_checkpoints/
+*.nbconvert.ipynb
+
+# Tests / linters / type checkers
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
 
 # IDE and editor settings
 .vscode/
 .idea/
 
-# macOS system files
+# macOS / Windows system files
 .DS_Store
+Thumbs.db
+.Spotlight-V100
+.Trashes
 
 # Temporary files
 *.log
 *.tmp
+*.swp
 
 # Environment and secret files
 .env
@@ -30,8 +46,10 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+*.whl
 
 # Local data/artifacts (do not commit)
 data/
+load_log*.tsv
+load_log*.csv
 *_backup*
-load_log_backup.tsv
