@@ -6,7 +6,7 @@ SELECT
   count() AS total,
   countIf(lengthUTF8(coalesce(clean_text, '')) >= min_body_len) AS has_body,
   countIf(lengthUTF8(coalesce(clean_text, '')) <  min_body_len) AS title_only,
-  round(has_body / total, 3) AS share_has_body
+  if(total = 0, 0, round(has_body / total, 3)) AS share_has_body
 FROM articles_dedup;
 
 -- 2) Примеры "title_only"

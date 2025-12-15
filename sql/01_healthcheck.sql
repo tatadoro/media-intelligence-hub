@@ -20,5 +20,5 @@ ORDER BY cnt DESC;
 SELECT
   count() AS total,
   countIf(ingest_object_name = '') AS empty_ingest,
-  round(empty_ingest / total, 3) AS share_empty
+  if(total = 0, 0, round(empty_ingest / total, 3)) AS share_empty
 FROM articles;

@@ -1,6 +1,89 @@
-.PHONY: views health quality topkw hour batches survival dupes report gold load etl
+-include .env
+export
 
-PYTHON ?= python
+.PHONY: up down ps logs restart reset \
+        wait-minio wait-clickhouse \
+        create-bucket init bootstrap ch-show-schema clean-sql \
+        views health quality topkw hour batches survival dupes report \
+        gold load etl
+
+PYTHON  ?= python
+COMPOSE ?= docker compose
+
+# ----------- Local infra helpers -----------
+up:
+	$(COMPOSE) up -d
+	$(MAKE) wait-clickhouse
+	$(MAKE) wait-minio || true
+
+down:
+	$(COMPOSE) down
+
+ps:
+	$(COMPOSE) ps
+
+logs:
+	$(COMPOSE) logs -f --tail=200
+
+restart: down up
+
+# clean start: removes volumes
+reset:
+	$(COMPOSE) down -v
+
+# Wait for services to become ready (best-effort)
+wait-clickhouse:
+	@echo "[INFO] Waiting for ClickHouse..."
+	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do \
+		docker exec clickhouse clickhouse-client -q "SELECT 1" >/dev/null 2>&1 && { echo "[OK] ClickHouse ready"; exit 0; }; \
+		sleep 1; \
+	done; \
+	echo "[WARN] ClickHouse not ready (timeout)."; exit 1
+
+wait-minio:
+	@echo "[INFO] Waiting for MinIO..."
+	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
+		curl -sf http://localhost:9000/minio/health/ready >/dev/null 2>&1 && { echo "[OK] MinIO ready"; exit 0; }; \
+		sleep 1; \
+	done; \
+	echo "[WARN] MinIO not ready (timeout)."; exit 1
+
+# Cleanup local SQL junk files
+clean-sql:
+	rm -f sql/.DS_Store
+
+# MinIO bucket (requires mc installed locally)
+# - if mc is not installed, print hint and exit with success (so bootstrap still works)
+# - if MinIO is not ready yet, skip without failing bootstrap
+create-bucket:
+	@command -v mc >/dev/null 2>&1 || { \
+		echo "[WARN] mc not found. Skip bucket creation."; exit 0; \
+	}
+	@test -n "$$MINIO_ENDPOINT" -a -n "$$MINIO_ACCESS_KEY" -a -n "$$MINIO_SECRET_KEY" -a -n "$$MINIO_BUCKET" || { \
+		echo "[WARN] MinIO env is not set (MINIO_ENDPOINT/MINIO_ACCESS_KEY/MINIO_SECRET_KEY/MINIO_BUCKET). Skip."; \
+		exit 0; \
+	}
+	@curl -sf http://localhost:9000/minio/health/ready >/dev/null 2>&1 || { \
+		echo "[WARN] MinIO not ready yet. Skip bucket creation."; \
+		exit 0; \
+	}
+	mc alias set local "$$MINIO_ENDPOINT" "$$MINIO_ACCESS_KEY" "$$MINIO_SECRET_KEY" >/dev/null
+	mc mb -p "local/$$MINIO_BUCKET" || true
+
+# ClickHouse init: DDL + views
+init:
+	./scripts/ch_run_sql.sh sql/00_ddl.sql
+	$(MAKE) views
+
+# One-command local bootstrap (robust)
+bootstrap: clean-sql up init ps
+	$(MAKE) create-bucket || true
+
+# Quick schema check (debug helper)
+ch-show-schema:
+	./scripts/ch_run_sql.sh sql/00_ddl.sql
+	./scripts/ch_run_sql.sh sql/00_views.sql
+	./scripts/ch_run_sql.sh sql/01_healthcheck.sql
 
 # ----------- ClickHouse reports -----------
 views:
