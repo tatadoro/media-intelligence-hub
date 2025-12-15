@@ -40,17 +40,18 @@
 ## Структура репозитория
 - `src/` — код (коллекторы, обработка, пайплайны)
 - `config/` — конфигурация (настройки запуска, параметры)
-- `sql/` — SQL для ClickHouse (проверки качества, аналитика)
+- `sql/` — SQL для ClickHouse (DDL, проверки качества, аналитика)
 - `scripts/` — вспомогательные скрипты
 - `notebooks/` — EDA/эксперименты
 - `data/` — локальные данные (не коммитятся)
 - `docker-compose.yml` — локальная инфраструктура (MinIO/ClickHouse)
-- `Makefile` — удобные команды для запуска типовых действий (если используется)
+- `Makefile` — команды для локального запуска и проверок
 - `requirements.txt` — зависимости Python
 
 ## Требования
 - Python 3.11+
 - Docker (для MinIO/ClickHouse)
+- (опционально) MinIO Client `mc` — для авто-создания бакета в `make bootstrap`
 
 ## Быстрый старт (локально)
 ```bash
@@ -61,47 +62,76 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# создать локальный env-файл из шаблона (если добавлен в репо)
 cp .env.example .env
-
-# поднять сервисы (MinIO/ClickHouse)
-docker compose up -d
-docker compose ps
 ```
 
-### Проверка сервисов
-- MinIO S3 endpoint: `http://localhost:9000`
-- MinIO Console: `http://localhost:9001`
-- ClickHouse HTTP: `http://localhost:8123`
+## Быстрый старт (one-liner, запуск с нуля)
+
+```bash
+# Полный чистый старт: инфраструктура + DDL + views + (опционально) бакет MinIO
+make reset && make bootstrap
+
+# Прогон MVP-цепочки (silver -> gold -> ClickHouse -> SQL-отчёт)
+make etl IN=data/silver/articles_20251210_155554_enriched_clean.json
+```
+
+### Что должно получиться после запуска
+
+```bash
+make health
+make quality
+make dupes
+```
+
+Ожидаемые признаки “всё ок”:
+- `make health`: `rows > 0`, `bad_dates = 0`, `share_empty = 0`
+- `make quality`: `share_has_body` близко к `1`
+- `make dupes`: `duplicate_rows = 0` (как минимум внутри одного батча)
 
 ## Конфигурация и переменные окружения
 
 Секреты не коммитятся. Локально создай файл `.env` (он должен быть в `.gitignore`).
 В репозитории хранится только шаблон `.env.example`.
 
-### Переменные окружения (пример)
+### MinIO / S3 (пример)
 ```bash
-# MinIO / S3
 MINIO_ENDPOINT=http://localhost:9000
 MINIO_ACCESS_KEY=YOUR_MINIO_USER
 MINIO_SECRET_KEY=YOUR_MINIO_PASSWORD
 MINIO_BUCKET=media-intel
 MINIO_REGION=us-east-1
 MINIO_SECURE=false
+```
 
-# ClickHouse
-CLICKHOUSE_HOST=localhost
-CLICKHOUSE_PORT=8123
-CLICKHOUSE_USER=default
-CLICKHOUSE_PASSWORD=YOUR_CLICKHOUSE_PASSWORD
-CLICKHOUSE_DATABASE=default
+### ClickHouse (пример)
+
+Важно: SQL-раннер `scripts/ch_run_sql.sh` читает переменные `CH_*`.
+
+```bash
+CH_CONTAINER=clickhouse
+CH_USER=CH_USER
+CH_PASSWORD=CH_PASSWORD
+CH_DATABASE=CH_DATABASE
 ```
 
 В `config/settings.yaml` управляется, куда писать raw-данные:
 - `raw_backend: local | s3 | both`
 
+## Проверка сервисов (если нужно руками)
+- MinIO S3 endpoint: `http://localhost:9000`
+- MinIO Console: `http://localhost:9001`
+- ClickHouse HTTP: `http://localhost:8123`
+
+Проверить контейнеры:
+```bash
+docker compose ps
+```
+
 ## MinIO: бакет для проекта
 Проект ожидает бакет `media-intel` (или значение из `MINIO_BUCKET` / `config/settings.yaml`).
+
+- `make bootstrap` вызывает `make create-bucket` **только если установлен `mc` и заполнены переменные MinIO в `.env`**.
+- Если `mc` не установлен — это не блокирует запуск MVP (raw/silver/gold/ClickHouse работают локально).
 
 Способ 1: через MinIO Console
 1) открой `http://localhost:9001`
@@ -136,34 +166,27 @@ python -m src.pipeline.silver_to_gold_local --input data/silver/<silver_file>.js
 python -m src.pipeline.gold_to_clickhouse_local --input data/gold/<gold_file>.parquet
 ```
 
-Примечание: если при первой загрузке в ClickHouse не хватает таблиц/вьюх, выполни подготовительные SQL-скрипты из `sql/` (в первую очередь `sql/00_views.sql`, если он используется в твоей схеме).
+Перед первой загрузкой и SQL-проверками подготовь ClickHouse-объекты:
+```bash
+make init
+```
 
 ## SQL: проверки качества и аналитика (ClickHouse)
 
 Файлы в `sql/` предназначены для контроля качества и аналитики поверх загруженных данных.
 
 Рекомендуемый порядок:
-1) `sql/00_views.sql` (если используются вьюхи/представления)
-2) `sql/01_healthcheck.sql`
-3) `sql/02_content_quality.sql`
-4) `sql/03_top_keywords.sql`
-5) дополнительные проверки: дедупликация и аналитика по батчам (файлы `03_*`, `05_*`, `06_*`, `07_*`)
+1) `sql/00_ddl.sql` (создание базы/таблиц)
+2) `sql/00_views.sql` (вьюхи/представления)
+3) `sql/01_healthcheck.sql`
+4) `sql/02_content_quality.sql`
+5) `sql/03_top_keywords.sql`
+6) батчевые проверки и аналитика: `05_*`, `06_*`, `07_*`
 
-Пример запуска через `clickhouse-client`:
+Запуск через Makefile:
 ```bash
-clickhouse-client --query "$(cat sql/01_healthcheck.sql)"
+make report
 ```
-
-## Быстрая проверка, что всё работает
-После шага 4 (загрузка в ClickHouse) запусти:
-- `sql/01_healthcheck.sql` — базовый healthcheck по данным
-- `sql/02_content_quality.sql` — проверка качества контента
-- `sql/03_top_keywords.sql` — топ ключевых слов
-
-Если healthcheck не показывает данные, сначала проверь:
-1) что gold-файл действительно создан в `data/gold/`
-2) что загрузка в ClickHouse отработала без ошибок
-3) что подключение к ClickHouse соответствует `.env`
 
 ## Примеры аналитики
 - `notebooks/03_gold_eda.ipynb` — EDA gold-слоя (keywords, динамика по дням, базовые проверки)
@@ -180,7 +203,7 @@ jupyter notebook
 
 ## Roadmap
 - обогащение gold: эмбеддинги, тематическое моделирование, тональность
-- улучшение извлечения ключевых фраз и саммаризации
+- улучшение извлечения ключевых фраз и суммаризации
 - стабильные витрины ClickHouse под BI (Superset/DataLens)
 - ежедневные отчёты/уведомления (дайджесты)
 - оркестрация (Airflow) и расписания
