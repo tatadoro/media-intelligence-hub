@@ -5,7 +5,7 @@ export
         wait-minio wait-clickhouse \
         create-bucket init bootstrap ch-show-schema clean-sql \
         views health quality topkw hour batches survival dupes report \
-        gold load etl md-report reports etl-latest run
+        gold load etl md-report reports etl-latest run validate-silver
 
 PYTHON  ?= python
 COMPOSE ?= docker compose
@@ -144,6 +144,13 @@ reports:
 	@echo "Done: SQL + Markdown reports generated."
 
 # ----------- ETL helpers -----------
+
+# Validate silver input contract
+# usage:
+#   make validate-silver IN=data/silver/xxx_clean.json
+validate-silver:
+	$(PYTHON) scripts/validate_silver.py --input $(IN)
+
 # 1) Silver -> Gold
 # usage:
 #   make gold IN=data/silver/xxx_clean.json
@@ -160,6 +167,7 @@ load:
 # usage:
 #   make etl IN=data/silver/xxx_clean.json
 etl:
+	$(MAKE) validate-silver IN=$(IN)
 	$(PYTHON) -m src.pipeline.silver_to_gold_local --input $(IN)
 	$(PYTHON) -m src.pipeline.gold_to_clickhouse_local --input data/gold/$(notdir $(IN:_clean.json=_processed.parquet))
 	$(MAKE) reports
