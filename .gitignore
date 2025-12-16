@@ -60,3 +60,11 @@ data/**
 load_log*.tsv
 load_log*.csv
 *_backup*
+# Airflow runtime
+airflow/logs/
+airflow/dags/__pycache__/
+**/__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
