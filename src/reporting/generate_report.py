@@ -35,9 +35,13 @@ class CHConfig:
         ),
     )
 
-    # user/password: дефолты выравниваем с docker-compose (admin/__REDACTED__)
-    user: str = os.getenv("CH_USER", os.getenv("CLICKHOUSE_USER", "admin"))
-    password: str = os.getenv("CH_PASSWORD", os.getenv("CLICKHOUSE_PASSWORD", "__REDACTED__"))
+    # user/password: берём только из env; дефолтных паролей в коде не держим
+user: str = os.getenv("CH_USER", os.getenv("CLICKHOUSE_USER", "admin"))
+password: str = os.getenv("CH_PASSWORD", os.getenv("CLICKHOUSE_PASSWORD", ""))
+if not password:
+    raise RuntimeError(
+        "ClickHouse password is not set. Set CH_PASSWORD (or CLICKHOUSE_PASSWORD) in environment / .env."
+    )
 
 def ch_query_tsv(cfg: CHConfig, query: str) -> List[List[str]]:
     """
