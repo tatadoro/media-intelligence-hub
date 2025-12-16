@@ -5,7 +5,8 @@ export
         wait-minio wait-clickhouse \
         create-bucket init bootstrap ch-show-schema clean-sql \
         views health quality topkw hour batches survival dupes report \
-        gold load etl md-report reports etl-latest run validate-silver
+        gold load etl md-report reports etl-latest run validate-silver \
+        validate-gold
 
 PYTHON  ?= python
 COMPOSE ?= docker compose
@@ -133,7 +134,6 @@ md-report:
 	python -m src.reporting.generate_report $$ARGS
 
 # Run SQL reports + generate Markdown report
-# Run SQL reports + generate Markdown report
 # You can pass params for Markdown report:
 #   make reports LAST_HOURS=6
 #   make reports FROM="2025-12-10 14:00:00" TO="2025-12-10 19:00:00"
@@ -151,6 +151,12 @@ reports:
 validate-silver:
 	$(PYTHON) scripts/validate_silver.py --input $(IN)
 
+# Validate gold input contract
+# usage:
+#   make validate-gold IN=data/gold/xxx_processed.parquet
+validate-gold:
+	$(PYTHON) scripts/validate_gold.py --input $(IN)
+
 # 1) Silver -> Gold
 # usage:
 #   make gold IN=data/silver/xxx_clean.json
@@ -160,7 +166,11 @@ gold:
 # 2) Gold -> ClickHouse
 # usage:
 #   make load IN=data/gold/xxx_processed.parquet
+# 2) Gold -> ClickHouse
+# usage:
+#   make load IN=data/gold/xxx_processed.parquet
 load:
+	$(MAKE) validate-gold IN=$(IN)
 	$(PYTHON) -m src.pipeline.gold_to_clickhouse_local --input $(IN)
 
 # 3) Full run: Silver -> Gold -> ClickHouse -> Report
