@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import os
 import argparse
 import subprocess
 from pathlib import Path
@@ -13,16 +13,45 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--input", type=str, required=True, help="Путь к parquet-файлу (например data/gold/...parquet)")
     p.add_argument(
-        "--container",
-        type=str,
-        default="clickhouse",
-        help="Имя контейнера ClickHouse (по умолчанию clickhouse)",
+    "--container",
+    type=str,
+    default=os.getenv("CH_CONTAINER", "clickhouse"),
+    help="Имя контейнера ClickHouse (по умолчанию clickhouse)",
     )
-    p.add_argument("--user", type=str, default="admin", help="ClickHouse user")
-    p.add_argument("--password", type=str, default="__REDACTED__", help="ClickHouse password")
-    p.add_argument("--database", type=str, default="media_intel", help="ClickHouse database")
-    p.add_argument("--table", type=str, default="articles", help="Целевая таблица")
-    p.add_argument("--layer", type=str, default="gold", help="Имя слоя для load_log")
+    p.add_argument(
+    "--database",
+    type=str,
+    default=os.getenv(
+        "CH_DATABASE",
+        os.getenv("CLICKHOUSE_DB", os.getenv("CLICKHOUSE_DATABASE", "media_intel")),
+    ),
+    help="ClickHouse database",
+    )
+
+    p.add_argument(
+    "--table",
+    type=str,
+    default="articles",
+    help="Target ClickHouse table (default: articles)",
+    )
+    p.add_argument(
+    "--layer",
+    type=str,
+    default="gold",
+    help="Логическое имя слоя для дедупа/аудита (по умолчанию: gold)",
+    )
+    p.add_argument(
+    "--user",
+    type=str,
+    default=os.getenv("CH_USER", os.getenv("CLICKHOUSE_USER", "admin")),
+    help="ClickHouse user",
+    )
+    p.add_argument(
+    "--password",
+    type=str,
+    default=os.getenv("CH_PASSWORD", os.getenv("CLICKHOUSE_PASSWORD", "__REDACTED__")),
+    help="ClickHouse password"
+    )
     return p.parse_args()
 
 
@@ -124,15 +153,15 @@ def main() -> None:
 
     # 1) Проверки "уже загружено?"
     in_log_q = (
-        "SELECT count() "
-        "FROM load_log "
-        f"WHERE layer = '{args.layer}' AND object_name = '{object_name}'"
-    )
+    "SELECT count() "
+    f"FROM {args.database}.load_log "
+    f"WHERE layer = '{args.layer}' AND object_name = '{object_name}'"
+)
     log_exists = ch_int(args, in_log_q, default=0) > 0
 
     in_table_q = (
         "SELECT count() "
-        f"FROM {args.table} "
+        f"FROM {args.database}.{args.table} "
         f"WHERE ingest_object_name = '{object_name}'"
     )
     table_cnt = ch_int(args, in_table_q, default=0)
@@ -162,7 +191,7 @@ def main() -> None:
         print("[WARN] Есть запись в load_log, но в таблице нет строк для этого object_name. Будем грузить заново.")
 
     # 2) INSERT parquet (через stdin)
-    insert_q = f"INSERT INTO {args.table} FORMAT Parquet"
+    insert_q = f"INSERT INTO {args.database}.{args.table} FORMAT Parquet"
     cmd = _docker_ch_cmd_stdin(args) + ["--query", insert_q]
 
     print(f"[INFO] Загружаем {input_path} -> {args.database}.{args.table}")
@@ -171,17 +200,17 @@ def main() -> None:
 
     # 3) Фиксируем фактическое число строк, оказавшихся в таблице
     table_cnt_after = ch_int(
-        args,
-        f"SELECT count() FROM {args.table} WHERE ingest_object_name = '{object_name}'",
-        default=0,
-    )
+    args,
+    f"SELECT count() FROM {args.database}.{args.table} WHERE ingest_object_name = '{object_name}'",
+    default=0,
+)
 
     # 4) Пишем лог БЕЗ DELETE/UPDATE: load_log может не поддерживать мутации (у тебя это и падало).
     # Дубли в load_log допустимы: в view/отчётах ты всё равно берёшь max(loaded_at) для батча.
     log_q = (
-        "INSERT INTO load_log (layer, object_name, loaded_at, rows_loaded) "
-        f"VALUES ('{args.layer}', '{object_name}', now(), {table_cnt_after})"
-    )
+    f"INSERT INTO {args.database}.load_log (layer, object_name, loaded_at, rows_loaded) "
+    f"VALUES ('{args.layer}', '{object_name}', now(), {table_cnt})"
+)
     ch_query(args, log_q)
 
     print(f"[OK] Загружено строк (факт в таблице): {table_cnt_after}. Запись в load_log добавлена.")

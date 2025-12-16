@@ -2,9 +2,11 @@
 set -euo pipefail
 
 CONTAINER="${CH_CONTAINER:-clickhouse}"
-USER="${CH_USER:-admin}"
-PASSWORD="${CH_PASSWORD:-__REDACTED__}"
-DATABASE="${CH_DATABASE:-media_intel}"
+
+# Prefer CH_* (used by scripts), fallback to CLICKHOUSE_* (used by Python), then defaults
+USER="${CH_USER:-${CLICKHOUSE_USER:-admin}}"
+PASSWORD="${CH_PASSWORD:-${CLICKHOUSE_PASSWORD:-__REDACTED__}}"
+DATABASE="${CH_DATABASE:-${CLICKHOUSE_DB:-${CLICKHOUSE_DATABASE:-media_intel}}}"
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 <sql_file>"

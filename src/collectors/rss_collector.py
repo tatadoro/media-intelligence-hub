@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
 from src.utils.s3_client import upload_json_bytes, MINIO_BUCKET
-import json
+import os
 import yaml
 import feedparser
 import pandas as pd
@@ -65,45 +65,50 @@ def feed_to_dataframe(feed, source_name: str = SOURCE_NAME) -> pd.DataFrame:
     return df
 
 
-def save_dataframe_to_json(df: pd.DataFrame, raw_dir_cfg: str | None = None) -> str:
+def save_dataframe_to_json(
+    df: pd.DataFrame,
+    raw_dir_cfg: str | None = None,
+    now: datetime | None = None,
+) -> str:
     """
     Сохраняет DataFrame с сырыми статьями в локальный JSON.
 
     :param df: данные со статьями
     :param raw_dir_cfg: относительный путь к каталогу raw из конфига (например, "data/raw").
-                        Если не задан, используется значение по умолчанию "data/raw".
+    :param now: фиксированный момент времени (UTC), чтобы имена совпадали между backends
     :return: путь к сохранённому файлу в виде строки
     """
     if raw_dir_cfg is None:
         raw_dir_cfg = "data/raw"
 
-    # Каталог относительно корня проекта
+    if now is None:
+        now = datetime.utcnow()
+
     raw_dir = BASE_DIR / raw_dir_cfg
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    ts_str = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts_str = now.strftime("%Y%m%d_%H%M%S")
     filename = raw_dir / f"articles_{ts_str}.json"
 
     df.to_json(filename, orient="records", force_ascii=False, indent=2)
-
     return str(filename)
 
-def save_raw_to_s3(df: pd.DataFrame, source_name: str) -> str:
+def save_raw_to_s3(df: pd.DataFrame, source_name: str, now: datetime | None = None) -> str:
     """
     Сохраняем сырые статьи в raw-зону Data Lake (MinIO).
 
     Структура ключа:
     raw/YYYY-MM-DD/source_name/articles_YYYYMMDD_HHMMSS.json
     """
-    now = datetime.now()
+    if now is None:
+        now = datetime.utcnow()
+
     date_str = now.strftime("%Y-%m-%d")
     ts_str = now.strftime("%Y%m%d_%H%M%S")
 
     key = f"raw/{date_str}/{source_name}/articles_{ts_str}.json"
-
     json_str = df.to_json(orient="records", force_ascii=False, indent=2)
     upload_json_bytes(MINIO_BUCKET, key, json_str)
-
     return key
 
 def main() -> None:
@@ -112,8 +117,8 @@ def main() -> None:
     storage_cfg = settings.get("storage", {})
     data_cfg = settings.get("data", {})
 
-    raw_backend = storage_cfg.get("raw_backend", "s3")
-    raw_dir_cfg = data_cfg.get("raw_dir", "data/raw")
+    raw_backend = os.getenv("RAW_BACKEND", storage_cfg.get("raw_backend", "s3"))
+    raw_dir_cfg = os.getenv("RAW_DIR", data_cfg.get("raw_dir", "data/raw"))
 
     print(f"[CONFIG] RAW backend = {raw_backend}")
     print(f"Fetching RSS from {RSS_URL} ...")
@@ -127,16 +132,17 @@ def main() -> None:
     if df.empty:
         print("No items to save, exiting.")
         return
-
+     now = datetime.utcnow()
+    
     # Ветвление по конфигу: куда писать сырые данные
     if raw_backend in ("s3", "both"):
         print("Saving raw data to MinIO (S3)...")
-        key = save_raw_to_s3(df, source_name=SOURCE_NAME)
+        key = save_raw_to_s3(df, source_name=SOURCE_NAME, now=now)
         print(f"Saved {len(df)} items to s3://{MINIO_BUCKET}/{key}")
 
     if raw_backend in ("local", "both"):
         print("Saving local backup JSON ...")
-        filename = save_dataframe_to_json(df, raw_dir_cfg)
+        filename = save_dataframe_to_json(df, raw_dir_cfg, now=now)
         print(f"Saved local copy with {len(df)} items to {filename}")
 
     if raw_backend not in ("s3", "local", "both"):

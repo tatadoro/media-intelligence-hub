@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import argparse
-
+import os
 import pandas as pd
 
 from src.processing.summarization import enrich_articles_with_summary_and_keywords
@@ -204,13 +204,48 @@ def main() -> None:
     if args.upload_minio:
         import subprocess
 
-        bucket = "media-intel"
-        dst = f"local/{bucket}/gold/{output_path.name}"
+        # Проверим, что mc доступен
+        try:
+            subprocess.run(["mc", "--version"], check=True, capture_output=True, text=True)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(
+                "Команда 'mc' не найдена. Установи MinIO Client (mc) и повтори."
+            ) from e
+
+        # Конфиг MinIO из окружения (совместимо с .env.example и Makefile)
+        minio_endpoint = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
+        minio_access_key = os.getenv("MINIO_ACCESS_KEY")
+        minio_secret_key = os.getenv("MINIO_SECRET_KEY")
+        bucket = os.getenv("MINIO_BUCKET", "media-intel")
+        alias = os.getenv("MINIO_ALIAS", "local")
+
+        if not minio_access_key or not minio_secret_key:
+            raise ValueError(
+                "Не заданы MINIO_ACCESS_KEY/MINIO_SECRET_KEY. "
+                "Заполни .env (см. .env.example) и повтори."
+            )
+
+        # Убедимся, что alias существует: если нет — создадим
+        out = subprocess.run(
+            ["mc", "alias", "list"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+        if f"{alias} " not in out and f"{alias}\t" not in out:
+            subprocess.run(
+                ["mc", "alias", "set", alias, minio_endpoint, minio_access_key, minio_secret_key],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        dst = f"{alias}/{bucket}/gold/{output_path.name}"
 
         print(f"[INFO] Загружаем gold в MinIO: {dst}")
         subprocess.run(["mc", "cp", str(output_path), dst], check=True)
         print("[OK] Gold загружен в MinIO")
-
 
 if __name__ == "__main__":
     main()

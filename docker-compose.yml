@@ -28,9 +28,8 @@ services:
       MINIO_ROOT_USER: admin
       MINIO_ROOT_PASSWORD: __REDACTED__
     volumes:
-      - eb636801023d0881e4d4e86b7232c57a5fe4e42be1a3a6734a4c079312f8943e:/data
+      - minio_data:/data
 
 volumes:
+  minio_data:
   clickhouse_data:
-  eb636801023d0881e4d4e86b7232c57a5fe4e42be1a3a6734a4c079312f8943e:
-    external: true

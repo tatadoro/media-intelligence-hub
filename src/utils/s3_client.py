@@ -3,62 +3,78 @@ import logging
 import os
 import io
 import yaml
-
+import re
 import boto3
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
-# Путь к корню проекта: /Users/.../media-intelligence-hub-
+# Путь к корню проекта
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
-ENV_PATH = os.path.join(BASE_DIR, "config", ".env")
+ROOT_ENV_PATH = os.path.join(BASE_DIR, ".env")
+LEGACY_ENV_PATH = os.path.join(BASE_DIR, "config", ".env")  # на всякий случай
 SETTINGS_PATH = os.path.join(BASE_DIR, "config", "settings.yaml")
 
-# 1. Подгружаем секреты из .env (логин/пароль к MinIO)
-load_dotenv(ENV_PATH)
+# 1) Подгружаем .env (сначала актуальный корневой, потом legacy без override)
+load_dotenv(ROOT_ENV_PATH)
+load_dotenv(LEGACY_ENV_PATH, override=False)
 
-# 2. Читаем общие настройки из settings.yaml
-with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
-    settings = yaml.safe_load(f)
+# 2) Читаем settings.yaml (если нет файла — не падаем)
+try:
+    with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+        settings = yaml.safe_load(f) or {}
+except FileNotFoundError:
+    settings = {}
 
-# 3. Инициализируем S3/MinIO-клиент на основе переменных окружения
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY")
-MINIO_REGION = os.getenv("MINIO_REGION", "us-east-1")
-MINIO_BUCKET = os.getenv("MINIO_BUCKET", "media-intel")
+storage_cfg = (settings.get("storage", {}) or {}).get("minio", {}) or {}
 
-s3 = boto3.client(
-    "s3",
-    endpoint_url=MINIO_ENDPOINT,
-    aws_access_key_id=MINIO_ACCESS_KEY,
-    aws_secret_access_key=MINIO_SECRET_KEY,
-    region_name=MINIO_REGION,
-)
+_PLACEHOLDER_RE = re.compile(r'^\$\{([A-Z0-9_]+):-"?(.*?)"?\}$')
 
-storage_cfg = settings["storage"]["minio"]
+
+def _resolve(value: str) -> str:
+    """
+    Поддержка шаблонов вида ${VAR:-"default"} из settings.yaml.
+    Если формат другой — возвращаем как есть.
+    """
+    if not isinstance(value, str):
+        return value
+    m = _PLACEHOLDER_RE.match(value.strip())
+    if not m:
+        return value
+    var, default = m.group(1), m.group(2)
+    return os.getenv(var, default)
+
+
+# 3) Итоговые параметры MinIO: env имеет приоритет, иначе берём из settings.yaml (с подстановкой)
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT") or _resolve(storage_cfg.get("endpoint", "http://localhost:9000"))
+MINIO_BUCKET = os.getenv("MINIO_BUCKET") or _resolve(storage_cfg.get("bucket", "media-intel"))
+MINIO_REGION = os.getenv("MINIO_REGION") or _resolve(storage_cfg.get("region", "us-east-1"))
 
 # Достаём параметры MinIO из конфига
-MINIO_ENDPOINT = storage_cfg["endpoint"]
-MINIO_BUCKET = storage_cfg["bucket"]
-MINIO_REGION = storage_cfg.get("region", "us-east-1")
-
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY") or _resolve(storage_cfg.get("access_key", ""))
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY") or _resolve(storage_cfg.get("secret_key", ""))
+MINIO_SECURE = (os.getenv("MINIO_SECURE") or _resolve(storage_cfg.get("secure", "false"))).lower() == "true"
 
 def get_s3_client():
     """Создаём и возвращаем клиент S3 (MinIO) с параметрами из .env и settings.yaml."""
-    access_key = os.getenv("MINIO_ACCESS_KEY")
-    secret_key = os.getenv("MINIO_SECRET_KEY")
+    access_key = MINIO_ACCESS_KEY
+    secret_key = MINIO_SECRET_KEY
+
+    if not access_key or not secret_key:
+        raise ValueError(
+            "Не заданы MINIO_ACCESS_KEY/MINIO_SECRET_KEY. "
+            "Заполни .env (см. .env.example) и повтори."
+        )
 
     session = boto3.session.Session()
-    s3 = session.client(
+    return session.client(
         service_name="s3",
         endpoint_url=MINIO_ENDPOINT,
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
         region_name=MINIO_REGION,
     )
-    return s3
 
 
 
@@ -73,7 +89,7 @@ def upload_json_bytes(bucket: str, key: str, json_str: str) -> None:
     bytes_io = io.BytesIO(json_str.encode("utf-8"))
 
     logger.info("Uploading object to S3: bucket=%s, key=%s", bucket, key)
-
+    s3 = get_s3_client()
     try:
         s3.upload_fileobj(bytes_io, bucket, key)
     except Exception as e:

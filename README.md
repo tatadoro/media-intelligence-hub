@@ -58,8 +58,8 @@
 
 ## Быстрый старт (локально)
 ```bash
-git clone https://github.com/tatadoro/media-intelligence-hub-.git
-cd media-intelligence-hub-
+git clone https://github.com/tatadoro/media-intelligence-hub.git
+cd media-intelligence-hub
 
 python3 -m venv venv
 source venv/bin/activate
@@ -67,12 +67,18 @@ pip install -r requirements.txt
 
 cp .env.example .env
 ```
+Важно: SQL-скрипты читают переменные CH_* (см. .env.example)
+Python-скрипты читают CLICKHOUSE_* (и тоже поддерживаются)
 
 ## Быстрый старт через Makefile (рекомендуется)
 Если у тебя установлен `make`, можно прогонять инфраструктуру + DDL + пайплайн одной командой.
 
 ```bash
 # Поднять сервисы, дождаться готовности, накатить DDL + views, (опционально) создать bucket в MinIO
+# Проверить, что make и docker доступны
+make --version
+docker --version
+docker compose version
 make bootstrap
 
 # Полный прогон: silver -> gold -> ClickHouse -> SQL-отчёты
@@ -170,7 +176,7 @@ CH_DATABASE=media_intel
 ## Проверка сервисов (если нужно руками)
 - MinIO S3 endpoint: `http://localhost:9000`
 - MinIO Console: `http://localhost:9001`
-- ClickHouse HTTP: `http://localhost:8123`
+- ClickHouse HTTP: `http://localhost:18123`
 
 Проверить контейнеры:
 ```bash

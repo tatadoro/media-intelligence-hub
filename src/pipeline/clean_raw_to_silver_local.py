@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import os
 import argparse
 import json
 import subprocess
@@ -121,15 +121,45 @@ def main() -> None:
 
     transform_raw_to_silver(input_path, output_path)
 
-    if args.upload_minio:
+        if args.upload_minio:
         # Проверим, что mc доступен
         try:
             subprocess.run(["mc", "--version"], check=True, capture_output=True, text=True)
         except FileNotFoundError as e:
-            raise FileNotFoundError("Команда 'mc' не найдена. Установи MinIO Client (mc) и повтори.") from e
+            raise FileNotFoundError(
+                "Команда 'mc' не найдена. Установи MinIO Client (mc) и повтори."
+            ) from e
 
-        bucket = "media-intel"
-        dst = f"local/{bucket}/silver/{output_path.name}"
+        # Конфиг MinIO из окружения (совместимо с .env.example и Makefile)
+        minio_endpoint = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
+        minio_access_key = os.getenv("MINIO_ACCESS_KEY")
+        minio_secret_key = os.getenv("MINIO_SECRET_KEY")
+        bucket = os.getenv("MINIO_BUCKET", "media-intel")
+        alias = os.getenv("MINIO_ALIAS", "local")
+
+        if not minio_access_key or not minio_secret_key:
+            raise ValueError(
+                "Не заданы MINIO_ACCESS_KEY/MINIO_SECRET_KEY. "
+                "Заполни .env (см. .env.example) и повтори."
+            )
+
+        # Убедимся, что alias существует: если нет — создадим
+        out = subprocess.run(
+            ["mc", "alias", "list"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+        if f"{alias} " not in out and f"{alias}\t" not in out:
+            subprocess.run(
+                ["mc", "alias", "set", alias, minio_endpoint, minio_access_key, minio_secret_key],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        dst = f"{alias}/{bucket}/silver/{output_path.name}"
 
         print(f"[INFO] Загружаем silver в MinIO: {dst}")
         subprocess.run(["mc", "cp", str(output_path), dst], check=True)

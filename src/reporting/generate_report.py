@@ -22,10 +22,22 @@ except Exception:
 class CHConfig:
     host: str = os.getenv("CH_HOST", os.getenv("CLICKHOUSE_HOST", "localhost"))
     port: int = int(os.getenv("CH_PORT", os.getenv("CLICKHOUSE_PORT", "18123")))
-    database: str = os.getenv("CH_DB", os.getenv("CLICKHOUSE_DB", "media_intel"))
-    user: str = os.getenv("CH_USER", os.getenv("CLICKHOUSE_USER", "default"))
-    password: str = os.getenv("CH_PASSWORD", os.getenv("CLICKHOUSE_PASSWORD", ""))
+    tz: str = os.getenv("CH_TZ", os.getenv("APP_TZ", "Europe/Moscow"))
+    # database: поддерживаем все варианты имён, которые встречаются в проекте
+    database: str = os.getenv(
+        "CH_DATABASE",
+        os.getenv(
+            "CH_DB",
+            os.getenv(
+                "CLICKHOUSE_DB",
+                os.getenv("CLICKHOUSE_DATABASE", "media_intel"),
+            ),
+        ),
+    )
 
+    # user/password: дефолты выравниваем с docker-compose (admin/__REDACTED__)
+    user: str = os.getenv("CH_USER", os.getenv("CLICKHOUSE_USER", "admin"))
+    password: str = os.getenv("CH_PASSWORD", os.getenv("CLICKHOUSE_PASSWORD", "__REDACTED__"))
 
 def ch_query_tsv(cfg: CHConfig, query: str) -> List[List[str]]:
     """
@@ -77,9 +89,9 @@ def build_report(
     where_parts: List[str] = []
 
     if dt_from:
-        where_parts.append(f"published_at >= toDateTime64('{dt_from}', 9, 'Europe/Moscow')")
+        where_parts.append(f"published_at >= toDateTime64('{dt_from}', 9, '{cfg.tz}')")
     if dt_to:
-        where_parts.append(f"published_at <  toDateTime64('{dt_to}', 9, 'Europe/Moscow')")
+        where_parts.append(f"published_at <  toDateTime64('{dt_to}', 9, '{cfg.tz}')")
     if last_hours is not None:
         where_parts.append(f"published_at >= now64(9) - INTERVAL {last_hours} HOUR")
 

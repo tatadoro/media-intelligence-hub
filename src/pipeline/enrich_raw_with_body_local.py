@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
-
+import os
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
@@ -278,14 +278,49 @@ def main() -> None:
     empty = sum(1 for r in enriched if r.get("body_status") in {"parsed_empty", "fetch_failed", "no_link"})
     print(f"[OK] Готово. ok={ok}, empty_or_failed={empty}, total={len(enriched)}")
 
-    if args.upload_minio:
-        import subprocess
+        if args.upload_minio:
+        # Проверим, что mc доступен
+        try:
+            subprocess.run(["mc", "--version"], check=True, capture_output=True, text=True)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(
+                "Команда 'mc' не найдена. Установи MinIO Client (mc) и повтори."
+            ) from e
 
-        bucket = "media-intel"
-        dst = f"local/{bucket}/raw_enriched/{output_path.name}"
-        print(f"[INFO] Загружаем raw_enriched в MinIO: {dst}")
+        # Конфиг MinIO из окружения (совместимо с .env.example и Makefile)
+        minio_endpoint = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
+        minio_access_key = os.getenv("MINIO_ACCESS_KEY")
+        minio_secret_key = os.getenv("MINIO_SECRET_KEY")
+        bucket = os.getenv("MINIO_BUCKET", "media-intel")
+        alias = os.getenv("MINIO_ALIAS", "local")
+
+        if not minio_access_key or not minio_secret_key:
+            raise ValueError(
+                "Не заданы MINIO_ACCESS_KEY/MINIO_SECRET_KEY. "
+                "Заполни .env (см. .env.example) и повтори."
+            )
+
+        # Убедимся, что alias существует: если нет — создадим
+        out = subprocess.run(
+            ["mc", "alias", "list"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+        if f"{alias} " not in out and f"{alias}\t" not in out:
+            subprocess.run(
+                ["mc", "alias", "set", alias, minio_endpoint, minio_access_key, minio_secret_key],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        dst = f"{alias}/{bucket}/raw_enriched/{output_path.name}"
+
+        print(f"[INFO] Загружаем enriched raw в MinIO: {dst}")
         subprocess.run(["mc", "cp", str(output_path), dst], check=True)
-        print("[OK] raw_enriched загружен в MinIO")
+        print("[OK] Enriched raw загружен в MinIO")
 
 
 if __name__ == "__main__":
