@@ -47,8 +47,7 @@ def ch_query_tsv(cfg: CHConfig, query: str) -> List[List[str]]:
 
 
 def safe_filename(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d_%H%M")
-
+    return dt.strftime("%Y-%m-%d_%H%M%S_%f")
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate Markdown report from ClickHouse.")

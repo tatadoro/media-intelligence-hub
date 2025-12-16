@@ -5,7 +5,7 @@ export
         wait-minio wait-clickhouse \
         create-bucket init bootstrap ch-show-schema clean-sql \
         views health quality topkw hour batches survival dupes report \
-        gold load etl
+        gold load etl md-report
 
 PYTHON  ?= python
 COMPOSE ?= docker compose
@@ -119,6 +119,17 @@ report:
 	./scripts/ch_run_sql.sh sql/05_batches.sql
 	./scripts/ch_run_sql.sh sql/06_batch_survival.sql
 	./scripts/ch_run_sql.sh sql/07_batch_internal_dupes.sql
+
+md-report:
+	@echo "Generating Markdown report..."
+	@ARGS=""; \
+	if [ -n "$(LAST_HOURS)" ]; then ARGS="$$ARGS --last-hours $(LAST_HOURS)"; fi; \
+	if [ -n "$(FROM)" ]; then ARGS="$$ARGS --from \"$(FROM)\""; fi; \
+	if [ -n "$(TO)" ]; then ARGS="$$ARGS --to \"$(TO)\""; fi; \
+	if [ -n "$(TABLE)" ]; then ARGS="$$ARGS --table $(TABLE)"; fi; \
+	if [ -n "$(TOP_K)" ]; then ARGS="$$ARGS --top-k $(TOP_K)"; fi; \
+	if [ -n "$(OUTDIR)" ]; then ARGS="$$ARGS --outdir $(OUTDIR)"; fi; \
+	python -m src.reporting.generate_report $$ARGS
 
 # ----------- ETL helpers -----------
 # 1) Silver -> Gold
