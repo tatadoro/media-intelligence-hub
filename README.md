@@ -142,7 +142,6 @@ python -m src.reporting.generate_report --from "2025-12-10 14:00:00" --to "2025-
 python -m src.reporting.generate_report --table articles_dedup --top-k 10 
 ```
 
-
 ## Конфигурация и переменные окружения
 Секреты не коммитятся. Локально создай файл `.env` (он должен быть в `.gitignore`).
 В репозитории хранится только шаблон `.env.example`.
@@ -256,6 +255,120 @@ jupyter notebook
 - `.env` и любые секреты **не коммитятся**
 - `data/` и локальные артефакты **не коммитятся**
 - в `reports/` в git хранится только `reports/examples/`
+
+## Troubleshooting
+
+### Быстрый диагностический чек-лист
+```bash
+docker compose ps
+docker compose logs -f --tail=200
+make ps
+make logs
+```
+
+Если нужно “проверить проект как пользователь” с нуля:
+```bash
+make smoke
+```
+
+### ClickHouse не готов / таймаут в wait-clickhouse
+Признаки: `ClickHouse not ready (timeout)` или SQL-скрипты не выполняются.
+
+Проверь контейнер и логи:
+```bash
+docker compose ps
+docker compose logs -f --tail=200 clickhouse
+```
+
+Проверь, что ClickHouse отвечает:
+```bash
+curl -sSf http://localhost:18123/ping
+```
+
+Если нужно полностью перезапустить с чистыми volumes:
+```bash
+make reset
+make bootstrap
+```
+
+### MinIO не готов / таймаут в wait-minio
+Признаки: `MinIO not ready (timeout)` или bucket не создаётся.
+
+Проверка health:
+```bash
+curl -sSf http://localhost:9000/minio/health/ready
+```
+
+Логи:
+```bash
+docker compose logs -f --tail=200 minio
+```
+
+Полный перезапуск:
+```bash
+make reset
+make bootstrap
+```
+
+### `mc not found. Skip bucket creation.`
+Это не блокирует MVP: raw/silver/gold/ClickHouse работают локально.
+
+Если хочешь автосоздание бакета — установи MinIO Client:
+```bash
+brew install minio/stable/mc
+```
+
+И убедись, что `.env` заполнен:
+```bash
+grep -E "MINIO_(ENDPOINT|ACCESS_KEY|SECRET_KEY|BUCKET)" .env
+```
+
+### Переменные окружения не подхватываются
+Makefile читает `.env` из корня репозитория.
+
+Проверь, что файл существует:
+```bash
+ls -la .env
+```
+
+Сверь с примером:
+```bash
+sed -n '1,120p' .env.example
+```
+
+### `No files found: data/silver/articles*_clean.json`
+Это значит, что в `data/silver/` пока нет готовых silver-файлов.
+
+Варианты:
+1) Запусти сбор и подготовку данных (пример):
+```bash
+python -m src.collectors.rss_collector
+python -m src.pipeline.enrich_raw_with_body_local
+python -m src.pipeline.clean_raw_to_silver_local
+```
+
+2) Или запусти ETL, явно указав silver-файл:
+```bash
+make etl IN=data/silver/<your_file>_clean.json
+```
+
+### Повторный прогон “не льёт” данные (дедуп по батчу)
+Скрипт загрузки защищает от дублей через `load_log` и проверку факта наличия строк в таблице по `ingest_object_name`.
+
+Если хочешь прогнать всё “как с нуля”:
+```bash
+make reset
+make bootstrap
+make etl-latest
+```
+
+### Git: `Permission denied (publickey)`
+Если push по SSH не работает, проще переключиться на HTTPS remote или настроить SSH-ключи.
+
+Проверить текущий remote:
+```bash
+git remote -v
+```
 
 ## Roadmap
 - обогащение gold: эмбеддинги, тематическое моделирование, тональность
