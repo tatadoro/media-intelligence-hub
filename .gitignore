@@ -37,6 +37,10 @@ Thumbs.db
 *.tmp
 *.swp
 
+# Reports: keep only examples in git
+reports/*.md
+!reports/examples/*.md
+
 # Environment and secret files
 .env
 .env.*
