@@ -20,7 +20,7 @@ def precheck_latest_silver(**context) -> None:
     """
     Логируем выбранный silver и быстро проверяем, что файл не legacy:
     - файл читается
-    - в первых N записях есть обязательные ключи (published_at и т.п.)
+    - в первых N записях есть обязательные ключи (published_at и title)
     Поддерживаем JSON-массив и JSONL.
 
     Зачем: чтобы DAG не падал на validate_silver из-за случайно подобранного legacy-файла.
@@ -36,7 +36,6 @@ def precheck_latest_silver(**context) -> None:
     if not silver_path.exists():
         raise FileNotFoundError(f"Selected silver file does not exist: {silver_path}")
 
-    # Минимальный набор. Можно расширить, если захочешь сделать проверку строже.
     required = {"published_at", "title"}
     checked = 0
     ok = False
@@ -130,7 +129,6 @@ def compute_report_window(last_hours: int = 6, **context) -> dict:
     if not max_dt_str:
         raise ValueError("ClickHouse returned empty max(published_at). Table is empty?")
 
-    # 'YYYY-MM-DD HH:MM:SS'
     max_dt = datetime.fromisoformat(max_dt_str)
     dt_from = max_dt - timedelta(hours=int(last_hours))
 
@@ -156,7 +154,6 @@ def compute_gold_path(**context) -> str:
     if silver_name.endswith("_clean.json"):
         gold_name = silver_name.replace("_clean.json", "_processed.parquet")
     elif silver_name.endswith(".json"):
-        # запасной вариант, если вдруг суффикс отличается
         gold_name = silver_name.replace(".json", "_processed.parquet")
     else:
         raise ValueError(f"Unexpected silver filename: {silver_name}")
@@ -180,6 +177,45 @@ with DAG(
     max_active_runs=1,
     tags=["mih"],
 ) as dag:
+    # --- waiters (infra readiness) ---
+    # ВАЖНО: внутри контейнера нельзя полагаться на make wait-*, потому что:
+    # - wait-minio в Makefile делает curl на localhost:9000 (а надо на minio:9000)
+    # - wait-clickhouse в Makefile использует docker exec (в контейнере docker обычно нет)
+    wait_clickhouse = BashOperator(
+        task_id="wait_clickhouse",
+        bash_command=(
+            "set -euo pipefail; "
+            "HOST=${CH_HOST:-${CLICKHOUSE_HOST:-clickhouse}}; "
+            "PORT=${CH_PORT:-${CLICKHOUSE_PORT:-8123}}; "
+            "USER=${CH_USER:-${CLICKHOUSE_USER:-}}; "
+            "PASS=${CH_PASSWORD:-${CLICKHOUSE_PASSWORD:-}}; "
+            "echo \"[INFO] Waiting for ClickHouse at http://${HOST}:${PORT}/ping\"; "
+            "for i in $(seq 1 30); do "
+            "  if [ -n \"$USER$PASS\" ]; then "
+            "    curl -sfS -u \"$USER:$PASS\" \"http://${HOST}:${PORT}/ping\" >/dev/null && echo \"[OK] ClickHouse ready\" && exit 0; "
+            "  else "
+            "    curl -sfS \"http://${HOST}:${PORT}/ping\" >/dev/null && echo \"[OK] ClickHouse ready\" && exit 0; "
+            "  fi; "
+            "  sleep 1; "
+            "done; "
+            "echo \"[ERROR] ClickHouse not ready (timeout)\"; exit 1"
+        ),
+    )
+
+    wait_minio = BashOperator(
+        task_id="wait_minio",
+        bash_command=(
+            "set -euo pipefail; "
+            "echo \"[INFO] Waiting for MinIO at http://minio:9000/minio/health/ready\"; "
+            "for i in $(seq 1 30); do "
+            "  curl -sfS http://minio:9000/minio/health/ready >/dev/null && echo \"[OK] MinIO ready\" && exit 0; "
+            "  sleep 1; "
+            "done; "
+            "echo \"[ERROR] MinIO not ready (timeout)\"; exit 1"
+        ),
+    )
+
+    # --- pick/precheck/validate silver ---
     pick_latest_silver = PythonOperator(
         task_id="pick_latest_silver",
         python_callable=pick_latest_silver_file,
@@ -198,6 +234,7 @@ with DAG(
         ),
     )
 
+    # --- silver -> gold ---
     silver_to_gold = BashOperator(
         task_id="silver_to_gold",
         bash_command=(
@@ -228,6 +265,7 @@ with DAG(
         ),
     )
 
+    # --- load to clickhouse ---
     load_to_clickhouse = BashOperator(
         task_id="load_to_clickhouse",
         bash_command=(
@@ -237,6 +275,7 @@ with DAG(
         ),
     )
 
+    # --- sql + md report ---
     sql_reports = BashOperator(
         task_id="sql_reports",
         bash_command="cd /opt/mih && make report",
@@ -259,7 +298,31 @@ with DAG(
         ),
     )
 
-    # Граф зависимостей
+    # --- upload report to MinIO ---
+    # best-effort: если в airflow-контейнере нет mc, не валим DAG
+    upload_report_to_minio = BashOperator(
+        task_id="upload_report_to_minio",
+        bash_command=(
+            "set -euo pipefail; "
+            "cd /opt/mih; "
+            "REPORT_FILE=$(ls -1t reports/daily_report_*.md | head -n 1); "
+            "echo \"[INFO] Latest report: ${REPORT_FILE}\"; "
+            "if command -v mc >/dev/null 2>&1; then "
+            "  make upload-report REPORT=\"${REPORT_FILE}\" LAST_HOURS=6; "
+            "else "
+            "  echo \"[WARN] mc not found in airflow container; skip upload to MinIO\"; "
+            "fi"
+        ),
+    )
+
+    # --- minimal observability log (best-effort) ---
+    quality_summary_log = BashOperator(
+        task_id="quality_summary_log",
+        bash_command="cd /opt/mih && make health && make quality || true",
+    )
+
+    # --- Dependencies ---
+    wait_clickhouse >> wait_minio >> pick_latest_silver
     pick_latest_silver >> precheck_silver >> validate_silver >> silver_to_gold >> compute_gold_path_task
     compute_gold_path_task >> validate_gold >> quality_gate >> load_to_clickhouse
-    load_to_clickhouse >> sql_reports >> compute_report_window_task >> md_report
+    load_to_clickhouse >> sql_reports >> compute_report_window_task >> md_report >> upload_report_to_minio >> quality_summary_log

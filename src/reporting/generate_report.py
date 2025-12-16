@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Tuple
 
@@ -103,7 +103,15 @@ def ch_query_tsv(cfg: CHConfig, query: str) -> List[List[str]]:
 
 
 def safe_filename(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d_%H%M%S_%f")
+    """
+    Стабильный timestamp для имени файла.
+    Всегда приводим к UTC, чтобы имя совпадало в контейнере (UTC) и на хосте (локальная TZ).
+    """
+    if dt.tzinfo is None:
+        # fallback: если вдруг передали naive datetime
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt_utc = dt.astimezone(timezone.utc)
+    return dt_utc.strftime("%Y-%m-%d_%H%M%S_%f")
 
 
 def parse_args() -> argparse.Namespace:
@@ -138,7 +146,11 @@ def build_report(
     if dt_to:
         where_parts.append(f"published_at <  toDateTime64('{dt_to}', 9, '{cfg.tz}')")
     if last_hours is not None:
-        where_parts.append("published_at >= (SELECT max(published_at) FROM {t}) - INTERVAL {h} HOUR".format(t=table, h=last_hours))
+        where_parts.append(
+            "published_at >= (SELECT max(published_at) FROM {t}) - INTERVAL {h} HOUR".format(
+                t=table, h=last_hours
+            )
+        )
         where_parts.append("published_at <= (SELECT max(published_at) FROM {t})".format(t=table))
 
     where_sql = "WHERE " + " AND ".join(where_parts) if where_parts else ""
@@ -239,7 +251,8 @@ def main() -> None:
     outdir = Path(args.outdir or os.getenv("REPORTS_DIR", "reports"))
     outdir.mkdir(parents=True, exist_ok=True)
 
-    now = datetime.now()
+    # Важно: используем UTC, чтобы имя файла было стабильным и одинаковым в контейнере и на хосте
+    now = datetime.now(timezone.utc)
     fname = f"daily_report_{safe_filename(now)}.md"
     outpath = outdir / fname
 
