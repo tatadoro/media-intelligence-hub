@@ -123,6 +123,20 @@ python -m src.reporting.generate_report
 ### Пример отчёта
 См. `reports/examples/daily_report_example.md`.
 
+Примеры:
+
+```bash
+# За последние 6 часов
+python -m src.reporting.generate_report --last-hours 6
+
+# За фиксированный период
+python -m src.reporting.generate_report --from "2025-12-10 14:00:00" --to "2025-12-10 19:00:00"
+
+# По dedup-витрине и с меньшим топом
+python -m src.reporting.generate_report --table articles_dedup --top-k 10 
+```
+
+
 ## Конфигурация и переменные окружения
 Секреты не коммитятся. Локально создай файл `.env` (он должен быть в `.gitignore`).
 В репозитории хранится только шаблон `.env.example`.
