@@ -6,7 +6,7 @@ export
         create-bucket init bootstrap ch-show-schema clean-sql \
         views health quality topkw hour batches survival dupes report \
         gold load etl md-report reports etl-latest run validate-silver \
-        validate-gold validate
+        validate-gold validate gate
 
 PYTHON  ?= python
 COMPOSE ?= docker compose
@@ -168,6 +168,22 @@ validate:
 	@$(MAKE) health || true
 	@echo "[OK] validate finished"
 
+# Quality gate for gold (best-effort by default)
+# usage:
+#   make gate IN=data/gold/xxx_processed.parquet
+#   make gate IN=... STRICT=1
+GATE_MIN_ROWS          ?= 20
+GATE_MIN_BODY_SHARE    ?= 0.05
+GATE_MIN_BODY_CHARS    ?= 50
+GATE_MAX_EMPTY_SUMMARY ?= 0.95
+GATE_MAX_EMPTY_KEYWORDS?= 0.95
+STRICT                 ?= 0
+
+gate:
+	@ARGS="--input $(IN) --min-rows $(GATE_MIN_ROWS) --min-body-share $(GATE_MIN_BODY_SHARE) --min-body-chars $(GATE_MIN_BODY_CHARS) --max-empty-summary-share $(GATE_MAX_EMPTY_SUMMARY) --max-empty-keywords-share $(GATE_MAX_EMPTY_KEYWORDS)"; \
+	if [ "$(STRICT)" = "1" ]; then ARGS="$$ARGS --strict"; fi; \
+	$(PYTHON) scripts/quality_gate_gold.py $$ARGS
+
 # 1) Silver -> Gold
 # usage:
 #   make gold IN=data/silver/xxx_clean.json
@@ -182,6 +198,7 @@ gold:
 #   make load IN=data/gold/xxx_processed.parquet
 load:
 	$(MAKE) validate-gold IN=$(IN)
+	$(MAKE) gate IN=$(IN) STRICT=$(STRICT)
 	$(PYTHON) -m src.pipeline.gold_to_clickhouse_local --input $(IN)
 
 # 3) Full run: Silver -> Gold -> ClickHouse -> Report
