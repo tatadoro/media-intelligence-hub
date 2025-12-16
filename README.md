@@ -153,6 +153,93 @@ python -m src.cli etl --in data/silver/<file>_clean.json
 python -m src.cli report --last-hours 6
 ```
 
+## Airflow (оркестрация ETL)
+
+В проекте есть DAG `mih_etl_latest_strict`, который запускает полный цикл:
+
+`silver → gold → ClickHouse → SQL checks → Markdown daily report`.
+
+### Конфигурация через `.env` (НЕ коммитить)
+
+Все чувствительные значения (логин/пароль Airflow, ClickHouse, MinIO и т.д.) должны храниться только в локальном файле `.env`, который добавлен в `.gitignore`.
+
+Пример `.env` (значения подставь свои):
+
+```env
+# Airflow
+AIRFLOW_UID=50000
+AIRFLOW_GID=0
+AIRFLOW_WEBSERVER_PORT=8080
+AIRFLOW_ADMIN_USER=admin
+AIRFLOW_ADMIN_PASSWORD=change_me
+AIRFLOW_ADMIN_EMAIL=admin@example.com
+
+# ClickHouse (HTTP интерфейс)
+CH_HOST=clickhouse
+CH_PORT=8123
+CH_USER=admin
+CH_PASSWORD=change_me
+CLICKHOUSE_DATABASE=media_intel
+
+# MinIO / S3 (если используется)
+MINIO_ENDPOINT=http://localhost:9000
+MINIO_ACCESS_KEY=admin
+MINIO_SECRET_KEY=change_me
+MINIO_BUCKET=media-intel
+```
+
+### Запуск
+
+```bash
+# сборка образа Airflow с нужными пакетами/утилитами
+docker compose -f docker-compose.yml -f docker-compose.airflow.yml build
+
+# старт (Postgres Airflow + webserver + scheduler)
+docker compose -f docker-compose.yml -f docker-compose.airflow.yml up -d
+```
+
+Airflow UI будет доступен на `http://localhost:${AIRFLOW_WEBSERVER_PORT:-8080}`.  
+Логин/пароль берутся из `.env` (`AIRFLOW_ADMIN_USER` / `AIRFLOW_ADMIN_PASSWORD`).
+
+### Проверка и триггер DAG из терминала
+
+```bash
+# список DAG
+docker exec -it airflow-scheduler airflow dags list | grep mih
+
+# вручную запустить DAG
+docker exec -it airflow-scheduler airflow dags trigger mih_etl_latest_strict
+
+# посмотреть запуски DAG
+docker exec -it airflow-scheduler airflow dags list-runs -d mih_etl_latest_strict
+
+# статусы тасок внутри конкретного run_id
+docker exec -it airflow-scheduler airflow tasks states-for-dag-run   mih_etl_latest_strict "manual__YYYY-MM-DDTHH:MM:SS+00:00"
+```
+
+### Важный нюанс: доступ к Docker из scheduler
+
+Чтобы шаги, которые делают `docker exec ...` (например, вызов `clickhouse-client`), работали **изнутри Airflow-контейнера**, в `docker-compose.airflow.yml` для `airflow-scheduler` (и при необходимости `airflow-webserver`) должен быть примонтирован сокет Docker:
+
+```yaml
+volumes:
+  - /var/run/docker.sock:/var/run/docker.sock
+```
+
+Также проект монтируется в контейнер, чтобы DAG мог вызывать `make`:
+
+```yaml
+volumes:
+  - ./:/opt/mih
+```
+
+### Артефакты
+
+- DAG: `airflow/dags/mih_etl_latest_strict.py`
+- Логи Airflow: `airflow/logs/` (папку логов обычно не коммитят)
+- Markdown-отчёты: `reports/daily_report_*.md`
+
+
 ## Конфигурация и переменные окружения
 Секреты не коммитятся. Локально создай файл `.env` (он должен быть в `.gitignore`).
 В репозитории хранится только шаблон `.env.example`.
