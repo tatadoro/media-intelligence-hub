@@ -3,10 +3,10 @@ export
 
 .PHONY: up down ps logs restart reset \
         wait-minio wait-clickhouse \
-        create-bucket init bootstrap ch-show-schema clean-sql \
+        create-bucket init bootstrap smoke ch-show-schema clean-sql \
         views health quality topkw hour batches survival dupes report \
         gold load etl md-report reports etl-latest run validate-silver \
-        validate-gold validate gate etl-latest-strict
+        validate-gold validate gate etl-latest-strict 
 
 PYTHON  ?= python
 COMPOSE ?= docker compose
@@ -219,3 +219,7 @@ etl-latest:
 	$(MAKE) etl IN="$$LATEST"
 etl-latest-strict:
 	@$(MAKE) etl-latest STRICT=1
+# Full local sanity check (from scratch): infra + bucket + MinIO smoke + ETL + reports
+smoke: reset bootstrap
+	$(PYTHON) -m src.utils.s3_smoke_test
+	$(MAKE) etl-latest
