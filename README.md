@@ -1,6 +1,6 @@
 # Media Intelligence Hub
 
-Пет-проект на стыке Data Analytics и Data Science.
+Учебный пет-проект на стыке Data Analytics и Data Science.
 
 Цель: построить автоматизированный пайплайн мониторинга медиа:
 - сбор материалов из разных источников (RSS / API / парсеры);
@@ -8,241 +8,79 @@
 - очистка текста и извлечение ключевой информации;
 - семантическое обогащение (summary, keywords, фичи);
 - загрузка витрин в ClickHouse;
-- аналитика/дашборды (Superset, DataLens) и ежедневные отчёты.
+- аналитика/дашборды и отчёты (Markdown сейчас, BI — в планах).
 
-Статус: **MVP в разработке** (raw → silver → gold → ClickHouse + базовые SQL-проверки + генерация Markdown-отчёта).
+Статус: **MVP работает** (raw → silver → gold → ClickHouse + SQL-проверки + Airflow DAG + Markdown-отчёт).
 
-## Что уже реализовано (MVP)
-- Ingestion RSS → raw (локально и/или MinIO)
-- Raw → Silver: очистка текста
-- Silver → Gold: summary + keywords (TF-IDF), текстовые фичи
-- Gold → ClickHouse: загрузка витрин локально
-- SQL-набор для healthcheck/quality/keywords/дедупликации и аналитики в `sql/`
-- Генерация Markdown-отчёта из ClickHouse: `python -m src.reporting.generate_report`
-- Пример отчёта: `reports/examples/daily_report_example.md`
-- EDA-ноутбук по gold-слою: `notebooks/03_gold_eda.ipynb`
+## Архитектура пайплайна (MVP)
 
-## Архитектура пайплайна
-Слои данных: `raw → silver → gold → ClickHouse/BI`
+- **raw**: сырые выгрузки из RSS (и/или обогащённые body, если включен шаг enrich)
+- **silver**: очищенный текст (нормализация, чистка, контракт)
+- **gold**: обогащение (summary + keywords + текстовые фичи), контракт
+- **ClickHouse**: витрина `articles` (+ `load_log` для дедупа/защиты от повторных заливок)
+- **reports**: SQL-аналитика + Markdown-дайджест
 
-- **raw**: данные “как пришли” (минимум преобразований)
-- **silver**: очищенный текст (готов к NLP)
-- **gold**: семантическое обогащение (summary, keywords, фичи)
-- **витрины**: загрузка в ClickHouse + SQL-проверки/аналитика + отчёты
+## Airflow orchestration
 
-### Где лежат данные
-- локально: `data/` (в git **не добавляем**)
-- в MinIO: `raw/YYYY-MM-DD/<source>/...`
+Основной DAG: `mih_etl_latest_strict` (ручной запуск).
 
-### Форматы данных (по слоям)
-- **raw**: `data/raw/*.json` (JSON-массив записей)
-- **silver**: `data/silver/*_clean.json` (очищенный текст)
-- **gold**: `data/gold/*_processed.parquet` (обогащённые данные)
+Что делает:
+1) выбирает **самый свежий** silver-файл по паттерну `data/silver/articles_*.json`
+2) `precheck_silver`: быстрый sanity-check, чтобы не подхватить legacy-файл
+3) `validate_silver`: валидация по контракту silver
+4) `silver_to_gold`: преобразование silver → gold parquet
+5) `compute_gold_path`: вычисляет путь до gold-файла
+6) `validate_gold`: валидация по контракту gold
+7) `quality_gate`: quality gate (STRICT=1)
+8) `load_to_clickhouse`: загрузка gold → ClickHouse (с защитой от дублей)
+9) `sql_reports`: прогон SQL-отчётов (`make report`)
+10) `compute_report_window`: строит окно отчёта по **реальным данным в ClickHouse**: `[max(published_at) - last_hours, max(published_at)]`
+11) `md_report`: генерирует Markdown-отчёт
 
-## Структура репозитория
-- `src/` — код (коллекторы, обработка, пайплайны, отчёты)
-- `config/` — конфигурация (настройки запуска, параметры)
-- `sql/` — SQL для ClickHouse (DDL, проверки качества, аналитика)
-- `scripts/` — вспомогательные скрипты
-- `notebooks/` — EDA/эксперименты
-- `reports/` — отчёты (в git хранится только `reports/examples/`)
-- `data/` — локальные данные (не коммитятся)
-- `docker-compose.yml` — локальная инфраструктура (MinIO/ClickHouse)
-- `Makefile` — команды для локального запуска и проверок
-- `requirements.txt` — зависимости Python
-
-## Требования
-- Python 3.11+
-- Docker (для MinIO/ClickHouse)
-- (опционально) MinIO Client `mc` — для авто-создания бакета в `make bootstrap`
-
-## Быстрый старт (локально)
+Запуск DAG:
 ```bash
-git clone https://github.com/tatadoro/media-intelligence-hub.git
-cd media-intelligence-hub
-
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-cp .env.example .env
-```
-Важно: SQL-скрипты читают переменные CH_* (см. .env.example)
-Python-скрипты читают CLICKHOUSE_* (и тоже поддерживаются)
-
-## Быстрый старт через Makefile (рекомендуется)
-Если у тебя установлен `make`, можно прогонять инфраструктуру + DDL + пайплайн одной командой.
-
-```bash
-# Поднять сервисы, дождаться готовности, накатить DDL + views, (опционально) создать bucket в MinIO
-# Проверить, что make и docker доступны
-make --version
-docker --version
-docker compose version
-make bootstrap
-
-# Полный прогон: silver -> gold -> ClickHouse -> SQL-отчёты
-make etl IN=data/silver/<silver_file>_clean.json
-
-# Только отчётные SQL (health/quality/keywords и т.д.)
-make report
-```
-
-Примечание: при повторном запуске `make etl` загрузка в ClickHouse может показать
-`[SKIP] ... уже загружен` — это ожидаемо (идемпотентность по `load_log` и факту строк).
-
-## Быстрый старт (one-liner, запуск с нуля)
-```bash
-# Полный чистый старт: инфраструктура + DDL + views + (опционально) бакет MinIO
-make reset && make bootstrap
-
-# Прогон MVP-цепочки (silver -> gold -> ClickHouse -> SQL-отчёт)
-make etl IN=data/silver/articles_20251210_155554_enriched_clean.json
-```
-
-### Что должно получиться после запуска
-```bash
-make health
-make quality
-make dupes
-```
-
-Ожидаемые признаки “всё ок”:
-- `make health`: `rows > 0`, `bad_dates = 0`, `share_empty = 0`
-- `make quality`: `share_has_body` близко к `1`
-- `make dupes`: `duplicate_rows = 0` (как минимум внутри одного батча)
-
-## Отчёты (Markdown)
-Проект умеет генерировать ежедневный Markdown-отчёт **напрямую из витрины ClickHouse** (`media_intel.articles`).
-
-### Сгенерировать отчёт
-1) Убедись, что контейнеры подняты (`make bootstrap` или `docker compose up -d`)
-2) Активируй окружение
-3) Запусти генератор:
-
-```bash
-python -m src.reporting.generate_report
-```
-
-Отчёт будет сохранён в `reports/`.
-
-### Пример отчёта
-См. `reports/examples/daily_report_example.md`.
-
-Примеры:
-
-```bash
-# За последние 6 часов
-python -m src.reporting.generate_report --last-hours 6
-
-# За фиксированный период
-python -m src.reporting.generate_report --from "2025-12-10 14:00:00" --to "2025-12-10 19:00:00"
-
-# По dedup-витрине и с меньшим топом
-python -m src.reporting.generate_report --table articles_dedup --top-k 10 
-```
-## CLI (опционально)
-
-Можно запускать основные сценарии через единый entrypoint:
-
-```bash
-python -m src.cli bootstrap
-python -m src.cli smoke
-python -m src.cli etl --latest
-python -m src.cli etl --in data/silver/<file>_clean.json
-python -m src.cli report --last-hours 6
-```
-
-## Airflow (оркестрация ETL)
-
-В проекте есть DAG `mih_etl_latest_strict`, который запускает полный цикл:
-
-`silver → gold → ClickHouse → SQL checks → Markdown daily report`.
-
-### Конфигурация через `.env` (НЕ коммитить)
-
-Все чувствительные значения (логин/пароль Airflow, ClickHouse, MinIO и т.д.) должны храниться только в локальном файле `.env`, который добавлен в `.gitignore`.
-
-Пример `.env` (значения подставь свои):
-
-```env
-# Airflow
-AIRFLOW_UID=50000
-AIRFLOW_GID=0
-AIRFLOW_WEBSERVER_PORT=8080
-AIRFLOW_ADMIN_USER=admin
-AIRFLOW_ADMIN_PASSWORD=change_me
-AIRFLOW_ADMIN_EMAIL=admin@example.com
-
-# ClickHouse (HTTP интерфейс)
-CH_HOST=clickhouse
-CH_PORT=8123
-CH_USER=admin
-CH_PASSWORD=change_me
-CLICKHOUSE_DATABASE=media_intel
-
-# MinIO / S3 (если используется)
-MINIO_ENDPOINT=http://localhost:9000
-MINIO_ACCESS_KEY=admin
-MINIO_SECRET_KEY=change_me
-MINIO_BUCKET=media-intel
-```
-
-### Запуск
-
-```bash
-# сборка образа Airflow с нужными пакетами/утилитами
-docker compose -f docker-compose.yml -f docker-compose.airflow.yml build
-
-# старт (Postgres Airflow + webserver + scheduler)
-docker compose -f docker-compose.yml -f docker-compose.airflow.yml up -d
-```
-
-Airflow UI будет доступен на `http://localhost:${AIRFLOW_WEBSERVER_PORT:-8080}`.  
-Логин/пароль берутся из `.env` (`AIRFLOW_ADMIN_USER` / `AIRFLOW_ADMIN_PASSWORD`).
-
-### Проверка и триггер DAG из терминала
-
-```bash
-# список DAG
-docker exec -it airflow-scheduler airflow dags list | grep mih
-
-# вручную запустить DAG
 docker exec -it airflow-scheduler airflow dags trigger mih_etl_latest_strict
-
-# посмотреть запуски DAG
-docker exec -it airflow-scheduler airflow dags list-runs -d mih_etl_latest_strict
-
-# статусы тасок внутри конкретного run_id
-docker exec -it airflow-scheduler airflow tasks states-for-dag-run   mih_etl_latest_strict "manual__YYYY-MM-DDTHH:MM:SS+00:00"
 ```
 
-### Важный нюанс: доступ к Docker из scheduler
+Проверка статусов по последнему run_id (через папку логов):
+```bash
+RUN_ID=$(ls -1t airflow/logs/dag_id=mih_etl_latest_strict | head -n 1 | sed 's/^run_id=//')
+docker exec -it airflow-scheduler airflow tasks states-for-dag-run mih_etl_latest_strict "$RUN_ID"
+```
 
-Чтобы шаги, которые делают `docker exec ...` (например, вызов `clickhouse-client`), работали **изнутри Airflow-контейнера**, в `docker-compose.airflow.yml` для `airflow-scheduler` (и при необходимости `airflow-webserver`) должен быть примонтирован сокет Docker:
+### Доступ Airflow к Docker (если используешь `docker exec` внутри задач)
+
+Чтобы шаги, которые делают `docker exec ...` (например, вызов `clickhouse-client`), работали **изнутри Airflow-контейнера**, в `docker-compose.airflow.yml` для `airflow-scheduler` (и при необходимости `airflow-webserver`) должен быть примонтирован Docker socket:
 
 ```yaml
 volumes:
   - /var/run/docker.sock:/var/run/docker.sock
 ```
 
-Также проект монтируется в контейнер, чтобы DAG мог вызывать `make`:
+Также проект монтируется в контейнер, чтобы DAG мог вызывать `make` и скрипты проекта:
 
 ```yaml
 volumes:
   - ./:/opt/mih
 ```
 
-### Артефакты
+### Артефакты отчётов
 
-- DAG: `airflow/dags/mih_etl_latest_strict.py`
-- Логи Airflow: `airflow/logs/` (папку логов обычно не коммитят)
-- Markdown-отчёты: `reports/daily_report_*.md`
+- Runtime Markdown-отчёты: `reports/daily_report_*.md` (в `.gitignore`)
+- Пример отчёта для репозитория: `reports/examples/daily_report_sample.md` (коммитится)
 
+Обновить пример отчёта:
+```bash
+cp "$(ls -1t reports/daily_report_*.md | head -n 1)" reports/examples/daily_report_sample.md
+git add reports/examples/daily_report_sample.md
+git commit -m "Docs: update report sample"
+git push
+```
 
 ## Конфигурация и переменные окружения
+
 Секреты не коммитятся. Локально создай файл `.env` (он должен быть в `.gitignore`).
-В репозитории хранится только шаблон `.env.example`.
+В репозитории хранится только шаблон `.env.example` (если добавишь).
 
 ### MinIO / S3 (пример)
 ```bash
@@ -255,63 +93,36 @@ MINIO_SECURE=false
 ```
 
 ### ClickHouse (пример)
+
 Важно: SQL-раннер `scripts/ch_run_sql.sh` читает переменные `CH_*`.
 
 ```bash
-CH_CONTAINER=clickhouse
+CH_HOST=clickhouse
+CH_PORT=8123
 CH_USER=YOUR_CH_USER
 CH_PASSWORD=YOUR_CH_PASSWORD
 CH_DATABASE=media_intel
 ```
 
-> Примечание: генератор Markdown-отчёта (`src.reporting.generate_report`) читает как `CH_*`,
-> так и `CLICKHOUSE_*` переменные (для удобства совместимости с Docker Compose).
+Примечания:
+- внутри Docker-сети обычно `CH_HOST=clickhouse`, `CH_PORT=8123`
+- с хоста ClickHouse HTTP может быть проброшен на `http://localhost:18123`
 
-В `config/settings.yaml` управляется, куда писать raw-данные:
-- `raw_backend: local | s3 | both`
+Генератор Markdown-отчёта (`src.reporting.generate_report`) читает `CH_*` и `CLICKHOUSE_*` переменные (для совместимости).
 
-## Проверка сервисов (если нужно руками)
-- MinIO S3 endpoint: `http://localhost:9000`
-- MinIO Console: `http://localhost:9001`
-- ClickHouse HTTP: `http://localhost:18123`
-
-Проверить контейнеры:
-```bash
-docker compose ps
-```
-
-## MinIO: бакет для проекта
-Проект ожидает бакет `media-intel` (или значение из `MINIO_BUCKET` / `config/settings.yaml`).
-
-- `make bootstrap` вызывает `make create-bucket` **только если установлен `mc` и заполнены переменные MinIO в `.env`**.
-- Если `mc` не установлен — это не блокирует запуск MVP (raw/silver/gold/ClickHouse работают локально).
-
-Способ 1: через MinIO Console
-1) открой `http://localhost:9001`
-2) зайди под своими кредами
-3) создай бакет `media-intel`
-
-Способ 2: через MinIO Client (если установлен `mc`)
-```bash
-mc alias set local http://localhost:9000 YOUR_MINIO_USER YOUR_MINIO_PASSWORD
-mc mb local/media-intel
-```
 ## Контракты данных (silver/gold)
 
-В репозитории зафиксированы контракты слоёв в виде JSON Schema:
+В репозитории зафиксированы контракты слоёв (JSON Schema):
 - `contracts/silver.schema.json` — формат **silver** (`*_clean.json`)
-- `contracts/gold.schema.json` — формат **gold** (`*_processed.parquet`, колонки после NLP)
+- `contracts/gold.schema.json` — формат **gold** (`*_processed.parquet`)
 
-Скрипты валидации используют эти контракты как ориентир:
+Скрипты валидации:
 ```bash
 python scripts/validate_silver.py --input data/silver/<file>_clean.json
 python scripts/validate_gold.py --input data/gold/<file>_processed.parquet
 ```
-## Data Dictionary
 
-Описание полей слоёв (human-readable): `docs/data_dictionary.md`
-
-## Запуск пайплайна
+## Запуск пайплайна (локально без Airflow)
 
 ### 1 Сбор RSS → raw
 ```bash
@@ -338,134 +149,51 @@ python -m src.pipeline.gold_to_clickhouse_local --input data/gold/<gold_file>.pa
 make init
 ```
 
-## SQL: проверки качества и аналитика (ClickHouse)
-Файлы в `sql/` предназначены для контроля качества и аналитики поверх загруженных данных.
+## SQL-отчёты и проверки (ClickHouse)
 
-Рекомендуемый порядок:
-1) `sql/00_ddl.sql` (создание базы/таблиц)
-2) `sql/00_views.sql` (вьюхи/представления)
-3) `sql/01_healthcheck.sql`
-4) `sql/02_content_quality.sql`
-5) `sql/03_top_keywords.sql`
-6) батчевые проверки и аналитика: `05_*`, `06_*`, `07_*`
+SQL-файлы в `sql/` предназначены для контроля качества и аналитики поверх загруженных данных.
 
-Запуск через Makefile:
+Запуск набора отчётов:
 ```bash
 make report
-```
-
-## Примеры аналитики
-- `notebooks/03_gold_eda.ipynb` — EDA gold-слоя (keywords, динамика по дням, базовые проверки)
-
-Запуск:
-```bash
-source venv/bin/activate
-jupyter notebook
 ```
 
 ## Безопасность и артефакты
 - `.env` и любые секреты **не коммитятся**
 - `data/` и локальные артефакты **не коммитятся**
+- runtime отчёты `reports/daily_report_*.md` **не коммитятся**
 - в `reports/` в git хранится только `reports/examples/`
 
 ## Troubleshooting
 
-### Быстрый диагностический чек-лист
-```bash
-docker compose ps
-docker compose logs -f --tail=200
-make ps
-make logs
-```
-
-Если нужно “проверить проект как пользователь” с нуля:
-```bash
-make smoke
-```
-
-### ClickHouse не готов / таймаут в wait-clickhouse
-Признаки: `ClickHouse not ready (timeout)` или SQL-скрипты не выполняются.
-
-Проверь контейнер и логи:
+### ClickHouse не готов / таймаут
 ```bash
 docker compose ps
 docker compose logs -f --tail=200 clickhouse
-```
-
-Проверь, что ClickHouse отвечает:
-```bash
 curl -sSf http://localhost:18123/ping
 ```
 
-Если нужно полностью перезапустить с чистыми volumes:
-```bash
-make reset
-make bootstrap
-```
-
-### MinIO не готов / таймаут в wait-minio
-Признаки: `MinIO not ready (timeout)` или bucket не создаётся.
-
-Проверка health:
-```bash
-curl -sSf http://localhost:9000/minio/health/ready
-```
-
-Логи:
+### MinIO не готов / таймаут
 ```bash
 docker compose logs -f --tail=200 minio
-```
-
-Полный перезапуск:
-```bash
-make reset
-make bootstrap
+curl -sSf http://localhost:9000/minio/health/ready
 ```
 
 ### `mc not found. Skip bucket creation.`
 Это не блокирует MVP: raw/silver/gold/ClickHouse работают локально.
-
 Если хочешь автосоздание бакета — установи MinIO Client:
 ```bash
 brew install minio/stable/mc
 ```
 
-И убедись, что `.env` заполнен:
-```bash
-grep -E "MINIO_(ENDPOINT|ACCESS_KEY|SECRET_KEY|BUCKET)" .env
-```
-
 ### Переменные окружения не подхватываются
-Makefile читает `.env` из корня репозитория.
-
-Проверь, что файл существует:
+Проверь, что `.env` лежит в корне репозитория:
 ```bash
 ls -la .env
 ```
 
-Сверь с примером:
-```bash
-sed -n '1,120p' .env.example
-```
-
-### `No files found: data/silver/articles*_clean.json`
-Это значит, что в `data/silver/` пока нет готовых silver-файлов.
-
-Варианты:
-1) Запусти сбор и подготовку данных (пример):
-```bash
-python -m src.collectors.rss_collector
-python -m src.pipeline.enrich_raw_with_body_local
-python -m src.pipeline.clean_raw_to_silver_local
-```
-
-2) Или запусти ETL, явно указав silver-файл:
-```bash
-make etl IN=data/silver/<your_file>_clean.json
-```
-
 ### Повторный прогон “не льёт” данные (дедуп по батчу)
-Скрипт загрузки защищает от дублей через `load_log` и проверку факта наличия строк в таблице по `ingest_object_name`.
+Скрипт загрузки защищает от дублей через `load_log` и проверку наличия строк в `articles` по `ingest_object_name`.
 
 Если хочешь прогнать всё “как с нуля”:
 ```bash
@@ -474,17 +202,9 @@ make bootstrap
 make etl-latest
 ```
 
-### Git: `Permission denied (publickey)`
-Если push по SSH не работает, проще переключиться на HTTPS remote или настроить SSH-ключи.
-
-Проверить текущий remote:
-```bash
-git remote -v
-```
-
 ## Roadmap
 - обогащение gold: эмбеддинги, тематическое моделирование, тональность
 - улучшение извлечения ключевых фраз и суммаризации
-- стабильные витрины ClickHouse под BI (Superset/DataLens)
-- ежедневные отчёты/уведомления (дайджесты)
-- оркестрация (Airflow) и расписания
+- витрины ClickHouse под BI (Superset/DataLens)
+- расписания и уведомления (ежедневные дайджесты)
+- расширение источников (несколько RSS/API)
