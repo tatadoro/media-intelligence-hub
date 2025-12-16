@@ -132,8 +132,16 @@ md-report:
 	python -m src.reporting.generate_report $$ARGS
 
 # Run SQL reports + generate Markdown report
-reports: report md-report
+# Run SQL reports + generate Markdown report
+# You can pass params for Markdown report:
+#   make reports LAST_HOURS=6
+#   make reports FROM="2025-12-10 14:00:00" TO="2025-12-10 19:00:00"
+#   make reports TABLE=articles_dedup TOP_K=10
+reports:
+	@$(MAKE) report
+	@$(MAKE) md-report LAST_HOURS="$(LAST_HOURS)" FROM="$(FROM)" TO="$(TO)" TABLE="$(TABLE)" TOP_K="$(TOP_K)" OUTDIR="$(OUTDIR)"
 	@echo "Done: SQL + Markdown reports generated."
+
 # ----------- ETL helpers -----------
 # 1) Silver -> Gold
 # usage:
