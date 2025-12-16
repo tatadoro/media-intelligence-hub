@@ -53,7 +53,10 @@ dist/
 *.whl
 
 # Local data/artifacts (do not commit)
-data/
+data/**
+!data/
+!data/**/
+!data/**/.gitkeep
 load_log*.tsv
 load_log*.csv
 *_backup*
