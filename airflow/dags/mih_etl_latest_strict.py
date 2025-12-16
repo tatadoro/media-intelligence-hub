@@ -1,34 +1,167 @@
 from __future__ import annotations
 
-from datetime import timedelta
+import json
+import logging
+import os
+from datetime import datetime, timedelta
 from pathlib import Path
 
+import requests
 from airflow import DAG
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 from airflow.utils.dates import days_ago
 
-
 PROJECT_DIR = Path("/opt/mih")
 SILVER_DIR = PROJECT_DIR / "data" / "silver"
 
 
+def precheck_latest_silver(**context) -> None:
+    """
+    Логируем выбранный silver и быстро проверяем, что файл не legacy:
+    - файл читается
+    - в первых N записях есть обязательные ключи (published_at и т.п.)
+    Поддерживаем JSON-массив и JSONL.
+
+    Зачем: чтобы DAG не падал на validate_silver из-за случайно подобранного legacy-файла.
+    """
+    ti = context["ti"]
+    silver_rel = ti.xcom_pull(task_ids="pick_latest_silver")
+    if not silver_rel:
+        raise ValueError("XCom empty: pick_latest_silver returned nothing")
+
+    silver_path = PROJECT_DIR / Path(str(silver_rel))
+    logging.info("Selected silver file: %s", silver_path)
+
+    if not silver_path.exists():
+        raise FileNotFoundError(f"Selected silver file does not exist: {silver_path}")
+
+    # Минимальный набор. Можно расширить, если захочешь сделать проверку строже.
+    required = {"published_at", "title"}
+    checked = 0
+    ok = False
+
+    with silver_path.open("r", encoding="utf-8") as f:
+        first = f.read(1)
+        f.seek(0)
+
+        # JSON-массив
+        if first == "[":
+            data = json.load(f)
+            for row in data[:20]:
+                checked += 1
+                if isinstance(row, dict) and required.issubset(row.keys()):
+                    ok = True
+                    break
+        # JSONL
+        else:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                checked += 1
+                if isinstance(row, dict) and required.issubset(row.keys()):
+                    ok = True
+                    break
+                if checked >= 20:
+                    break
+
+    if not ok:
+        raise ValueError(
+            f"Silver precheck failed: required keys {sorted(required)} not found "
+            f"in first {checked} records of {silver_rel}"
+        )
+
+    logging.info("Silver precheck OK (%s records scanned).", checked)
+
+
 def pick_latest_silver_file() -> str:
     """
-    Возвращает относительный путь к самому свежему silver JSON-файлу.
-    Airflow положит return в XCom, дальше используем в BashOperator.
+    Возвращает относительный путь (от /opt/mih) к самому свежему silver JSON-файлу.
+
+    ВАЖНО: чтобы не подхватить legacy/тестовые файлы, берём только articles_*.json.
     """
     if not SILVER_DIR.exists():
         raise FileNotFoundError(f"Silver dir not found: {SILVER_DIR}")
 
-    # Подстрой под свой паттерн, если нужно:
-    candidates = sorted(SILVER_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    candidates = sorted(
+        SILVER_DIR.glob("articles_*.json"),
+        key=lambda p: p.stat().st_mtime,
+    )
     if not candidates:
-        raise FileNotFoundError(f"No silver files found in: {SILVER_DIR}")
+        raise FileNotFoundError(
+            f"No silver files found in: {SILVER_DIR}. Expected pattern: articles_*.json"
+        )
 
     latest = candidates[-1]
-    # В Makefile/скриптах у тебя используются относительные пути от /opt/mih
     return str(latest.relative_to(PROJECT_DIR))
+
+
+def compute_report_window(last_hours: int = 6, **context) -> dict:
+    """
+    Берём последнее время публикации из ClickHouse и строим окно отчёта
+    [max_dt - last_hours, max_dt]. Так отчёт всегда по реальным данным.
+
+    Возвращаем dict для XCom: {"dt_from": "...", "dt_to": "..."}
+    """
+    host = os.getenv("CH_HOST", os.getenv("CLICKHOUSE_HOST", "clickhouse"))
+    port = int(os.getenv("CH_PORT", os.getenv("CLICKHOUSE_PORT", "8123")))
+    db = os.getenv(
+        "CH_DATABASE",
+        os.getenv("CLICKHOUSE_DATABASE", os.getenv("CLICKHOUSE_DB", "media_intel")),
+    )
+    table = os.getenv("REPORT_TABLE", "articles")
+
+    user = os.getenv("CH_USER", os.getenv("CLICKHOUSE_USER", ""))
+    password = os.getenv("CH_PASSWORD", os.getenv("CLICKHOUSE_PASSWORD", ""))
+
+    url = f"http://{host}:{port}/"
+    query = (
+        f"SELECT formatDateTime(max(published_at), '%F %T') "
+        f"FROM {db}.{table} FORMAT TabSeparated"
+    )
+
+    auth = (user, password) if (user or password) else None
+    r = requests.get(url, params={"query": query}, auth=auth, timeout=30)
+    r.raise_for_status()
+
+    max_dt_str = r.text.strip()
+    if not max_dt_str:
+        raise ValueError("ClickHouse returned empty max(published_at). Table is empty?")
+
+    # 'YYYY-MM-DD HH:MM:SS'
+    max_dt = datetime.fromisoformat(max_dt_str)
+    dt_from = max_dt - timedelta(hours=int(last_hours))
+
+    return {
+        "dt_from": dt_from.strftime("%Y-%m-%d %H:%M:%S"),
+        "dt_to": max_dt.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def compute_gold_path(**context) -> str:
+    """
+    Строит относительный путь gold parquet из пути silver, который лежит в XCom.
+    Ожидаем, что silver файл заканчивается на *_clean.json,
+    а gold — на *_processed.parquet.
+    """
+    ti = context["ti"]
+    silver_rel = ti.xcom_pull(task_ids="pick_latest_silver")
+    if not silver_rel:
+        raise ValueError("XCom is empty: pick_latest_silver did not return a path")
+
+    silver_name = Path(str(silver_rel)).name
+
+    if silver_name.endswith("_clean.json"):
+        gold_name = silver_name.replace("_clean.json", "_processed.parquet")
+    elif silver_name.endswith(".json"):
+        # запасной вариант, если вдруг суффикс отличается
+        gold_name = silver_name.replace(".json", "_processed.parquet")
+    else:
+        raise ValueError(f"Unexpected silver filename: {silver_name}")
+
+    return f"data/gold/{gold_name}"
 
 
 default_args = {
@@ -42,22 +175,26 @@ with DAG(
     default_args=default_args,
     description="MIH ETL: latest silver -> gold -> clickhouse -> reports (strict)",
     start_date=days_ago(1),
-    schedule=None,  # оставляем ручной запуск; потом поставим cron
+    schedule=None,  # ручной запуск; позже можно поставить cron
     catchup=False,
     max_active_runs=1,
     tags=["mih"],
 ) as dag:
-
     pick_latest_silver = PythonOperator(
         task_id="pick_latest_silver",
         python_callable=pick_latest_silver_file,
+    )
+
+    precheck_silver = PythonOperator(
+        task_id="precheck_silver",
+        python_callable=precheck_latest_silver,
     )
 
     validate_silver = BashOperator(
         task_id="validate_silver",
         bash_command=(
             "cd /opt/mih && "
-            "make validate-silver IN={{ ti.xcom_pull(task_ids='pick_latest_silver') }}"
+            "make validate-silver IN=\"{{ ti.xcom_pull(task_ids='pick_latest_silver') }}\""
         ),
     )
 
@@ -66,39 +203,20 @@ with DAG(
         bash_command=(
             "cd /opt/mih && "
             "python -m src.pipeline.silver_to_gold_local "
-            "--input {{ ti.xcom_pull(task_ids='pick_latest_silver') }}"
+            "--input \"{{ ti.xcom_pull(task_ids='pick_latest_silver') }}\""
         ),
     )
 
-    # Если хочешь, можно вычислять имя gold файла в коде и передавать дальше.
-    # Но у тебя уже есть make-цель load/gate, которая сама знает, что делать после генерации.
-    # Здесь используем make etl для простоты на данном этапе.
-    # Более "чисто" — вычислить путь gold и передать в XCom, но это следующий рефакторинг.
-
-    # Вариант A: строго повторяем логику Makefile (сам построит gold и возьмёт нужный файл)
-    # Вариант B: сделать отдельные шаги validate-gold / gate / load с явным IN.
-    # Ниже — вариант B (прозрачнее).
-
-    # Предполагаем, что silver_to_gold_local пишет parquet с тем же базовым именем.
-    # Если имя отличается — лучше вынести в функцию compute_gold_path().
-    compute_gold_path = BashOperator(
+    compute_gold_path_task = PythonOperator(
         task_id="compute_gold_path",
-        bash_command=(
-            "python - <<'PY'\n"
-            "from pathlib import Path\n"
-            "silver = Path('/opt/mih') / Path(\"{{ ti.xcom_pull(task_ids='pick_latest_silver') }}\")\n"
-            "out = silver.name.replace('_clean.json', '_processed.parquet')\n"
-            "print(f\"data/gold/{out}\")\n"
-            "PY"
-        ),
-        do_xcom_push=True,
+        python_callable=compute_gold_path,
     )
 
     validate_gold = BashOperator(
         task_id="validate_gold",
         bash_command=(
             "cd /opt/mih && "
-            "make validate-gold IN={{ ti.xcom_pull(task_ids='compute_gold_path') }}"
+            "make validate-gold IN=\"{{ ti.xcom_pull(task_ids='compute_gold_path') }}\""
         ),
     )
 
@@ -106,7 +224,7 @@ with DAG(
         task_id="quality_gate",
         bash_command=(
             "cd /opt/mih && "
-            "make gate IN={{ ti.xcom_pull(task_ids='compute_gold_path') }} STRICT=1"
+            "make gate IN=\"{{ ti.xcom_pull(task_ids='compute_gold_path') }}\" STRICT=1"
         ),
     )
 
@@ -115,21 +233,33 @@ with DAG(
         bash_command=(
             "cd /opt/mih && "
             "python -m src.pipeline.gold_to_clickhouse_local "
-            "--input {{ ti.xcom_pull(task_ids='compute_gold_path') }}"
+            "--input \"{{ ti.xcom_pull(task_ids='compute_gold_path') }}\""
         ),
     )
 
     sql_reports = BashOperator(
         task_id="sql_reports",
-        bash_command="cd /opt/mih && make sql-reports",
+        bash_command="cd /opt/mih && make report",
+    )
+
+    compute_report_window_task = PythonOperator(
+        task_id="compute_report_window",
+        python_callable=compute_report_window,
+        op_kwargs={"last_hours": 6},
     )
 
     md_report = BashOperator(
         task_id="md_report",
-        bash_command="cd /opt/mih && make md-report LAST_HOURS=6",
+        bash_command=(
+            "cd /opt/mih && "
+            "python -m src.reporting.generate_report "
+            "--from \"{{ ti.xcom_pull(task_ids='compute_report_window')['dt_from'] }}\" "
+            "--to \"{{ ti.xcom_pull(task_ids='compute_report_window')['dt_to'] }}\" "
+            "--table articles"
+        ),
     )
 
     # Граф зависимостей
-    pick_latest_silver >> validate_silver >> silver_to_gold >> compute_gold_path
-    compute_gold_path >> validate_gold >> quality_gate >> load_to_clickhouse
-    load_to_clickhouse >> sql_reports >> md_report
+    pick_latest_silver >> precheck_silver >> validate_silver >> silver_to_gold >> compute_gold_path_task
+    compute_gold_path_task >> validate_gold >> quality_gate >> load_to_clickhouse
+    load_to_clickhouse >> sql_reports >> compute_report_window_task >> md_report

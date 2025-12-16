@@ -70,3 +70,6 @@ airflow/dags/__pycache__/
 .DS_Store
 
 config/.env
+
+# runtime reports (generated)
+reports/daily_report_*.md

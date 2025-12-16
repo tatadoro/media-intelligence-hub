@@ -23,6 +23,7 @@ class CHConfig:
     host: str = os.getenv("CH_HOST", os.getenv("CLICKHOUSE_HOST", "localhost"))
     port: int = int(os.getenv("CH_PORT", os.getenv("CLICKHOUSE_PORT", "18123")))
     tz: str = os.getenv("CH_TZ", os.getenv("APP_TZ", "Europe/Moscow"))
+
     # database: поддерживаем все варианты имён, которые встречаются в проекте
     database: str = os.getenv(
         "CH_DATABASE",
@@ -34,6 +35,16 @@ class CHConfig:
             ),
         ),
     )
+
+    # user/password: берём только из env; дефолтных паролей в коде не держим
+    user: str = os.getenv("CH_USER", os.getenv("CLICKHOUSE_USER", "admin"))
+    password: str = os.getenv("CH_PASSWORD", os.getenv("CLICKHOUSE_PASSWORD", ""))
+
+    def __post_init__(self) -> None:
+        if not self.password:
+            raise RuntimeError(
+                "ClickHouse password is not set. Set CH_PASSWORD (or CLICKHOUSE_PASSWORD) in environment / .env."
+            )
 
     # user/password: берём только из env; дефолтных паролей в коде не держим
 user: str = os.getenv("CH_USER", os.getenv("CLICKHOUSE_USER", "admin"))
