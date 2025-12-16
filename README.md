@@ -8,9 +8,9 @@
 - очистка текста и извлечение ключевой информации;
 - семантическое обогащение (summary, keywords, фичи);
 - загрузка витрин в ClickHouse;
-- аналитика/дашборды (Superset, DataLens) и ежедневные отчёты (в планах).
+- аналитика/дашборды (Superset, DataLens) и ежедневные отчёты.
 
-Статус: **MVP в разработке** (raw → silver → gold → ClickHouse + базовые SQL-проверки).
+Статус: **MVP в разработке** (raw → silver → gold → ClickHouse + базовые SQL-проверки + генерация Markdown-отчёта).
 
 ## Что уже реализовано (MVP)
 - Ingestion RSS → raw (локально и/или MinIO)
@@ -18,6 +18,8 @@
 - Silver → Gold: summary + keywords (TF-IDF), текстовые фичи
 - Gold → ClickHouse: загрузка витрин локально
 - SQL-набор для healthcheck/quality/keywords/дедупликации и аналитики в `sql/`
+- Генерация Markdown-отчёта из ClickHouse: `python -m src.reporting.generate_report`
+- Пример отчёта: `reports/examples/daily_report_example.md`
 - EDA-ноутбук по gold-слою: `notebooks/03_gold_eda.ipynb`
 
 ## Архитектура пайплайна
@@ -26,7 +28,7 @@
 - **raw**: данные “как пришли” (минимум преобразований)
 - **silver**: очищенный текст (готов к NLP)
 - **gold**: семантическое обогащение (summary, keywords, фичи)
-- **витрины**: загрузка в ClickHouse + SQL-проверки/аналитика
+- **витрины**: загрузка в ClickHouse + SQL-проверки/аналитика + отчёты
 
 ### Где лежат данные
 - локально: `data/` (в git **не добавляем**)
@@ -38,11 +40,12 @@
 - **gold**: `data/gold/*_processed.parquet` (обогащённые данные)
 
 ## Структура репозитория
-- `src/` — код (коллекторы, обработка, пайплайны)
+- `src/` — код (коллекторы, обработка, пайплайны, отчёты)
 - `config/` — конфигурация (настройки запуска, параметры)
 - `sql/` — SQL для ClickHouse (DDL, проверки качества, аналитика)
 - `scripts/` — вспомогательные скрипты
 - `notebooks/` — EDA/эксперименты
+- `reports/` — отчёты (в git хранится только `reports/examples/`)
 - `data/` — локальные данные (не коммитятся)
 - `docker-compose.yml` — локальная инфраструктура (MinIO/ClickHouse)
 - `Makefile` — команды для локального запуска и проверок
@@ -103,6 +106,23 @@ make dupes
 - `make quality`: `share_has_body` близко к `1`
 - `make dupes`: `duplicate_rows = 0` (как минимум внутри одного батча)
 
+## Отчёты (Markdown)
+Проект умеет генерировать ежедневный Markdown-отчёт **напрямую из витрины ClickHouse** (`media_intel.articles`).
+
+### Сгенерировать отчёт
+1) Убедись, что контейнеры подняты (`make bootstrap` или `docker compose up -d`)
+2) Активируй окружение
+3) Запусти генератор:
+
+```bash
+python -m src.reporting.generate_report
+```
+
+Отчёт будет сохранён в `reports/`.
+
+### Пример отчёта
+См. `reports/examples/daily_report_example.md`.
+
 ## Конфигурация и переменные окружения
 Секреты не коммитятся. Локально создай файл `.env` (он должен быть в `.gitignore`).
 В репозитории хранится только шаблон `.env.example`.
@@ -126,6 +146,9 @@ CH_USER=YOUR_CH_USER
 CH_PASSWORD=YOUR_CH_PASSWORD
 CH_DATABASE=media_intel
 ```
+
+> Примечание: генератор Markdown-отчёта (`src.reporting.generate_report`) читает как `CH_*`,
+> так и `CLICKHOUSE_*` переменные (для удобства совместимости с Docker Compose).
 
 В `config/settings.yaml` управляется, куда писать raw-данные:
 - `raw_backend: local | s3 | both`
@@ -212,6 +235,7 @@ jupyter notebook
 ## Безопасность и артефакты
 - `.env` и любые секреты **не коммитятся**
 - `data/` и локальные артефакты **не коммитятся**
+- в `reports/` в git хранится только `reports/examples/`
 
 ## Roadmap
 - обогащение gold: эмбеддинги, тематическое моделирование, тональность
