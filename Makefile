@@ -6,11 +6,31 @@ export
         create-bucket init bootstrap smoke ch-show-schema clean-sql \
         views health quality topkw hour batches survival dupes report \
         gold load etl md-report reports etl-latest run validate-silver \
-        validate-gold validate gate etl-latest-strict 
+        validate-gold validate gate etl-latest-strict env-check
 
 PYTHON  ?= python
 COMPOSE ?= docker compose
 SILVER_GLOB ?= data/silver/articles*_clean.json
+
+# ----------- Connection defaults (local scripts) -----------
+# These are used by scripts/ch_run_sql.sh and src.reporting.generate_report.
+# Priority: real env (docker compose) > .env (-include) > defaults
+
+CH_USER     ?= admin
+CH_PASSWORD ?= $(CLICKHOUSE_PASSWORD)
+CH_DATABASE ?= media_intel
+CH_HOST     ?= localhost
+CH_PORT     ?= 18123
+
+env-check:
+	@echo "[INFO] Effective env for ClickHouse (Makefile)"
+	@echo "CH_USER=$(CH_USER)"
+	@if [ -n "$(CH_PASSWORD)" ]; then echo "CH_PASSWORD=$$(printf '%s' "$(CH_PASSWORD)" | sed -E 's/^(.{2}).*(.{2})$$/\1***\2/') (len=$$(printf '%s' "$(CH_PASSWORD)" | wc -c | tr -d ' '))"; else echo "CH_PASSWORD=<empty>"; fi
+	@echo "CH_DATABASE=$(CH_DATABASE)"
+	@echo "CH_HOST=$(CH_HOST)"
+	@echo "CH_PORT=$(CH_PORT)"
+	@echo "CLICKHOUSE_USER=$(CLICKHOUSE_USER)"
+	@if [ -n "$(CLICKHOUSE_PASSWORD)" ]; then echo "CLICKHOUSE_PASSWORD=$$(printf '%s' "$(CLICKHOUSE_PASSWORD)" | sed -E 's/^(.{2}).*(.{2})$$/\1***\2/') (len=$$(printf '%s' "$(CLICKHOUSE_PASSWORD)" | wc -c | tr -d ' '))"; else echo "CLICKHOUSE_PASSWORD=<empty>"; fi
 
 # ----------- Local infra helpers -----------
 up:
@@ -37,7 +57,7 @@ reset:
 wait-clickhouse:
 	@echo "[INFO] Waiting for ClickHouse..."
 	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do \
-		docker exec clickhouse clickhouse-client -q "SELECT 1" >/dev/null 2>&1 && { echo "[OK] ClickHouse ready"; exit 0; }; \
+		docker exec clickhouse clickhouse-client -u "$${CLICKHOUSE_USER:-admin}" --password "$${CLICKHOUSE_PASSWORD:-}" -q "SELECT 1" >/dev/null 2>&1 && { echo "[OK] ClickHouse ready"; exit 0; }; \
 		sleep 1; \
 	done; \
 	echo "[WARN] ClickHouse not ready (timeout)."; exit 1
@@ -131,13 +151,9 @@ md-report:
 	if [ -n "$(TABLE)" ]; then ARGS="$$ARGS --table $(TABLE)"; fi; \
 	if [ -n "$(TOP_K)" ]; then ARGS="$$ARGS --top-k $(TOP_K)"; fi; \
 	if [ -n "$(OUTDIR)" ]; then ARGS="$$ARGS --outdir $(OUTDIR)"; fi; \
-	python -m src.reporting.generate_report $$ARGS
+	$(PYTHON) -m src.reporting.generate_report $$ARGS
 
 # Run SQL reports + generate Markdown report
-# You can pass params for Markdown report:
-#   make reports LAST_HOURS=6
-#   make reports FROM="2025-12-10 14:00:00" TO="2025-12-10 19:00:00"
-#   make reports TABLE=articles_dedup TOP_K=10
 reports:
 	@$(MAKE) report
 	@$(MAKE) md-report LAST_HOURS="$(LAST_HOURS)" FROM="$(FROM)" TO="$(TO)" TABLE="$(TABLE)" TOP_K="$(TOP_K)" OUTDIR="$(OUTDIR)"
@@ -145,22 +161,12 @@ reports:
 
 # ----------- ETL helpers -----------
 
-# Validate silver input contract
-# usage:
-#   make validate-silver IN=data/silver/xxx_clean.json
 validate-silver:
 	$(PYTHON) scripts/validate_silver.py --input $(IN)
 
-# Validate gold input contract
-# usage:
-#   make validate-gold IN=data/gold/xxx_processed.parquet
 validate-gold:
 	$(PYTHON) scripts/validate_gold.py --input $(IN)
 
-# Unified validation (best-effort)
-# usage:
-#   make validate SILVER_IN=data/silver/xxx_clean.json GOLD_IN=data/gold/xxx_processed.parquet
-#   make validate  # просто health + report checks (если сервисы подняты)
 validate:
 	@echo "[INFO] Running validations..."
 	@if [ -n "$(SILVER_IN)" ]; then $(MAKE) validate-silver IN="$(SILVER_IN)"; else echo "[SKIP] SILVER_IN not set"; fi
@@ -168,10 +174,6 @@ validate:
 	@$(MAKE) health || true
 	@echo "[OK] validate finished"
 
-# Quality gate for gold (best-effort by default)
-# usage:
-#   make gate IN=data/gold/xxx_processed.parquet
-#   make gate IN=... STRICT=1
 GATE_MIN_ROWS          ?= 20
 GATE_MIN_BODY_SHARE    ?= 0.05
 GATE_MIN_BODY_CHARS    ?= 50
@@ -184,31 +186,20 @@ gate:
 	if [ "$(STRICT)" = "1" ]; then ARGS="$$ARGS --strict"; fi; \
 	$(PYTHON) scripts/quality_gate_gold.py $$ARGS
 
-# 1) Silver -> Gold
-# usage:
-#   make gold IN=data/silver/xxx_clean.json
 gold:
 	$(PYTHON) -m src.pipeline.silver_to_gold_local --input $(IN)
 
-# 2) Gold -> ClickHouse
-# usage:
-#   make load IN=data/gold/xxx_processed.parquet
-# 2) Gold -> ClickHouse
-# usage:
-#   make load IN=data/gold/xxx_processed.parquet
 load:
 	$(MAKE) validate-gold IN=$(IN)
 	$(MAKE) gate IN=$(IN) STRICT=$(STRICT)
 	$(PYTHON) -m src.pipeline.gold_to_clickhouse_local --input $(IN)
 
-# 3) Full run: Silver -> Gold -> ClickHouse -> Report
-# usage:
-#   make etl IN=data/silver/xxx_clean.json
 etl:
 	$(MAKE) validate-silver IN=$(IN)
 	$(PYTHON) -m src.pipeline.silver_to_gold_local --input $(IN)
 	$(MAKE) load IN=data/gold/$(notdir $(IN:_clean.json=_processed.parquet)) STRICT=$(STRICT)
 	$(MAKE) reports
+
 etl-latest:
 	@LATEST="$$(ls -t $(SILVER_GLOB) 2>/dev/null | head -n 1)"; \
 	if [ -z "$$LATEST" ]; then \
@@ -217,9 +208,10 @@ etl-latest:
 	fi; \
 	echo "[INFO] Using latest silver file: $$LATEST"; \
 	$(MAKE) etl IN="$$LATEST"
+
 etl-latest-strict:
 	@$(MAKE) etl-latest STRICT=1
-# Full local sanity check (from scratch): infra + bucket + MinIO smoke + ETL + reports
+
 smoke: reset bootstrap
 	$(PYTHON) -m src.utils.s3_smoke_test
 	$(MAKE) etl-latest

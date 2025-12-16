@@ -5,60 +5,90 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 import requests
 
 try:
     from dotenv import load_dotenv
 
-    load_dotenv(Path(__file__).resolve().parents[2] / ".env")  # корень репо
+    load_dotenv(Path(__file__).resolve().parents[2] / ".env")  # repo root
 except Exception:
-    # если dotenv не установлен или .env отсутствует — просто работаем дальше
     pass
+
+
+def _running_in_docker() -> bool:
+    if os.path.exists("/.dockerenv"):
+        return True
+    try:
+        cgroup = Path("/proc/1/cgroup")
+        if cgroup.exists() and "docker" in cgroup.read_text(encoding="utf-8", errors="ignore"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _default_host_port() -> Tuple[str, int]:
+    # If explicitly set in env -> use it
+    if os.getenv("CH_HOST") or os.getenv("CLICKHOUSE_HOST"):
+        host = os.getenv("CH_HOST", os.getenv("CLICKHOUSE_HOST", "localhost"))
+        port = int(os.getenv("CH_PORT", os.getenv("CLICKHOUSE_PORT", "8123")))
+        return host, port
+
+    # If inside docker (airflow container) -> connect by service name
+    if _running_in_docker():
+        return "clickhouse", 8123
+
+    # Local default: host-mapped port from docker-compose.yml
+    return "localhost", 18123
 
 
 @dataclass
 class CHConfig:
-    host: str = os.getenv("CH_HOST", os.getenv("CLICKHOUSE_HOST", "localhost"))
-    port: int = int(os.getenv("CH_PORT", os.getenv("CLICKHOUSE_PORT", "18123")))
-    tz: str = os.getenv("CH_TZ", os.getenv("APP_TZ", "Europe/Moscow"))
+    host: str
+    port: int
+    tz: str
+    database: str
+    user: str
+    password: str
 
-    # database: поддерживаем все варианты имён, которые встречаются в проекте
-    database: str = os.getenv(
-        "CH_DATABASE",
-        os.getenv(
-            "CH_DB",
+    @classmethod
+    def from_env(cls) -> "CHConfig":
+        host, port = _default_host_port()
+
+        tz = os.getenv("CH_TZ", os.getenv("APP_TZ", "Europe/Moscow"))
+
+        database = os.getenv(
+            "CH_DATABASE",
             os.getenv(
-                "CLICKHOUSE_DB",
-                os.getenv("CLICKHOUSE_DATABASE", "media_intel"),
+                "CH_DB",
+                os.getenv(
+                    "CLICKHOUSE_DB",
+                    os.getenv("CLICKHOUSE_DATABASE", "media_intel"),
+                ),
             ),
-        ),
-    )
+        )
 
-    # user/password: берём только из env; дефолтных паролей в коде не держим
-    user: str = os.getenv("CH_USER", os.getenv("CLICKHOUSE_USER", "admin"))
-    password: str = os.getenv("CH_PASSWORD", os.getenv("CLICKHOUSE_PASSWORD", ""))
+        user = os.getenv("CH_USER", os.getenv("CLICKHOUSE_USER", "admin"))
+        password = os.getenv("CH_PASSWORD", os.getenv("CLICKHOUSE_PASSWORD", ""))
 
-    def __post_init__(self) -> None:
-        if not self.password:
+        if not password:
             raise RuntimeError(
                 "ClickHouse password is not set. Set CH_PASSWORD (or CLICKHOUSE_PASSWORD) in environment / .env."
             )
 
-    # user/password: берём только из env; дефолтных паролей в коде не держим
-user: str = os.getenv("CH_USER", os.getenv("CLICKHOUSE_USER", "admin"))
-password: str = os.getenv("CH_PASSWORD", os.getenv("CLICKHOUSE_PASSWORD", ""))
-if not password:
-    raise RuntimeError(
-        "ClickHouse password is not set. Set CH_PASSWORD (or CLICKHOUSE_PASSWORD) in environment / .env."
-    )
+        return cls(
+            host=host,
+            port=int(port),
+            tz=tz,
+            database=database,
+            user=user,
+            password=password,
+        )
+
 
 def ch_query_tsv(cfg: CHConfig, query: str) -> List[List[str]]:
-    """
-    Выполняет запрос в ClickHouse через HTTP и возвращает rows как список списков строк.
-    Формат ответа — TSV.
-    """
     url = f"http://{cfg.host}:{cfg.port}/"
     params = {"database": cfg.database, "query": query.strip() + "\nFORMAT TSV"}
     auth = (cfg.user, cfg.password) if (cfg.user or cfg.password) else None
@@ -69,12 +99,12 @@ def ch_query_tsv(cfg: CHConfig, query: str) -> List[List[str]]:
     text = r.text.strip()
     if not text:
         return []
-
     return [line.split("\t") for line in text.splitlines()]
 
 
 def safe_filename(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d_%H%M%S_%f")
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate Markdown report from ClickHouse.")
@@ -108,11 +138,11 @@ def build_report(
     if dt_to:
         where_parts.append(f"published_at <  toDateTime64('{dt_to}', 9, '{cfg.tz}')")
     if last_hours is not None:
-        where_parts.append(f"published_at >= now64(9) - INTERVAL {last_hours} HOUR")
+        where_parts.append("published_at >= (SELECT max(published_at) FROM {t}) - INTERVAL {h} HOUR".format(t=table, h=last_hours))
+        where_parts.append("published_at <= (SELECT max(published_at) FROM {t})".format(t=table))
 
     where_sql = "WHERE " + " AND ".join(where_parts) if where_parts else ""
 
-    # 1) Сводка
     summary_q = f"""
     SELECT
       count() AS articles,
@@ -127,7 +157,6 @@ def build_report(
     """
     summary_rows = ch_query_tsv(cfg, summary_q)
     if not summary_rows:
-        # Пустой период: делаем “пустой” отчёт, чтобы пайплайн не падал
         min_dt = max_dt = "—"
         articles = "0"
         sources = "0"
@@ -135,7 +164,6 @@ def build_report(
     else:
         articles, sources, min_dt, max_dt, avg_len, avg_sent, avg_kw = summary_rows[0]
 
-    # 2) Топ источников
     sources_q = f"""
     SELECT source, count() AS n
     FROM {table}
@@ -146,7 +174,6 @@ def build_report(
     """
     sources_rows = ch_query_tsv(cfg, sources_q)
 
-    # 3) Динамика по часу
     hourly_q = f"""
     SELECT toStartOfHour(published_at) AS hour, count() AS n
     FROM {table}
@@ -156,7 +183,6 @@ def build_report(
     """
     hourly_rows = ch_query_tsv(cfg, hourly_q)
 
-    # 4) Топ ключевых слов
     prewhere_sql = ""
     if where_parts:
         prewhere_sql = "PREWHERE " + " AND ".join(where_parts)
@@ -208,7 +234,7 @@ def build_report(
 
 def main() -> None:
     args = parse_args()
-    cfg = CHConfig()
+    cfg = CHConfig.from_env()
 
     outdir = Path(args.outdir or os.getenv("REPORTS_DIR", "reports"))
     outdir.mkdir(parents=True, exist_ok=True)
