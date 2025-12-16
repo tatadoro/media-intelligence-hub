@@ -5,7 +5,11 @@ CONTAINER="${CH_CONTAINER:-clickhouse}"
 
 # Prefer CH_* (used by scripts), fallback to CLICKHOUSE_* (used by Python), then defaults
 USER="${CH_USER:-${CLICKHOUSE_USER:-admin}}"
-PASSWORD="${CH_PASSWORD:-${CLICKHOUSE_PASSWORD:-__REDACTED__}}"
+PASSWORD="${CH_PASSWORD:-${CLICKHOUSE_PASSWORD:-}}"
+if [ -z "$PASSWORD" ]; then
+  echo "[ERROR] ClickHouse password is not set. Export CH_PASSWORD (or CLICKHOUSE_PASSWORD)." >&2
+  exit 2
+fi
 DATABASE="${CH_DATABASE:-${CLICKHOUSE_DB:-${CLICKHOUSE_DATABASE:-media_intel}}}"
 
 if [[ $# -lt 1 ]]; then
