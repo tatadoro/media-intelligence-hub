@@ -141,6 +141,17 @@ python -m src.reporting.generate_report --from "2025-12-10 14:00:00" --to "2025-
 # По dedup-витрине и с меньшим топом
 python -m src.reporting.generate_report --table articles_dedup --top-k 10 
 ```
+## CLI (опционально)
+
+Можно запускать основные сценарии через единый entrypoint:
+
+```bash
+python -m src.cli bootstrap
+python -m src.cli smoke
+python -m src.cli etl --latest
+python -m src.cli etl --in data/silver/<file>_clean.json
+python -m src.cli report --last-hours 6
+```
 
 ## Конфигурация и переменные окружения
 Секреты не коммитятся. Локально создай файл `.env` (он должен быть в `.gitignore`).
