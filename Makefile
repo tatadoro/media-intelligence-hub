@@ -5,10 +5,11 @@ export
         wait-minio wait-clickhouse \
         create-bucket init bootstrap ch-show-schema clean-sql \
         views health quality topkw hour batches survival dupes report \
-        gold load etl md-report reports
+        gold load etl md-report reports etl-latest run
 
 PYTHON  ?= python
 COMPOSE ?= docker compose
+SILVER_GLOB ?= data/silver/articles*_clean.json
 
 # ----------- Local infra helpers -----------
 up:
@@ -162,3 +163,11 @@ etl:
 	$(PYTHON) -m src.pipeline.silver_to_gold_local --input $(IN)
 	$(PYTHON) -m src.pipeline.gold_to_clickhouse_local --input data/gold/$(notdir $(IN:_clean.json=_processed.parquet))
 	$(MAKE) reports
+etl-latest:
+	@LATEST="$$(ls -t $(SILVER_GLOB) 2>/dev/null | head -n 1)"; \
+	if [ -z "$$LATEST" ]; then \
+		echo "[ERROR] No files found: $(SILVER_GLOB)"; \
+		exit 1; \
+	fi; \
+	echo "[INFO] Using latest silver file: $$LATEST"; \
+	$(MAKE) etl IN="$$LATEST"
