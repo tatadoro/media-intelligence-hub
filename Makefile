@@ -5,7 +5,7 @@ export
         wait-minio wait-clickhouse \
         create-bucket init bootstrap ch-show-schema clean-sql \
         views health quality topkw hour batches survival dupes report \
-        gold load etl md-report
+        gold load etl md-report reports
 
 PYTHON  ?= python
 COMPOSE ?= docker compose
@@ -131,6 +131,9 @@ md-report:
 	if [ -n "$(OUTDIR)" ]; then ARGS="$$ARGS --outdir $(OUTDIR)"; fi; \
 	python -m src.reporting.generate_report $$ARGS
 
+# Run SQL reports + generate Markdown report
+reports: report md-report
+	@echo "Done: SQL + Markdown reports generated."
 # ----------- ETL helpers -----------
 # 1) Silver -> Gold
 # usage:
