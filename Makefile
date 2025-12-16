@@ -161,4 +161,4 @@ load:
 etl:
 	$(PYTHON) -m src.pipeline.silver_to_gold_local --input $(IN)
 	$(PYTHON) -m src.pipeline.gold_to_clickhouse_local --input data/gold/$(notdir $(IN:_clean.json=_processed.parquet))
-	$(MAKE) report
+	$(MAKE) reports
