@@ -6,7 +6,7 @@ export
         create-bucket init bootstrap ch-show-schema clean-sql \
         views health quality topkw hour batches survival dupes report \
         gold load etl md-report reports etl-latest run validate-silver \
-        validate-gold
+        validate-gold validate
 
 PYTHON  ?= python
 COMPOSE ?= docker compose
@@ -156,6 +156,17 @@ validate-silver:
 #   make validate-gold IN=data/gold/xxx_processed.parquet
 validate-gold:
 	$(PYTHON) scripts/validate_gold.py --input $(IN)
+
+# Unified validation (best-effort)
+# usage:
+#   make validate SILVER_IN=data/silver/xxx_clean.json GOLD_IN=data/gold/xxx_processed.parquet
+#   make validate  # просто health + report checks (если сервисы подняты)
+validate:
+	@echo "[INFO] Running validations..."
+	@if [ -n "$(SILVER_IN)" ]; then $(MAKE) validate-silver IN="$(SILVER_IN)"; else echo "[SKIP] SILVER_IN not set"; fi
+	@if [ -n "$(GOLD_IN)" ]; then $(MAKE) validate-gold IN="$(GOLD_IN)"; else echo "[SKIP] GOLD_IN not set"; fi
+	@$(MAKE) health || true
+	@echo "[OK] validate finished"
 
 # 1) Silver -> Gold
 # usage:
