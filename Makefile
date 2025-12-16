@@ -6,7 +6,7 @@ export
         create-bucket init bootstrap ch-show-schema clean-sql \
         views health quality topkw hour batches survival dupes report \
         gold load etl md-report reports etl-latest run validate-silver \
-        validate-gold validate gate
+        validate-gold validate gate etl-latest-strict
 
 PYTHON  ?= python
 COMPOSE ?= docker compose
@@ -207,7 +207,7 @@ load:
 etl:
 	$(MAKE) validate-silver IN=$(IN)
 	$(PYTHON) -m src.pipeline.silver_to_gold_local --input $(IN)
-	$(PYTHON) -m src.pipeline.gold_to_clickhouse_local --input data/gold/$(notdir $(IN:_clean.json=_processed.parquet))
+	$(MAKE) load IN=data/gold/$(notdir $(IN:_clean.json=_processed.parquet)) STRICT=$(STRICT)
 	$(MAKE) reports
 etl-latest:
 	@LATEST="$$(ls -t $(SILVER_GLOB) 2>/dev/null | head -n 1)"; \
@@ -217,3 +217,5 @@ etl-latest:
 	fi; \
 	echo "[INFO] Using latest silver file: $$LATEST"; \
 	$(MAKE) etl IN="$$LATEST"
+etl-latest-strict:
+	@$(MAKE) etl-latest STRICT=1
