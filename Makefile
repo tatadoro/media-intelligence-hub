@@ -31,6 +31,7 @@ env-check:
 	@echo "CH_PORT=$(CH_PORT)"
 	@echo "CLICKHOUSE_USER=$(CLICKHOUSE_USER)"
 	@if [ -n "$(CLICKHOUSE_PASSWORD)" ]; then echo "CLICKHOUSE_PASSWORD=$$(printf '%s' "$(CLICKHOUSE_PASSWORD)" | sed -E 's/^(.{2}).*(.{2})$$/\1***\2/') (len=$$(printf '%s' "$(CLICKHOUSE_PASSWORD)" | wc -c | tr -d ' '))"; else echo "CLICKHOUSE_PASSWORD=<empty>"; fi
+	@python scripts/env_check.py
 
 # ----------- Local infra helpers -----------
 up:
@@ -153,9 +154,30 @@ md-report:
 	if [ -n "$(OUTDIR)" ]; then ARGS="$$ARGS --outdir $(OUTDIR)"; fi; \
 	$(PYTHON) -m src.reporting.generate_report $$ARGS
 
-# Run SQL reports + generate Markdown report
-reports:
+upload-report: env-check
+	@test -n "$(REPORT)" || (echo "[ERROR] REPORT is required. Example: make upload-report REPORT=reports/daily_report_xxx.md LAST_HOURS=6" && exit 2)
+	./scripts/upload_report_to_minio.sh "$(REPORT)" "$(LAST_HOURS)"
+
+etl-and-report: env-check
+	@echo "[INFO] Running ETL (latest, strict)..."
+	@$(MAKE) etl-latest-strict
+	@echo
+	@echo "[INFO] Generating Markdown report..."
+	@$(MAKE) md-report LAST_HOURS=$(LAST_HOURS)
+	@echo
+	@echo "[INFO] Uploading latest report to MinIO..."
+	@REPORT_FILE=$$(ls -1t reports/daily_report_*.md | head -n 1); \
+	echo "[INFO] Latest report: $$REPORT_FILE"; \
+	$(MAKE) upload-report REPORT="$$REPORT_FILE" LAST_HOURS=$(LAST_HOURS)
+
+# Run only SQL reports (no Markdown)
+reports-sql:
 	@$(MAKE) report
+	@echo "Done: SQL reports generated."
+
+# Run SQL reports + generate Markdown report (explicit)
+reports:
+	@$(MAKE) reports-sql
 	@$(MAKE) md-report LAST_HOURS="$(LAST_HOURS)" FROM="$(FROM)" TO="$(TO)" TABLE="$(TABLE)" TOP_K="$(TOP_K)" OUTDIR="$(OUTDIR)"
 	@echo "Done: SQL + Markdown reports generated."
 
@@ -198,7 +220,7 @@ etl:
 	$(MAKE) validate-silver IN=$(IN)
 	$(PYTHON) -m src.pipeline.silver_to_gold_local --input $(IN)
 	$(MAKE) load IN=data/gold/$(notdir $(IN:_clean.json=_processed.parquet)) STRICT=$(STRICT)
-	$(MAKE) reports
+	$(MAKE) reports-sql
 
 etl-latest:
 	@LATEST="$$(ls -t $(SILVER_GLOB) 2>/dev/null | head -n 1)"; \
