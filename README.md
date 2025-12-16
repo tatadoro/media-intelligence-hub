@@ -220,6 +220,9 @@ mc mb local/media-intel
 python scripts/validate_silver.py --input data/silver/<file>_clean.json
 python scripts/validate_gold.py --input data/gold/<file>_processed.parquet
 ```
+## Data Dictionary
+
+Описание полей слоёв (human-readable): `docs/data_dictionary.md`
 
 ## Запуск пайплайна
 
