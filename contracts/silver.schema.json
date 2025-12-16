@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "contracts/silver.schema.json",
+  "title": "Media Intelligence Hub — Silver layer contract",
+  "type": "array",
+  "minItems": 1,
+  "items": {
+    "type": "object",
+    "additionalProperties": true,
+    "required": [
+      "id",
+      "title",
+      "link",
+      "source",
+      "raw_text",
+      "clean_text",
+      "body_status",
+      "body_len"
+    ],
+    "properties": {
+      "id": {
+        "description": "Stable identifier of the article/item inside the pipeline",
+        "type": [
+          "string",
+          "integer"
+        ]
+      },
+      "title": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "link": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "format": "uri-reference"
+      },
+      "source": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "raw_text": {
+        "description": "Raw text (may include boilerplate)",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "clean_text": {
+        "description": "Cleaned text for downstream NLP",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "body_status": {
+        "description": "Status of body extraction/enrichment (free-form string)",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "body_len": {
+        "description": "Body length in characters (or 0 if missing)",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 0
+      }
+    }
+  }
+}

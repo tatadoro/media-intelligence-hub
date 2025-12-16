@@ -209,6 +209,17 @@ docker compose ps
 mc alias set local http://localhost:9000 YOUR_MINIO_USER YOUR_MINIO_PASSWORD
 mc mb local/media-intel
 ```
+## Контракты данных (silver/gold)
+
+В репозитории зафиксированы контракты слоёв в виде JSON Schema:
+- `contracts/silver.schema.json` — формат **silver** (`*_clean.json`)
+- `contracts/gold.schema.json` — формат **gold** (`*_processed.parquet`, колонки после NLP)
+
+Скрипты валидации используют эти контракты как ориентир:
+```bash
+python scripts/validate_silver.py --input data/silver/<file>_clean.json
+python scripts/validate_gold.py --input data/gold/<file>_processed.parquet
+```
 
 ## Запуск пайплайна
 

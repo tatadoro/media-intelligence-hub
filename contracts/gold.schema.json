@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "contracts/gold.schema.json",
+  "title": "Media Intelligence Hub — Gold layer contract",
+  "type": "array",
+  "minItems": 1,
+  "items": {
+    "type": "object",
+    "additionalProperties": true,
+    "required": [
+      "id",
+      "title",
+      "link",
+      "source",
+      "raw_text",
+      "body_status",
+      "body_len",
+      "clean_text",
+      "nlp_text",
+      "summary",
+      "keywords",
+      "text_length_chars",
+      "num_sentences",
+      "num_keywords",
+      "ingest_object_name"
+    ],
+    "properties": {
+      "id": {
+        "type": [
+          "string",
+          "integer"
+        ]
+      },
+      "title": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "link": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "format": "uri-reference"
+      },
+      "source": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "raw_text": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "body_status": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "body_len": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 0
+      },
+      "clean_text": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "nlp_text": {
+        "description": "Text used for summarization/keywords (post-processing)",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "summary": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "keywords": {
+        "description": "Keywords string (e.g., comma-separated)",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "text_length_chars": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 0
+      },
+      "num_sentences": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 0
+      },
+      "num_keywords": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 0
+      },
+      "ingest_object_name": {
+        "description": "Batch/object name (should match parquet filename)",
+        "type": [
+          "string"
+        ]
+      }
+    }
+  }
+}
