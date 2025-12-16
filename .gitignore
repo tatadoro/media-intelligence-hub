@@ -68,3 +68,5 @@ airflow/dags/__pycache__/
 
 # macOS
 .DS_Store
+
+config/.env

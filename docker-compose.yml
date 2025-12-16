@@ -14,7 +14,7 @@ services:
     environment:
       CLICKHOUSE_DB: media_intel
       CLICKHOUSE_USER: admin
-      CLICKHOUSE_PASSWORD: __REDACTED__
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
 
   minio:
@@ -26,7 +26,7 @@ services:
       - "9001:9001"
     environment:
       MINIO_ROOT_USER: admin
-      MINIO_ROOT_PASSWORD: __REDACTED__
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
     volumes:
       - minio_data:/data
 
