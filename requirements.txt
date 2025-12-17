@@ -4,6 +4,7 @@ scikit-learn
 pandas
 pyarrow
 boto3
+botocore
 python-dotenv
 pymorphy3
 pymorphy3-dicts-ru

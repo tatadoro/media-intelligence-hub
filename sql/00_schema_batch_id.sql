@@ -1,0 +1,2 @@
+ALTER TABLE articles
+  ADD COLUMN IF NOT EXISTS batch_id String DEFAULT '';

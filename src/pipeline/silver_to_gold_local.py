@@ -194,8 +194,9 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # batch id внутри gold (всегда строкой)
-    df_gold["ingest_object_name"] = str(output_path.name)
-
+    batch_id = str(output_path.name)
+    df_gold["ingest_object_name"] = batch_id
+    df_gold["batch_id"] = str(output_path.name)
     print(f"gold:   {output_path}")
     df_gold.to_parquet(output_path, index=False)
 

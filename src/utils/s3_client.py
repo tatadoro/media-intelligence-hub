@@ -5,6 +5,7 @@ import io
 import yaml
 import re
 import boto3
+from botocore.config import Config
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
@@ -68,15 +69,22 @@ def get_s3_client():
         )
 
     session = boto3.session.Session()
+
+    # Для MinIO внутри docker-сети чаще всего надёжнее path-style:
+    # http://minio:9000/bucket/key вместо http://bucket.minio:9000/key
+    cfg = Config(
+        s3={"addressing_style": "path"},
+        retries={"max_attempts": 5, "mode": "standard"},
+    )
+
     return session.client(
         service_name="s3",
         endpoint_url=MINIO_ENDPOINT,
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
         region_name=MINIO_REGION,
+        config=cfg,
     )
-
-
 
 def upload_json_bytes(bucket: str, key: str, json_str: str) -> None:
     """
@@ -115,3 +123,31 @@ def list_bucket_objects(bucket: str, prefix: str = ""):
     s3 = get_s3_client()
     resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
     return resp.get("Contents", [])
+
+def upload_file(bucket: str, key: str, file_path: str, content_type: str | None = None) -> None:
+    """
+    Загружает локальный файл в S3/MinIO по указанному ключу.
+    """
+    logger.info("Uploading file to S3: bucket=%s, key=%s, file=%s", bucket, key, file_path)
+
+    s3 = get_s3_client()
+    extra_args = {}
+    if content_type:
+        extra_args["ContentType"] = content_type
+
+    try:
+        if extra_args:
+            s3.upload_file(file_path, bucket, key, ExtraArgs=extra_args)
+        else:
+            s3.upload_file(file_path, bucket, key)
+    except Exception as e:
+        logger.error(
+            "Failed to upload file to S3: bucket=%s, key=%s, file=%s, error=%s",
+            bucket,
+            key,
+            file_path,
+            e,
+        )
+        raise
+    else:
+        logger.info("Successfully uploaded file to S3: bucket=%s, key=%s", bucket, key)

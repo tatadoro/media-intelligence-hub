@@ -5,7 +5,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
-
+import pendulum
 import requests
 from airflow import DAG
 from airflow.operators.bash import BashOperator
@@ -15,6 +15,19 @@ from airflow.utils.dates import days_ago
 PROJECT_DIR = Path("/opt/mih")
 SILVER_DIR = PROJECT_DIR / "data" / "silver"
 
+def compute_batch_id(ti, **_):
+    # ВАЖНО: здесь должен быть task_id реального таска compute_gold_path
+    v = ti.xcom_pull(task_ids="compute_gold_path")
+
+    # compute_gold_path может вернуть dict {"gold_path": "..."} или просто строку "..."
+    gold_path = v["gold_path"] if isinstance(v, dict) else v
+    return {"batch_id": Path(str(gold_path)).name}
+
+
+compute_batch_id_task = PythonOperator(
+    task_id="compute_batch_id",
+    python_callable=compute_batch_id,
+)
 
 def precheck_latest_silver(**context) -> None:
     """
@@ -166,16 +179,17 @@ default_args = {
     "retries": 2,
     "retry_delay": timedelta(minutes=2),
 }
-
+REPORT_LAST_HOURS = int(os.getenv("REPORT_LAST_HOURS", "1"))
 with DAG(
     dag_id="mih_etl_latest_strict",
     default_args=default_args,
     description="MIH ETL: latest silver -> gold -> clickhouse -> reports (strict)",
-    start_date=days_ago(1),
-    schedule=None,  # ручной запуск; позже можно поставить cron
+    start_date=pendulum.datetime(2025, 12, 16, 0, 0, 0, tz="Europe/Belgrade"),
+    schedule="@hourly",
     catchup=False,
     max_active_runs=1,
     tags=["mih"],
+    params={"report_last_hours": REPORT_LAST_HOURS},
 ) as dag:
     # --- waiters (infra readiness) ---
     # ВАЖНО: внутри контейнера нельзя полагаться на make wait-*, потому что:
@@ -265,6 +279,17 @@ with DAG(
         ),
     )
 
+    delete_batch_in_ch = BashOperator(
+        task_id="delete_batch_in_ch",
+        bash_command=(
+            "set -euo pipefail; cd /opt/mih; "
+            "BATCH_ID=\"{{ ti.xcom_pull(task_ids='compute_batch_id')['batch_id'] }}\"; "
+            "TMP_SQL=$(mktemp); "
+            "printf \"ALTER TABLE articles DELETE WHERE batch_id='%s';\\n\" \"$BATCH_ID\" > \"$TMP_SQL\"; "
+            "./scripts/ch_run_sql.sh \"$TMP_SQL\"; rm -f \"$TMP_SQL\""
+        ),
+    )
+
     # --- load to clickhouse ---
     load_to_clickhouse = BashOperator(
         task_id="load_to_clickhouse",
@@ -284,17 +309,21 @@ with DAG(
     compute_report_window_task = PythonOperator(
         task_id="compute_report_window",
         python_callable=compute_report_window,
-        op_kwargs={"last_hours": 6},
+        op_kwargs={"last_hours": "{{ params.report_last_hours }}"},
     )
 
     md_report = BashOperator(
         task_id="md_report",
+        do_xcom_push=True,
         bash_command=(
-            "cd /opt/mih && "
+            "set -euo pipefail; "
+            "cd /opt/mih; "
             "python -m src.reporting.generate_report "
-            "--from \"{{ ti.xcom_pull(task_ids='compute_report_window')['dt_from'] }}\" "
-            "--to \"{{ ti.xcom_pull(task_ids='compute_report_window')['dt_to'] }}\" "
-            "--table articles"
+            "--from \"{{ (ti.xcom_pull(task_ids='compute_report_window') or {})['dt_from'] }}\" "
+            "--to \"{{ (ti.xcom_pull(task_ids='compute_report_window') or {})['dt_to'] }}\" "
+            "--table articles 1>&2; "
+            "REPORT_FILE=$(ls -1t reports/daily_report_*.md | head -n 1); "
+            "echo \"${REPORT_FILE}\""
         ),
     )
 
@@ -305,14 +334,21 @@ with DAG(
         bash_command=(
             "set -euo pipefail; "
             "cd /opt/mih; "
-            "REPORT_FILE=$(ls -1t reports/daily_report_*.md | head -n 1); "
-            "echo \"[INFO] Latest report: ${REPORT_FILE}\"; "
-            "if command -v mc >/dev/null 2>&1; then "
-            "  make upload-report REPORT=\"${REPORT_FILE}\" LAST_HOURS=6; "
-            "else "
-            "  echo \"[WARN] mc not found in airflow container; skip upload to MinIO\"; "
-            "fi"
+            "REPORT_FILE=\"{{ (ti.xcom_pull(task_ids='md_report') or '') | trim }}\"; "
+            "if [ -z \"${REPORT_FILE}\" ]; then "
+            "  echo \"[ERROR] md_report XCom is empty; cannot upload deterministically\" 1>&2; "
+            "  exit 1; "
+            "fi; "
+            "DT_FROM=\"{{ ti.xcom_pull(task_ids='compute_report_window')['dt_from'] }}\"; "
+            "DT_TO=\"{{ ti.xcom_pull(task_ids='compute_report_window')['dt_to'] }}\"; "
+            "echo \"[INFO] Uploading report: ${REPORT_FILE} (dt_from=${DT_FROM}, dt_to=${DT_TO})\" 1>&2; "
+            "python -m src.utils.minio_reports "
+            "--last-hours '{{ params.report_last_hours }}' "
+            "--report-path \"${REPORT_FILE}\" "
+            "--dt-from \"${DT_FROM}\" "
+            "--dt-to \"${DT_TO}\""
         ),
+        params={"report_last_hours": 1},
     )
 
     # --- minimal observability log (best-effort) ---
@@ -324,5 +360,5 @@ with DAG(
     # --- Dependencies ---
     wait_clickhouse >> wait_minio >> pick_latest_silver
     pick_latest_silver >> precheck_silver >> validate_silver >> silver_to_gold >> compute_gold_path_task
-    compute_gold_path_task >> validate_gold >> quality_gate >> load_to_clickhouse
+    compute_gold_path_task >> validate_gold >> quality_gate >> compute_batch_id_task >> delete_batch_in_ch >> load_to_clickhouse
     load_to_clickhouse >> sql_reports >> compute_report_window_task >> md_report >> upload_report_to_minio >> quality_summary_log

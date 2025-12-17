@@ -121,6 +121,16 @@ CH_DATABASE=media_intel
 python scripts/validate_silver.py --input data/silver/<file>_clean.json
 python scripts/validate_gold.py --input data/gold/<file>_processed.parquet
 ```
+## Идемпотентная загрузка в ClickHouse (batch_id)
+
+Чтобы повторные прогоны DAG не накапливали дубли, в таблице `articles` используется поле `batch_id` (тип `String`).
+
+- `batch_id` вычисляется как имя gold-файла Parquet (например, `articles_..._processed.parquet`).
+- Перед загрузкой нового батча выполняется удаление старых строк этого же батча:
+  `ALTER TABLE articles DELETE WHERE batch_id = '<batch_id>'`.
+- Затем выполняется `load_to_clickhouse`, который загружает строки с тем же `batch_id`.
+
+Миграция схемы: `sql/00_schema_batch_id.sql` (добавляет колонку `batch_id`, если её нет).
 
 ## Запуск пайплайна (локально без Airflow)
 
