@@ -6,11 +6,17 @@ export
         create-bucket init bootstrap smoke ch-show-schema clean-sql \
         views health quality topkw hour batches survival dupes report \
         gold load etl md-report reports etl-latest run validate-silver \
-        validate-gold validate gate etl-latest-strict env-check
+        validate-gold validate gate etl-latest-strict env-check env-ensure
 
 PYTHON  ?= python
-COMPOSE ?= docker compose
-SILVER_GLOB ?= data/silver/articles*_clean.json
+SILVER_GLOB ?= data/silver/articles_*_clean.json
+
+PROJECT_DIR := $(CURDIR)
+ENV_FILE    := $(PROJECT_DIR)/.env
+
+COMPOSE_BIN ?= docker compose
+COMPOSE     := $(COMPOSE_BIN) --project-directory $(PROJECT_DIR) --env-file $(ENV_FILE) \
+               -f $(PROJECT_DIR)/docker-compose.yml -f $(PROJECT_DIR)/docker-compose.airflow.yml
 
 # ----------- Connection defaults (local scripts) -----------
 # These are used by scripts/ch_run_sql.sh and src.reporting.generate_report.
@@ -33,8 +39,13 @@ env-check:
 	@if [ -n "$(CLICKHOUSE_PASSWORD)" ]; then echo "CLICKHOUSE_PASSWORD=$$(printf '%s' "$(CLICKHOUSE_PASSWORD)" | sed -E 's/^(.{2}).*(.{2})$$/\1***\2/') (len=$$(printf '%s' "$(CLICKHOUSE_PASSWORD)" | wc -c | tr -d ' '))"; else echo "CLICKHOUSE_PASSWORD=<empty>"; fi
 	@python scripts/env_check.py
 
+env-ensure:
+	@test -f "$(ENV_FILE)" || (echo "[ERROR] .env not found: $(ENV_FILE)"; exit 2)
+	@python scripts/env_check.py
+
 # ----------- Local infra helpers -----------
-up:
+
+up: env-ensure
 	$(COMPOSE) up -d
 	$(MAKE) wait-clickhouse
 	$(MAKE) wait-minio || true
@@ -42,7 +53,7 @@ up:
 down:
 	$(COMPOSE) down
 
-ps:
+ps: env-ensure
 	$(COMPOSE) ps
 
 logs:
@@ -99,7 +110,7 @@ init:
 	$(MAKE) views
 
 # One-command local bootstrap (robust)
-bootstrap: clean-sql up init ps
+bootstrap: env-ensure clean-sql up init ps
 	$(MAKE) create-bucket || true
 
 # Quick schema check (debug helper)
@@ -158,7 +169,7 @@ upload-report: env-check
 	@test -n "$(REPORT)" || (echo "[ERROR] REPORT is required. Example: make upload-report REPORT=reports/daily_report_xxx.md LAST_HOURS=6" && exit 2)
 	./scripts/upload_report_to_minio.sh "$(REPORT)" "$(LAST_HOURS)"
 
-etl-and-report: env-check
+etl-and-report: env-ensure env-check
 	@echo "[INFO] Running ETL (latest, strict)..."
 	@$(MAKE) etl-latest-strict
 	@echo

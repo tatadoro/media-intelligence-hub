@@ -22,14 +22,40 @@ services:
       - .env
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow"
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+
+      # Make "python -m src...." work from anywhere in Airflow containers
+      PYTHONPATH: /opt/mih
+
+      # ClickHouse inside docker network
+      CH_HOST: ${CH_HOST_DOCKER:-clickhouse}
+      CH_PORT: "${CH_PORT_DOCKER:-8123}"
+      CLICKHOUSE_HOST: ${CH_HOST_DOCKER:-clickhouse}
+      CLICKHOUSE_PORT: "${CH_PORT_DOCKER:-8123}"
+
+      # MinIO endpoint inside docker network (avoid "localhost" from inside containers)
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT_DOCKER:-http://minio:9000}
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./airflow/logs:/opt/airflow/logs
       - ./airflow/plugins:/opt/airflow/plugins
-    entrypoint: /bin/bash
-    command: -c "airflow db migrate && airflow users create --username $$AIRFLOW_ADMIN_USER --password $$AIRFLOW_ADMIN_PASSWORD --firstname Admin --lastname User --role Admin --email $$AIRFLOW_ADMIN_EMAIL"
+      - ./:/opt/mih
+
+    # IMPORTANT: bash receives ONE script string via -c
+    entrypoint: ["/bin/bash"]
+    command:
+      - -c
+      - |
+        set -euo pipefail
+        airflow db migrate
+
+        # Idempotent: if user exists — do not fail
+        if airflow users list | awk 'NR>2{print $$2}' | grep -qx "$$AIRFLOW_ADMIN_USER"; then
+          echo "$$AIRFLOW_ADMIN_USER already exists in the db"
+        else
+          airflow users create --username "$$AIRFLOW_ADMIN_USER" --password "$$AIRFLOW_ADMIN_PASSWORD" --firstname Admin --lastname User --role Admin --email "$$AIRFLOW_ADMIN_EMAIL"
+        fi
     restart: "no"
 
   airflow-webserver:
@@ -42,14 +68,21 @@ services:
       - airflow-postgres
     env_file:
       - .env
+    working_dir: /opt/mih  
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow"
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
-      CH_HOST: clickhouse
-      CH_PORT: "8123"
-      CLICKHOUSE_HOST: clickhouse
-      CLICKHOUSE_PORT: "8123"
+   
+      PYTHONPATH: /opt/mih
+
+      # Always use docker-host for ClickHouse from containers
+      CH_HOST: ${CH_HOST_DOCKER:-clickhouse}
+      CH_PORT: "${CH_PORT_DOCKER:-8123}"
+      CLICKHOUSE_HOST: ${CH_HOST_DOCKER:-clickhouse}
+      CLICKHOUSE_PORT: "${CH_PORT_DOCKER:-8123}"
+
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT_DOCKER:-http://minio:9000}
     ports:
       - "${AIRFLOW_WEBSERVER_PORT:-8080}:8080"
     volumes:
@@ -71,14 +104,21 @@ services:
       - airflow-postgres
     env_file:
       - .env
+    working_dir: /opt/mih  
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow"
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
-      CH_HOST: clickhouse
-      CH_PORT: "8123"
-      CLICKHOUSE_HOST: clickhouse
-      CLICKHOUSE_PORT: "8123"
+
+      PYTHONPATH: /opt/mih
+
+      # Always use docker-host for ClickHouse from containers
+      CH_HOST: ${CH_HOST_DOCKER:-clickhouse}
+      CH_PORT: "${CH_PORT_DOCKER:-8123}"
+      CLICKHOUSE_HOST: ${CH_HOST_DOCKER:-clickhouse}
+      CLICKHOUSE_PORT: "${CH_PORT_DOCKER:-8123}"
+
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT_DOCKER:-http://minio:9000}
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./airflow/logs:/opt/airflow/logs
