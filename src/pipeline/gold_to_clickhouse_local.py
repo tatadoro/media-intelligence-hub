@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 import argparse
 import subprocess
+import tempfile
 from pathlib import Path
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 
@@ -13,6 +15,12 @@ def parse_args() -> argparse.Namespace:
         description="Загрузка gold Parquet в ClickHouse с защитой от дублей через load_log + фактическую проверку таблицы."
     )
     p.add_argument("--input", type=str, required=True, help="Путь к parquet-файлу (например data/gold/...parquet)")
+    p.add_argument(
+        "--batch-id",
+        type=str,
+        required=True,
+        help="Идентификатор батча (одинаковый для всех строк текущей загрузки)",
+    )
     p.add_argument(
         "--container",
         type=str,
@@ -97,8 +105,16 @@ def _docker_ch_cmd_stdin(args: argparse.Namespace) -> list[str]:
 
 def ch_query(args: argparse.Namespace, query: str) -> str:
     cmd = _docker_ch_cmd(args) + ["--query", query]
-    res = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    return res.stdout.strip()
+    try:
+        res = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        return res.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"[ERROR] ClickHouse query failed.\n"
+            f"cmd={' '.join(cmd)}\n"
+            f"stdout:\n{e.stdout}\n"
+            f"stderr:\n{e.stderr}\n"
+        ) from e
 
 
 def ch_int(args: argparse.Namespace, query: str, default: int = 0) -> int:
@@ -142,6 +158,86 @@ def validate_ingest_object_name(input_path: Path, object_name: str) -> None:
         )
 
 
+def _parquet_batch_id_state(input_path: Path) -> tuple[bool, int, int, set[str]]:
+    """
+    Возвращает:
+      has_col, total_rows, empty_rows, uniq_non_empty_values
+    """
+    pf = pq.ParquetFile(str(input_path))
+    names = set(pf.schema_arrow.names)
+    if "batch_id" not in names:
+        return False, 0, 0, set()
+
+    total = 0
+    empty = 0
+    uniq: set[str] = set()
+
+    for rg in range(pf.num_row_groups):
+        t = pf.read_row_group(rg, columns=["batch_id"])
+        for x in t.column(0).to_pylist():
+            total += 1
+            s = "" if x is None else str(x)
+            if s == "":
+                empty += 1
+            else:
+                uniq.add(s)
+
+    return True, total, empty, uniq
+
+
+def ensure_batch_id_in_parquet(input_path: Path, batch_id: str) -> tuple[Path, bool]:
+    """
+    Гарантирует, что batch_id присутствует и заполнен одинаково во всех строках.
+    Если нужно — создаёт временный parquet и возвращает (temp_path, True).
+    Иначе возвращает (input_path, False).
+    """
+    has_col, total, empty, uniq = _parquet_batch_id_state(input_path)
+
+    # Нужно пересобрать, если:
+    # - колонки batch_id нет
+    # - или все значения пустые
+    # - или есть непустые, но не равны ожидаемому batch_id
+    need_rewrite = False
+    if not has_col:
+        need_rewrite = True
+        reason = "parquet без batch_id"
+    elif total > 0 and empty == total:
+        need_rewrite = True
+        reason = "parquet batch_id пустой во всех строках"
+    elif uniq and uniq != {batch_id}:
+        need_rewrite = True
+        reason = f"parquet batch_id != ожидаемого (uniq={sorted(list(uniq))[:5]})"
+    else:
+        # uniq либо пуст (но не все строки пустые — редкий случай), либо ровно {batch_id}
+        # и/или есть пустые значения вперемешку с batch_id — это тоже плохо, перепишем.
+        if empty > 0:
+            need_rewrite = True
+            reason = "parquet batch_id частично пустой"
+
+    if not need_rewrite:
+        print(f"[INFO] batch_id валиден в parquet: {input_path.name}")
+        return input_path, False
+
+    tmp_dir = Path(tempfile.gettempdir())
+    stem = input_path.stem
+    safe_batch = "".join(c if (c.isalnum() or c in ("-", "_", ".")) else "_" for c in batch_id)[:120]
+    tmp_path = tmp_dir / f"{stem}__with_batch_id__{safe_batch}.parquet"
+
+    print(f"[INFO] {reason}: создали временный файл для загрузки: {tmp_path}")
+
+    table = pq.read_table(str(input_path))
+    batch_arr = pa.array([batch_id] * table.num_rows, type=pa.string())
+
+    if "batch_id" in table.schema.names:
+        idx = table.schema.get_field_index("batch_id")
+        table = table.set_column(idx, "batch_id", batch_arr)
+    else:
+        table = table.append_column("batch_id", batch_arr)
+
+    pq.write_table(table, str(tmp_path))
+    return tmp_path, True
+
+
 def main() -> None:
     args = parse_args()
     _require_password(args)
@@ -156,8 +252,11 @@ def main() -> None:
 
     object_name = input_path.name
 
-    # 0) Валидация batch id внутри parquet
+    # 0) Валидация ingest_object_name внутри parquet
     validate_ingest_object_name(input_path, object_name)
+
+    # 0.1) Гарантируем batch_id (создаём temp parquet при необходимости)
+    load_path, is_temp = ensure_batch_id_in_parquet(input_path, args.batch_id)
 
     # 1) Проверки "уже загружено?"
     in_log_q = (
@@ -175,7 +274,6 @@ def main() -> None:
     table_cnt = ch_int(args, in_table_q, default=0)
 
     if table_cnt > 0:
-        # Данные уже в таблице. Проверим последнюю запись лога: если rows_loaded=0 — починим лог вставкой новой записи.
         last_rows_q = (
             "SELECT rows_loaded "
             f"FROM {args.database}.load_log "
@@ -200,6 +298,8 @@ def main() -> None:
                 f"[SKIP] {object_name} уже загружен: в таблице {args.table} есть "
                 f"{table_cnt} строк и есть запись в load_log."
             )
+        if is_temp and load_path.exists():
+            load_path.unlink(missing_ok=True)
         return
 
     if log_exists and table_cnt == 0:
@@ -209,9 +309,16 @@ def main() -> None:
     insert_q = f"INSERT INTO {args.database}.{args.table} FORMAT Parquet"
     cmd = _docker_ch_cmd_stdin(args) + ["--query", insert_q]
 
-    print(f"[INFO] Загружаем {input_path} -> {args.database}.{args.table}")
-    with input_path.open("rb") as f:
+    print(f"[INFO] Загружаем {load_path} -> {args.database}.{args.table}")
+    with load_path.open("rb") as f:
         subprocess.run(cmd, check=True, stdin=f)
+
+    if is_temp:
+        try:
+            load_path.unlink(missing_ok=True)
+            print(f"[INFO] Удалили временный файл: {load_path}")
+        except Exception:
+            pass
 
     # 3) Фиксируем фактическое число строк, оказавшихся в таблице
     table_cnt_after = ch_int(

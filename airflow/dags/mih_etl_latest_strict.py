@@ -5,29 +5,37 @@ import logging
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
+
 import pendulum
+import pyarrow.parquet as pq
 import requests
 from airflow import DAG
 from airflow.operators.bash import BashOperator
-from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
+from airflow.operators.python import PythonOperator, ShortCircuitOperator
 
 PROJECT_DIR = Path("/opt/mih")
 SILVER_DIR = PROJECT_DIR / "data" / "silver"
 
-def compute_batch_id(ti, **_):
-    # ВАЖНО: здесь должен быть task_id реального таска compute_gold_path
-    v = ti.xcom_pull(task_ids="compute_gold_path")
 
-    # compute_gold_path может вернуть dict {"gold_path": "..."} или просто строку "..."
+def compute_batch_id(**context):
+    ti = context["ti"]
+
+    v = ti.xcom_pull(task_ids="compute_gold_path")
     gold_path = v["gold_path"] if isinstance(v, dict) else v
-    return {"batch_id": Path(str(gold_path)).name}
+
+    batch_id = Path(str(gold_path)).name
+
+    # чтобы удобно тянуть по key (опционально, но полезно)
+    ti.xcom_push(key="batch_id", value=batch_id)
+
+    return {"batch_id": batch_id}
 
 
 compute_batch_id_task = PythonOperator(
     task_id="compute_batch_id",
     python_callable=compute_batch_id,
 )
+
 
 def precheck_latest_silver(**context) -> None:
     """
@@ -157,6 +165,16 @@ def compute_gold_path(**context) -> str:
     Ожидаем, что silver файл заканчивается на *_clean.json,
     а gold — на *_processed.parquet.
     """
+
+    # --- override через dag_run.conf (ручной прогон нужного gold) ---
+    dag_run = context.get("dag_run")
+    conf = (dag_run.conf if dag_run else {}) or {}
+    override = conf.get("gold_path")
+    if override:
+        print(f"[INFO] gold_path override from dag_run.conf: {override}")
+        return override
+    # ---------------------------------------------------------------
+
     ti = context["ti"]
     silver_rel = ti.xcom_pull(task_ids="pick_latest_silver")
     if not silver_rel:
@@ -174,12 +192,37 @@ def compute_gold_path(**context) -> str:
     return f"data/gold/{gold_name}"
 
 
+def gold_non_empty(**context) -> bool:
+    """
+    Защита от пустого батча:
+    - если gold parquet пустой (0 rows), то downstream (delete/load/report) должны быть skipped.
+    """
+    ti = context["ti"]
+    gold_rel = ti.xcom_pull(task_ids="compute_gold_path")
+    if not gold_rel:
+        raise ValueError("XCom is empty: compute_gold_path did not return a path")
+
+    gold_path = PROJECT_DIR / Path(str(gold_rel))
+    if not gold_path.exists():
+        raise FileNotFoundError(f"Gold parquet not found: {gold_path}")
+
+    pf = pq.ParquetFile(str(gold_path))
+    rows = int(pf.metadata.num_rows)
+
+    logging.info("Gold rows=%s path=%s", rows, gold_rel)
+    ti.xcom_push(key="gold_rows", value=rows)
+
+    return rows > 0
+
+
 default_args = {
     "owner": "mih",
     "retries": 2,
     "retry_delay": timedelta(minutes=2),
 }
+
 REPORT_LAST_HOURS = int(os.getenv("REPORT_LAST_HOURS", "1"))
+
 with DAG(
     dag_id="mih_etl_latest_strict",
     default_args=default_args,
@@ -263,6 +306,12 @@ with DAG(
         python_callable=compute_gold_path,
     )
 
+    # --- guard: do nothing if gold is empty ---
+    gold_non_empty_task = ShortCircuitOperator(
+        task_id="gold_non_empty",
+        python_callable=gold_non_empty,
+    )
+
     validate_gold = BashOperator(
         task_id="validate_gold",
         bash_command=(
@@ -296,7 +345,8 @@ with DAG(
         bash_command=(
             "cd /opt/mih && "
             "python -m src.pipeline.gold_to_clickhouse_local "
-            "--input \"{{ ti.xcom_pull(task_ids='compute_gold_path') }}\""
+            "--input \"{{ ti.xcom_pull(task_ids='compute_gold_path') }}\" "
+            "--batch-id \"{{ ti.xcom_pull(task_ids='compute_batch_id', key='batch_id') }}\""
         ),
     )
 
@@ -360,5 +410,8 @@ with DAG(
     # --- Dependencies ---
     wait_clickhouse >> wait_minio >> pick_latest_silver
     pick_latest_silver >> precheck_silver >> validate_silver >> silver_to_gold >> compute_gold_path_task
-    compute_gold_path_task >> validate_gold >> quality_gate >> compute_batch_id_task >> delete_batch_in_ch >> load_to_clickhouse
+
+    compute_gold_path_task >> gold_non_empty_task
+    gold_non_empty_task >> validate_gold >> quality_gate >> compute_batch_id_task >> delete_batch_in_ch >> load_to_clickhouse
+
     load_to_clickhouse >> sql_reports >> compute_report_window_task >> md_report >> upload_report_to_minio >> quality_summary_log
