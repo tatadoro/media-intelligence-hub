@@ -16,7 +16,9 @@ ENV_FILE    := $(PROJECT_DIR)/.env
 
 COMPOSE_BIN ?= docker compose
 COMPOSE     := $(COMPOSE_BIN) --project-directory $(PROJECT_DIR) --env-file $(ENV_FILE) \
-               -f $(PROJECT_DIR)/docker-compose.yml -f $(PROJECT_DIR)/docker-compose.airflow.yml
+               -f $(PROJECT_DIR)/docker-compose.yml \
+               -f $(PROJECT_DIR)/docker-compose.airflow.yml \
+               -f $(PROJECT_DIR)/docker-compose.superset.yml
 
 # ----------- Connection defaults (local scripts) -----------
 # These are used by scripts/ch_run_sql.sh and src.reporting.generate_report.

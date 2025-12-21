@@ -1,0 +1,59 @@
+services:
+  superset-postgres:
+    image: postgres:16
+    container_name: superset-postgres
+    environment:
+      POSTGRES_USER: ${SUPERSET_PG_USER:-superset}
+      POSTGRES_PASSWORD: ${SUPERSET_PG_PASSWORD:-superset}
+      POSTGRES_DB: ${SUPERSET_PG_DB:-superset}
+    volumes:
+      - superset_pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  superset-redis:
+    image: redis:7
+    container_name: superset-redis
+    restart: unless-stopped
+
+  superset:
+    build:
+      context: .
+      dockerfile: docker/superset/Dockerfile
+    image: media_intel_hub-superset
+    container_name: superset
+    depends_on:
+      - superset-postgres
+      - superset-redis
+
+    # берём секреты/логины из .env в корне проекта
+    env_file:
+      - .env
+
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-change-me-please}
+      SUPERSET_ADMIN_USERNAME: ${SUPERSET_ADMIN_USERNAME:-admin}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD:-admin}
+      SUPERSET_ADMIN_EMAIL: ${SUPERSET_ADMIN_EMAIL:-admin@example.com}
+      SUPERSET_ADMIN_FIRSTNAME: ${SUPERSET_ADMIN_FIRSTNAME:-Superset}
+      SUPERSET_ADMIN_LASTNAME: ${SUPERSET_ADMIN_LASTNAME:-Admin}
+
+      SQLALCHEMY_DATABASE_URI: >-
+        postgresql+psycopg2://${SUPERSET_PG_USER:-superset}:${SUPERSET_PG_PASSWORD:-superset}@superset-postgres:5432/${SUPERSET_PG_DB:-superset}
+
+      REDIS_HOST: ${REDIS_HOST:-superset-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+
+    command: ["/app/superset-init.sh"]
+    ports:
+      - "${SUPERSET_PORT:-18088}:8088"
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8088/ >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
+
+volumes:
+  superset_pgdata:
