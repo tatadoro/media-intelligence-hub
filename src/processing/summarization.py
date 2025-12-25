@@ -1,318 +1,409 @@
+"""
+Text enrichment: extractive summary + TF-IDF keywords (RU-friendly).
+
+Goals:
+- keep dependencies minimal (scikit-learn + pymorphy3);
+- be robust on short/dirty news texts;
+- produce deterministic output for pipelines (raw/silver/gold).
+"""
+
 from __future__ import annotations
 
-from typing import List, Sequence
-from pathlib import Path
 import re
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from pymorphy3 import MorphAnalyzer
 from sklearn.feature_extraction.text import TfidfVectorizer
-
-# Попробуем подключить pymorphy2 для лемматизации
-try:
-    import pymorphy3
-    _MORPH = pymorphy3.MorphAnalyzer()
-except ImportError:
-    _MORPH = None
+from sklearn.metrics.pairwise import cosine_similarity
 
 
-# Простейший токенайзер: берем слова из русских/латинских букв и цифр
-_TOKEN_REGEX = re.compile(r"\b[а-яёa-z0-9]+\b", re.IGNORECASE)
-
-
-# Небольшой набор русских стоп-слов (можно потом расширить)
+# ----------------------------
+# Basic RU stopwords (small but pragmatic)
+# ----------------------------
 RU_STOPWORDS = {
-    "и", "но", "или", "а", "же", "то", "что", "чтобы",
-    "как", "так", "также",
-    "в", "на", "к", "от", "по", "из", "у", "за", "для",
-    "о", "об", "про", "при", "над", "под", "между",
-    "же", "ли", "бы", "же",
-    "это", "этот", "эта", "эти", "того", "этого", "тому",
-    "он", "она", "оно", "они", "мы", "вы", "ты",
-    "тот", "та", "те", "который", "которые", "какой",
-    "свой", "наш", "ваш", "их", "его", "ее",
-    "там", "тут", "здесь", "сюда", "туда",
-    "где", "когда", "пока", "уже", "еще",
-    "да", "нет",
+    "и", "в", "во", "на", "не", "что", "это", "как", "а", "но", "или", "то",
+    "у", "к", "по", "из", "за", "от", "до", "над", "под", "при", "про",
+    "для", "без", "с", "со", "об", "о", "обо", "же", "ли", "бы", "быть",
+    "он", "она", "оно", "они", "мы", "вы", "я", "ты", "его", "ее", "их",
+    "этот", "эта", "эти", "тот", "та", "те", "такой", "такая", "такие",
+    "там", "тут", "здесь", "вот", "уже", "еще", "ещё", "все", "всё",
+    "только", "лишь", "очень", "сам", "сама", "сами",
+    "который", "которая", "которые", "которых", "которому", "которым",
+    "так", "же", "ни", "да", "нет",
+    "сегодня", "вчера", "завтра",
+}
+
+# ----------------------------
+# Domain stopwords: frequent "news noise" words (esp. Telegram/short news)
+# Keep it small; extend empirically from your corpus.
+# ----------------------------
+DOMAIN_STOPWORDS = {
+    "конец", "близкий", "похоже", "кажется",
+    "ранее", "сейчас", "сегодня", "вчера", "завтра",
+    "сообщить", "сообщаться", "заявить", "заявлять", "рассказать",
+    "отметить", "уточнить", "добавить",
+    "якобы", "возможно", "вероятно",
+    "стало", "стать",
+    "дневной", "облёт", "облет", "пересмешник", "щебетать",
+    "канал", "телеграм", "telegram", "вечер",
+    "слово", "утренний", "полдень"
 }
 
 
-def _lemmatize_token(token: str) -> str:
+def _norm_word(w: str) -> str:
+    """Normalize for stable stopword matching: lower + ё→е."""
+    return w.lower().replace("ё", "е")
+
+
+RU_STOPWORDS_NORM = {_norm_word(w) for w in RU_STOPWORDS}
+DOMAIN_STOPWORDS_NORM = {_norm_word(w) for w in DOMAIN_STOPWORDS}
+
+# Extra forms that often appear after lemmatization / different spellings
+DOMAIN_STOPWORDS_NORM.update(
+    {_norm_word(w) for w in ["дневный", "дневной", "кремлевский", "кремлёвский"]}
+)
+
+_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё]{2,}", re.UNICODE)
+
+# Sentence split: keep it simple but stable.
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-ZА-ЯЁ0-9])")
+
+_morph = MorphAnalyzer()
+
+
+@lru_cache(maxsize=200_000)
+def _lemma_and_pos(token_lower: str) -> Tuple[str, str]:
     """
-    Приводим слово к начальной форме, если доступен pymorphy2.
-    Если нет — возвращаем как есть.
+    Return (lemma, POS) for a token using pymorphy3.
+    Cached for speed because news corpora repeat words a lot.
     """
-    if _MORPH is None:
-        return token
-    p = _MORPH.parse(token)
+    p = _morph.parse(token_lower)
     if not p:
-        return token
-    return p[0].normal_form
+        return token_lower, ""
+    best = p[0]
+    lemma = best.normal_form or token_lower
+    pos = str(best.tag.POS) if best.tag else ""
+    return lemma, pos
 
 
-def normalize_for_tfidf(text: str) -> str:
+def normalize_for_tfidf(
+    text: str,
+    *,
+    keep_pos: Optional[Sequence[str]] = ("NOUN", "ADJF", "ADJS"),
+    stopwords: Optional[set] = None,
+) -> str:
     """
-    Подготовка текста для TF-IDF:
-    - приводим к нижнему регистру,
-    - разбиваем на токены (слова),
-    - лемматизируем,
-    - выкидываем стоп-слова и очень короткие токены.
-    Возвращаем строку с токенами через пробел.
+    Turn raw text into a space-separated string of lemmas.
+
+    - tokenizes (letters only, len>=2)
+    - lowercases
+    - lemmatizes (pymorphy3)
+    - optional POS filtering (by pymorphy3 tag.POS)
+    - stopwords filtering
+
+    Returns a string for vectorizers.
     """
-    if not isinstance(text, str):
+    if not isinstance(text, str) or not text.strip():
         return ""
 
-    text = text.lower()
-    tokens = _TOKEN_REGEX.findall(text)
+    # Support custom stopwords, but match them normalized
+    custom_sw_norm = {_norm_word(w) for w in stopwords} if stopwords else None
 
-    norm_tokens: list[str] = []
-    for token in tokens:
-        if token in RU_STOPWORDS:
+    tokens = _TOKEN_RE.findall(text.lower())
+
+    lemmas: List[str] = []
+    for tok in tokens:
+        lemma, pos = _lemma_and_pos(tok)
+        lemma_norm = _norm_word(lemma)
+
+        # stopwords (normalized)
+        if custom_sw_norm is not None:
+            if lemma_norm in custom_sw_norm:
+                continue
+        else:
+            if lemma_norm in RU_STOPWORDS_NORM:
+                continue
+
+        # domain noise stopwords (normalized)
+        if lemma_norm in DOMAIN_STOPWORDS_NORM:
             continue
 
-        lemma = _lemmatize_token(token)
-        if lemma in RU_STOPWORDS:
+        if keep_pos is not None:
+            if pos and pos not in keep_pos:
+                continue
+
+        # drop very short lemmas after normalization
+        if len(lemma_norm) < 2:
             continue
 
-        # отсечем совсем короткие штуки типа "с", "в", "на"
-        if len(lemma) <= 2:
-            continue
+        lemmas.append(lemma_norm)
 
-        norm_tokens.append(lemma)
-
-    return " ".join(norm_tokens)
-
-# --- 1. Разбиение текста на предложения ---
-
-_SENTENCE_SPLIT_REGEX = re.compile(r"(?<=[.!?])\s+")
+    return " ".join(lemmas)
 
 
 def split_into_sentences(text: str) -> List[str]:
     """
-    Наивно разбивает текст на предложения по знакам . ! ?
-    Подходит как простое решение для новостных текстов.
+    Split text into sentences.
+
+    We don't try to be perfect Russian NLP here; we want predictable behavior in pipeline.
     """
     if not isinstance(text, str):
         return []
-
-    text = text.strip()
+    text = re.sub(r"\s+", " ", text.strip())
     if not text:
         return []
 
-    sentences = _SENTENCE_SPLIT_REGEX.split(text)
-    sentences = [s.strip() for s in sentences if s.strip()]
-    return sentences
+    parts = _SENT_SPLIT_RE.split(text)
+    # final cleanup
+    return [p.strip() for p in parts if p and p.strip()]
 
 
-# --- 2. Простая extractive-саммаризация ---
+@dataclass(frozen=True)
+class SummaryConfig:
+    max_sentences: int = 3
+    max_chars: int = 700
+    redundancy_threshold: float = 0.65  # cosine sim; lower => more diverse
 
-def extractive_summary(
-    text: str,
-    max_sentences: int = 3,
-    max_chars: int = 500,
-) -> str:
+
+def extractive_summary(text: str, cfg: SummaryConfig = SummaryConfig()) -> str:
     """
-    Простая extractive-саммаризация:
-    берем первые несколько предложений, пока не превысим max_sentences и max_chars.
+    Extractive summary using sentence TF-IDF scoring + redundancy control.
     """
+    if not isinstance(text, str) or not text.strip():
+        return ""
+
     sentences = split_into_sentences(text)
     if not sentences:
         return ""
 
-    selected: List[str] = []
-    total_chars = 0
+    # Short texts: return as-is (but clipped)
+    if len(sentences) <= cfg.max_sentences:
+        s = " ".join(sentences)
+        return s[: cfg.max_chars].strip()
 
-    for sent in sentences:
-        if len(selected) >= max_sentences:
-            break
+    # Build sentence-level TF-IDF inside a single document
+    norm_sents = [normalize_for_tfidf(s, keep_pos=None) for s in sentences]
+    # In case everything got filtered out
+    if sum(1 for s in norm_sents if s.strip()) == 0:
+        s = " ".join(sentences[: cfg.max_sentences])
+        return s[: cfg.max_chars].strip()
 
-        # если добавление предложения сильно превышает лимит символов
-        # и у нас уже есть хотя бы одно предложение — остановимся
-        if total_chars + len(sent) > max_chars and selected:
-            break
-
-        selected.append(sent)
-        total_chars += len(sent)
-
-    return " ".join(selected)
-
-
-# --- 3. Ключевые слова с помощью TF-IDF ---
-
-def extract_keywords_tfidf(
-    texts: Sequence[str],
-    top_k: int = 10,
-    max_features: int = 5000,
-) -> List[List[str]]:
-    """
-    Принимает список текстов (по одному на документ) и
-    возвращает для каждого документа список ключевых слов (top_k по TF-IDF).
-
-    Перед TF-IDF:
-    - нормализуем текст (лемматизация + удаление стоп-слов),
-    - считаем TF-IDF по нормализованным токенам.
-    """
-    cleaned_texts = [
-        t if isinstance(t, str) else ""
-        for t in texts
-    ]
-
-    # Нормализуем тексты для TF-IDF
-    normalized_texts = [normalize_for_tfidf(t) for t in cleaned_texts]
-
-    # Если все тексты пустые после нормализации — возвращаем пустые списки
-    if all(not nt for nt in normalized_texts):
-        return [[] for _ in normalized_texts]
-
-    vectorizer = TfidfVectorizer(
-        max_features=max_features,
-        ngram_range=(1, 2),        # униграммы и биграммы
-        lowercase=False,           # уже привели к lower
-        token_pattern=r"(?u)\b\w+\b",
+    vect = TfidfVectorizer(
+        max_features=4000,
+        ngram_range=(1, 2),
+        min_df=1,
+        max_df=0.95,
     )
+    X = vect.fit_transform(norm_sents)  # (n_sent, vocab)
 
-    tfidf_matrix = vectorizer.fit_transform(normalized_texts)
-    feature_names = np.array(vectorizer.get_feature_names_out())
+    # Score sentence by total TF-IDF mass; add mild bias to early sentences
+    base = np.asarray(X.sum(axis=1)).ravel()
+    position_bonus = np.linspace(1.0, 0.7, num=len(sentences))  # early sentences slightly preferred
+    scores = base * position_bonus
 
-    keywords_per_doc: List[List[str]] = []
+    # Select top sentences with redundancy filtering
+    order = np.argsort(-scores)
 
-    for row in tfidf_matrix:
-        if row.nnz == 0:
-            keywords_per_doc.append([])
+    chosen: List[int] = []
+    for idx in order:
+        if len(chosen) >= cfg.max_sentences:
+            break
+
+        if not chosen:
+            chosen.append(int(idx))
             continue
 
-        row_array = row.toarray().ravel()
-        top_indices = row_array.argsort()[-top_k:][::-1]
-        top_scores = row_array[top_indices]
+        sims = cosine_similarity(X[idx], X[chosen]).ravel()
+        if np.max(sims) < cfg.redundancy_threshold:
+            chosen.append(int(idx))
 
-        mask = top_scores > 0
-        top_terms = feature_names[top_indices][mask]
+    # If redundancy blocked too much, fill by best remaining
+    if len(chosen) < cfg.max_sentences:
+        for idx in order:
+            if int(idx) not in chosen:
+                chosen.append(int(idx))
+                if len(chosen) >= cfg.max_sentences:
+                    break
 
-        keywords_per_doc.append(top_terms.tolist())
+    chosen_sorted = sorted(chosen)
+    summary = " ".join(sentences[i] for i in chosen_sorted).strip()
 
-    return keywords_per_doc
-
-# --- 4. Обогащение DataFrame: silver -> gold (summary + keywords) ---
-
-EXPECTED_TEXT_COLUMN = "clean_text"
+    return summary[: cfg.max_chars].strip()
 
 
-def _build_nlp_text_row(row: pd.Series) -> str:
+@dataclass(frozen=True)
+class KeywordsConfig:
+    top_k: int = 8
+    ngram_range: Tuple[int, int] = (1, 3)
+    max_features: int = 50_000
+    max_df: float = 0.85
+    min_df: int = 1
+    # post-filtering
+    min_term_len: int = 3
+    max_terms: int = 8
+
+
+def _postfilter_terms(terms: List[str], cfg: KeywordsConfig) -> List[str]:
     """
-    Строим текст, который будем использовать для summary/keywords.
-
-    1) Если clean_text непустой — используем его.
-    2) Иначе собираем из title / description / summary (что есть).
+    Post-filter candidate terms:
+    - drop too short
+    - drop terms that start/end with stopwords
+    - drop terms containing domain stopwords (noise)
+    - drop junk patterns like "слово X"
+    - de-duplicate and avoid "nested" keywords:
+      if a longer phrase is selected, drop single-word/sub-phrases contained in it.
+    - if too few phrases remain, softly backfill with single-word terms (non-nested)
     """
-    # 1. clean_text
-    base = row.get(EXPECTED_TEXT_COLUMN, "")
-    if isinstance(base, str):
-        base_stripped = base.strip()
-        if base_stripped:
-            return base_stripped
+    cleaned: List[str] = []
+    seen = set()
 
-    # 2. Фолбэк: title + description/summary (если есть)
-    parts = []
+    for t in terms:
+        t = t.strip()
+        if not t:
+            continue
+        if len(t) < cfg.min_term_len:
+            continue
 
-    title = row.get("title", "")
-    if isinstance(title, str) and title.strip():
-        parts.append(title.strip())
+        # drop junk patterns like "слово X"
+        if t.startswith("слово "):
+            continue
 
-    # если в будущем в silver появятся поля description / summary, они тоже попадут сюда
-    for col in ("description", "summary"):
-        val = row.get(col, "")
-        if isinstance(val, str) and val.strip():
-            parts.append(val.strip())
+        words = t.split()
+        if not words:
+            continue
 
-    return ". ".join(parts)
+        w0 = _norm_word(words[0])
+        wL = _norm_word(words[-1])
+
+        # drop if starts/ends with stopwords (normalized)
+        if w0 in RU_STOPWORDS_NORM or wL in RU_STOPWORDS_NORM:
+            continue
+
+        # drop if contains domain stopwords anywhere (normalized)
+        if any(_norm_word(w) in DOMAIN_STOPWORDS_NORM for w in words):
+            continue
+
+        if t in seen:
+            continue
+
+        seen.add(t)
+        cleaned.append(t)
+
+    if not cleaned:
+        return []
+
+    # prefer longer / more specific phrases first
+    cleaned.sort(key=lambda s: (len(s.split()), len(s)), reverse=True)
+
+    # anti-nesting: keep phrase, drop subphrases / singletons inside it
+    selected: List[str] = []
+    for t in cleaned:
+        t_norm = f" {t} "
+        if any(t_norm in f" {s} " for s in selected):
+            continue
+        selected.append(t)
+        if len(selected) >= cfg.max_terms:
+            break
+
+    # soft backfill: add non-nested single terms if we have too few
+    if len(selected) < cfg.max_terms:
+        for t in cleaned:
+            if t in selected:
+                continue
+            if len(t.split()) != 1:
+                continue
+            t_norm = f" {t} "
+            if any(t_norm in f" {s} " for s in selected):
+                continue
+            selected.append(t)
+            if len(selected) >= cfg.max_terms:
+                break
+
+    return selected
+
+
+def extract_keywords_tfidf(texts: Sequence[str], cfg: KeywordsConfig = KeywordsConfig()) -> List[str]:
+    """
+    Global TF-IDF over a batch of documents, then top-k terms per document.
+    Returns list of '; '-joined keywords for each doc.
+    """
+    norm_texts = [normalize_for_tfidf(t, keep_pos=("NOUN", "ADJF", "ADJS")) for t in texts]
+
+    vect = TfidfVectorizer(
+        max_features=cfg.max_features,
+        ngram_range=cfg.ngram_range,
+        min_df=cfg.min_df,
+        max_df=cfg.max_df,
+    )
+    X = vect.fit_transform(norm_texts)
+    feat = np.array(vect.get_feature_names_out())
+
+    results: List[str] = []
+    for i in range(X.shape[0]):
+        row = X.getrow(i)
+        if row.nnz == 0:
+            results.append("")
+            continue
+        data = row.data
+        idxs = row.indices
+        order = np.argsort(-data)[: cfg.top_k]
+        top_terms = [feat[idxs[j]] for j in order]
+        top_terms = _postfilter_terms(top_terms, cfg)
+        results.append("; ".join(top_terms))
+
+    return results
 
 
 def enrich_articles_with_summary_and_keywords(
-    df_silver: pd.DataFrame,
-    top_k_keywords: int = 10,
+    df: pd.DataFrame,
+    *,
+    text_col: str = "clean_text",
+    title_col: str = "title",
+    summary_col: str = "summary",
+    keywords_col: str = "keywords",
+    nlp_text_col: str = "nlp_text",
+    summary_cfg: SummaryConfig = SummaryConfig(),
+    keywords_cfg: KeywordsConfig = KeywordsConfig(),
 ) -> pd.DataFrame:
     """
-    Принимает DataFrame из silver-слоя (должна быть колонка clean_text),
-    добавляет summary, keywords и несколько простых текстовых фичей.
-    Возвращает новый DataFrame (копию).
+    Adds:
+      - nlp_text: title + clean_text (for stable NLP input)
+      - summary: extractive summary
+      - keywords: TF-IDF keywords (batch-level)
 
-    ВАЖНО: если clean_text пустой, используем title/description/summary как фолбэк.
+    Also adds helper features for compatibility:
+      - text_length_chars
+      - num_sentences
+      - num_keywords
+
+    Returns a COPY of df (no inplace modifications).
     """
-    df = df_silver.copy()
+    out = df.copy()
 
-    if EXPECTED_TEXT_COLUMN not in df.columns:
-        raise ValueError(
-            f"В DataFrame нет колонки '{EXPECTED_TEXT_COLUMN}' с очищенным текстом"
-        )
+    title = out[title_col].fillna("").astype(str) if title_col in out.columns else ""
+    body = out[text_col].fillna("").astype(str) if text_col in out.columns else ""
 
-    # Строим текст для NLP: либо clean_text, либо title/description/summary
-    nlp_texts = df.apply(_build_nlp_text_row, axis=1)
-    df["nlp_text"] = nlp_texts
+    out[nlp_text_col] = (title + ". " + body).str.strip()
 
-    # 4.1. Summary для каждой статьи
-    df["summary"] = df["nlp_text"].apply(
-        lambda txt: extractive_summary(
-            txt,
-            max_sentences=3,
-            max_chars=500,
-        )
-    )
+    # summary per row
+    out[summary_col] = out[nlp_text_col].apply(lambda t: extractive_summary(t, summary_cfg))
 
-    # 4.2. Ключевые слова (TF-IDF по всему корпусу)
-    keywords_lists = extract_keywords_tfidf(
-        df["nlp_text"].tolist(),
-        top_k=top_k_keywords,
-    )
-    df["keywords"] = [
-        "; ".join(kw_list) if kw_list else ""
-        for kw_list in keywords_lists
-    ]
+    # keywords: batch-level TF-IDF (better for trends + comparability)
+    out[keywords_col] = extract_keywords_tfidf(out[nlp_text_col].tolist(), keywords_cfg)
 
-    # 4.3. Несколько вспомогательных фичей
-    df["text_length_chars"] = df["nlp_text"].apply(len)
-    df["num_sentences"] = df["nlp_text"].apply(
+    # --- helper features (compat with ClickHouse schema / old pipeline) ---
+    out["text_length_chars"] = out[nlp_text_col].fillna("").astype(str).apply(len)
+    out["num_sentences"] = out[nlp_text_col].fillna("").astype(str).apply(
         lambda txt: len(split_into_sentences(txt))
     )
-    df["num_keywords"] = df["keywords"].apply(
-        lambda s: 0 if not s else len([x for x in s.split(";") if x.strip()])
+    out["num_keywords"] = out[keywords_col].apply(
+        lambda s: 0
+        if not isinstance(s, str) or not s.strip()
+        else len([x for x in s.split(";") if x.strip()])
     )
 
-    return df
-
-
-# --- 5. Мини-тест на фейковых данных (для локальной проверки) ---
-
-if __name__ == "__main__":
-    # Простой тест модуля: создаем маленький DataFrame из двух "статей"
-    data = [
-        {
-            "article_id": "1",
-            "source": "test_source",
-            "title": "Первая тестовая статья",
-            "published_at": "2025-12-11T10:00:00",
-            "url": "https://example.com/1",
-            "clean_text": (
-                "Это первая тестовая новость. "
-                "В ней мы проверяем работу простого summarizer. "
-                "Текст не несет смысловой нагрузки, но помогает протестировать код."
-            ),
-        },
-        {
-            "article_id": "2",
-            "source": "test_source",
-            "title": "Вторая тестовая статья",
-            "published_at": "2025-12-11T11:00:00",
-            "url": "https://example.com/2",
-            "clean_text": (
-                "Это вторая новость для проверки TF-IDF. "
-                "Она про анализ медиа и обработку текстов. "
-                "Мы хотим выделить ключевые слова про анализ и тексты."
-            ),
-        },
-    ]
-    df_test = pd.DataFrame(data)
-
-    df_gold_test = enrich_articles_with_summary_and_keywords(df_test, top_k_keywords=5)
-
-    cols_to_show = ["article_id", "title", "summary", "keywords"]
-    print(df_gold_test[cols_to_show])
+    return out
