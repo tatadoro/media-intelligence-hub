@@ -1,0 +1,10 @@
+# Новости
+bbbreaking
+listnewsru
+moscow_laundry
+KremlinPeresmeshnik
+kritiknewsfeed
+banksta
+ostorozhno_novosti
+# Тест
+ostorozhno_novosti

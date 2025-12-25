@@ -77,3 +77,7 @@ reports/daily_report_*.md
 
 # macOS
 .DS_Store
+
+# temp/debug artifacts
+pythonpath/
+temp_results_*_posts_*.json

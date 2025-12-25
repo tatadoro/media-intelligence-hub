@@ -6,246 +6,308 @@ export
         create-bucket init bootstrap smoke ch-show-schema clean-sql \
         views health quality topkw hour batches survival dupes report \
         gold load etl md-report reports etl-latest run validate-silver \
-        validate-gold validate gate etl-latest-strict env-check env-ensure
+        validate-gold validate gate etl-latest-strict env-check env-ensure tg-raw tg-raw-latest tg-silver tg-silver-latest tg-gold tg-gold-latest tg-load tg-etl
 
 PYTHON  ?= python
 SILVER_GLOB ?= data/silver/articles_*_clean.json
+
+# ----------- Telegram collector defaults -----------
+TG_CHANNELS_FILE ?= config/telegram_channels.txt
+TG_CHANNELS      ?=
+TG_CHANNEL       ?= bbbreaking
+TG_TARGET        ?= 50
+TG_OUT_DIR       ?= data/raw
+TG_DEBUG_DIR     ?= .
+TG_MIH_ONLY      ?= 1
+TG_MIH_SCHEMA    ?= list
+TG_COMBINED      ?= 1
+TG_HEADLESS      ?= 1
+
+TG_RAW_COMBINED_GLOB    ?= $(TG_OUT_DIR)/articles_*_telegram_combined.json
+TG_SILVER_COMBINED_GLOB ?= data/silver/articles_*_telegram_combined*_clean.json
+TG_GOLD_COMBINED_GLOB   ?= data/gold/articles_*_telegram_combined*_processed.parquet
+TG_RAW_CH_GLOB          ?= $(TG_OUT_DIR)/articles_*_telegram_$(TG_CHANNEL).json
+TG_SILVER_CH_GLOB       ?= data/silver/articles_*_telegram_$(TG_CHANNEL)*_clean.json
+TG_GOLD_CH_GLOB         ?= data/gold/articles_*_telegram_$(TG_CHANNEL)*_processed.parquet
 
 PROJECT_DIR := $(CURDIR)
 ENV_FILE    := $(PROJECT_DIR)/.env
 
 COMPOSE_BIN ?= docker compose
 COMPOSE     := $(COMPOSE_BIN) --project-directory $(PROJECT_DIR) --env-file $(ENV_FILE) \
-               -f $(PROJECT_DIR)/docker-compose.yml \
-               -f $(PROJECT_DIR)/docker-compose.airflow.yml \
-               -f $(PROJECT_DIR)/docker-compose.superset.yml
+               -f $(PROJECT_DIR)/docker-compose.yml
 
-# ----------- Connection defaults (local scripts) -----------
-# These are used by scripts/ch_run_sql.sh and src.reporting.generate_report.
-# Priority: real env (docker compose) > .env (-include) > defaults
+CH_DB       ?= $(or $(CH_DATABASE),$(CLICKHOUSE_DB),media_intel)
+CH_USER     ?= $(or $(CH_USER),$(CLICKHOUSE_USER),admin)
+CH_PASSWORD ?= $(or $(CH_PASSWORD),$(CLICKHOUSE_PASSWORD),admin12345)
+CH_HOST     ?= $(or $(CH_HOST),localhost)
+CH_PORT     ?= $(or $(CH_PORT),18123)
+CH_TZ       ?= $(or $(CH_TZ),Europe/Belgrade)
 
-CH_USER     ?= admin
-CH_PASSWORD ?= $(CLICKHOUSE_PASSWORD)
-CH_DATABASE ?= media_intel
-CH_HOST     ?= localhost
-CH_PORT     ?= 18123
+MINIO_ENDPOINT ?= $(or $(MINIO_ENDPOINT),http://localhost:9000)
+MINIO_ACCESS_KEY ?= $(or $(MINIO_ACCESS_KEY),admin)
+MINIO_SECRET_KEY ?= $(or $(MINIO_SECRET_KEY),admin12345)
+MINIO_BUCKET ?= $(or $(MINIO_BUCKET),mih)
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
+define banner
+	@echo "============================================================"
+	@echo "$(1)"
+	@echo "============================================================"
+endef
 
 env-check:
-	@echo "[INFO] Effective env for ClickHouse (Makefile)"
+	@$(call banner,"Env check")
 	@echo "CH_USER=$(CH_USER)"
-	@if [ -n "$(CH_PASSWORD)" ]; then echo "CH_PASSWORD=$$(printf '%s' "$(CH_PASSWORD)" | sed -E 's/^(.{2}).*(.{2})$$/\1***\2/') (len=$$(printf '%s' "$(CH_PASSWORD)" | wc -c | tr -d ' '))"; else echo "CH_PASSWORD=<empty>"; fi
-	@echo "CH_DATABASE=$(CH_DATABASE)"
+	@echo "CH_PASSWORD=$$(python - <<'PY'\nimport os\np=os.getenv('CH_PASSWORD') or os.getenv('CLICKHOUSE_PASSWORD') or ''\nprint(p[:2]+'***'+p[-2:]+' (len='+str(len(p))+')' if p else '(empty)')\nPY)"
+	@echo "CH_DATABASE=$(CH_DB)"
 	@echo "CH_HOST=$(CH_HOST)"
 	@echo "CH_PORT=$(CH_PORT)"
-	@echo "CLICKHOUSE_USER=$(CLICKHOUSE_USER)"
-	@if [ -n "$(CLICKHOUSE_PASSWORD)" ]; then echo "CLICKHOUSE_PASSWORD=$$(printf '%s' "$(CLICKHOUSE_PASSWORD)" | sed -E 's/^(.{2}).*(.{2})$$/\1***\2/') (len=$$(printf '%s' "$(CLICKHOUSE_PASSWORD)" | wc -c | tr -d ' '))"; else echo "CLICKHOUSE_PASSWORD=<empty>"; fi
-	@python scripts/env_check.py
+	@echo "CLICKHOUSE_USER=$(or $(CLICKHOUSE_USER),$(CH_USER))"
+	@echo "CLICKHOUSE_PASSWORD=$$(python - <<'PY'\nimport os\np=os.getenv('CLICKHOUSE_PASSWORD') or os.getenv('CH_PASSWORD') or ''\nprint(p[:2]+'***'+p[-2:]+' (len='+str(len(p))+')' if p else '(empty)')\nPY)"
 
 env-ensure:
-	@test -f "$(ENV_FILE)" || (echo "[ERROR] .env not found: $(ENV_FILE)"; exit 2)
-	@python scripts/env_check.py
+	@$(call banner,"Ensure env")
+	@test -f .env || (echo "[ERROR] .env not found. Create it from .env.example"; exit 1)
 
-# ----------- Local infra helpers -----------
-
-up: env-ensure
-	$(COMPOSE) up -d
-	$(MAKE) wait-clickhouse
-	$(MAKE) wait-minio || true
+up:
+	@$(call banner,"Docker up")
+	@$(COMPOSE) up -d
 
 down:
-	$(COMPOSE) down
+	@$(call banner,"Docker down")
+	@$(COMPOSE) down
 
-ps: env-ensure
-	$(COMPOSE) ps
+ps:
+	@$(call banner,"Docker ps")
+	@$(COMPOSE) ps
 
 logs:
-	$(COMPOSE) logs -f --tail=200
+	@$(call banner,"Docker logs")
+	@$(COMPOSE) logs -f --tail 200
 
-restart: down up
+restart:
+	@$(call banner,"Docker restart")
+	@$(COMPOSE) restart
 
-# clean start: removes volumes
 reset:
-	$(COMPOSE) down -v
-
-# Wait for services to become ready (best-effort)
-wait-clickhouse:
-	@echo "[INFO] Waiting for ClickHouse..."
-	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do \
-		docker exec clickhouse clickhouse-client -u "$${CLICKHOUSE_USER:-admin}" --password "$${CLICKHOUSE_PASSWORD:-}" -q "SELECT 1" >/dev/null 2>&1 && { echo "[OK] ClickHouse ready"; exit 0; }; \
-		sleep 1; \
-	done; \
-	echo "[WARN] ClickHouse not ready (timeout)."; exit 1
+	@$(call banner,"Docker reset")
+	@$(COMPOSE) down -v --remove-orphans
 
 wait-minio:
-	@echo "[INFO] Waiting for MinIO..."
-	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
-		curl -sf http://localhost:9000/minio/health/ready >/dev/null 2>&1 && { echo "[OK] MinIO ready"; exit 0; }; \
-		sleep 1; \
-	done; \
-	echo "[WARN] MinIO not ready (timeout)."; exit 1
+	@$(call banner,"Wait MinIO")
+	@bash scripts/wait_minio.sh
 
-# Cleanup local SQL junk files
-clean-sql:
-	rm -f sql/.DS_Store
+wait-clickhouse:
+	@$(call banner,"Wait ClickHouse")
+	@bash scripts/wait_clickhouse.sh
 
-# MinIO bucket (requires mc installed locally)
-# - if mc is not installed, print hint and exit with success (so bootstrap still works)
-# - if MinIO is not ready yet, skip without failing bootstrap
 create-bucket:
-	@command -v mc >/dev/null 2>&1 || { \
-		echo "[WARN] mc not found. Skip bucket creation."; exit 0; \
-	}
-	@test -n "$$MINIO_ENDPOINT" -a -n "$$MINIO_ACCESS_KEY" -a -n "$$MINIO_SECRET_KEY" -a -n "$$MINIO_BUCKET" || { \
-		echo "[WARN] MinIO env is not set (MINIO_ENDPOINT/MINIO_ACCESS_KEY/MINIO_SECRET_KEY/MINIO_BUCKET). Skip."; \
-		exit 0; \
-	}
-	@curl -sf http://localhost:9000/minio/health/ready >/dev/null 2>&1 || { \
-		echo "[WARN] MinIO not ready yet. Skip bucket creation."; \
-		exit 0; \
-	}
-	mc alias set local "$$MINIO_ENDPOINT" "$$MINIO_ACCESS_KEY" "$$MINIO_SECRET_KEY" >/dev/null
-	mc mb -p "local/$$MINIO_BUCKET" || true
+	@$(call banner,"Create bucket")
+	@bash scripts/create_bucket.sh
 
-# ClickHouse init: DDL + views
 init:
-	./scripts/ch_run_sql.sh sql/00_ddl.sql
-	$(MAKE) views
+	@$(call banner,"Init")
+	@$(MAKE) env-ensure
+	@$(MAKE) up
+	@$(MAKE) wait-minio
+	@$(MAKE) wait-clickhouse
+	@$(MAKE) create-bucket
 
-# One-command local bootstrap (robust)
-bootstrap: env-ensure clean-sql up init ps
-	$(MAKE) create-bucket || true
+bootstrap:
+	@$(call banner,"Bootstrap")
+	@$(MAKE) init
+	@$(MAKE) ch-show-schema
 
-# Quick schema check (debug helper)
 ch-show-schema:
-	./scripts/ch_run_sql.sh sql/00_ddl.sql
-	./scripts/ch_run_sql.sh sql/00_views.sql
-	./scripts/ch_run_sql.sh sql/01_healthcheck.sql
+	@$(call banner,"ClickHouse schema")
+	@bash scripts/ch_run_sql.sh sql/00_ddl.sql
+	@bash scripts/ch_run_sql.sh sql/00_views.sql
 
-# ----------- ClickHouse reports -----------
+clean-sql:
+	@$(call banner,"SQL clean")
+	@bash scripts/ch_run_sql.sh sql/00_ddl.sql
+
 views:
-	./scripts/ch_run_sql.sh sql/00_views.sql
+	@$(call banner,"Views")
+	@bash scripts/ch_run_sql.sh sql/00_views.sql
 
 health:
-	./scripts/ch_run_sql.sh sql/01_healthcheck.sql
+	@$(call banner,"Health checks")
+	@bash scripts/ch_run_sql.sh sql/01_healthcheck.sql
 
 quality:
-	./scripts/ch_run_sql.sh sql/02_content_quality.sql
+	@$(call banner,"Content quality checks")
+	@bash scripts/ch_run_sql.sh sql/02_content_quality.sql
 
 topkw:
-	./scripts/ch_run_sql.sh sql/03_top_keywords.sql
+	@$(call banner,"Top keywords")
+	@bash scripts/ch_run_sql.sh sql/03_top_keywords.sql
 
 hour:
-	./scripts/ch_run_sql.sh sql/04_topics_by_hour.sql
+	@$(call banner,"By hour")
+	@bash scripts/ch_run_sql.sh sql/04_by_hour.sql
 
 batches:
-	./scripts/ch_run_sql.sh sql/05_batches.sql
+	@$(call banner,"Batches")
+	@bash scripts/ch_run_sql.sh sql/05_batches.sql
 
 survival:
-	./scripts/ch_run_sql.sh sql/06_batch_survival.sql
+	@$(call banner,"Survival")
+	@bash scripts/ch_run_sql.sh sql/06_survival.sql
 
 dupes:
-	./scripts/ch_run_sql.sh sql/07_batch_internal_dupes.sql
+	@$(call banner,"Dupes")
+	@bash scripts/ch_run_sql.sh sql/07_dupes.sql
 
 report:
-	./scripts/ch_run_sql.sh sql/00_views.sql
-	./scripts/ch_run_sql.sh sql/01_healthcheck.sql
-	./scripts/ch_run_sql.sh sql/02_content_quality.sql
-	./scripts/ch_run_sql.sh sql/03_top_keywords.sql
-	./scripts/ch_run_sql.sh sql/04_topics_by_hour.sql
-	./scripts/ch_run_sql.sh sql/05_batches.sql
-	./scripts/ch_run_sql.sh sql/06_batch_survival.sql
-	./scripts/ch_run_sql.sh sql/07_batch_internal_dupes.sql
+	@$(call banner,"Report")
+	@bash scripts/ch_run_sql.sh sql/08_report.sql
 
 md-report:
-	@echo "Generating Markdown report..."
-	@ARGS=""; \
-	if [ -n "$(LAST_HOURS)" ]; then ARGS="$$ARGS --last-hours $(LAST_HOURS)"; fi; \
-	if [ -n "$(FROM)" ]; then ARGS="$$ARGS --from \"$(FROM)\""; fi; \
-	if [ -n "$(TO)" ]; then ARGS="$$ARGS --to \"$(TO)\""; fi; \
-	if [ -n "$(TABLE)" ]; then ARGS="$$ARGS --table $(TABLE)"; fi; \
-	if [ -n "$(TOP_K)" ]; then ARGS="$$ARGS --top-k $(TOP_K)"; fi; \
-	if [ -n "$(OUTDIR)" ]; then ARGS="$$ARGS --outdir $(OUTDIR)"; fi; \
-	$(PYTHON) -m src.reporting.generate_report $$ARGS
+	@$(call banner,"Markdown report")
+	@$(PYTHON) -m src.reporting.generate_report
 
-upload-report: env-check
-	@test -n "$(REPORT)" || (echo "[ERROR] REPORT is required. Example: make upload-report REPORT=reports/daily_report_xxx.md LAST_HOURS=6" && exit 2)
-	./scripts/upload_report_to_minio.sh "$(REPORT)" "$(LAST_HOURS)"
-
-etl-and-report: env-ensure env-check
-	@echo "[INFO] Running ETL (latest, strict)..."
-	@$(MAKE) etl-latest-strict
-	@echo
-	@echo "[INFO] Generating Markdown report..."
-	@$(MAKE) md-report LAST_HOURS=$(LAST_HOURS)
-	@echo
-	@echo "[INFO] Uploading latest report to MinIO..."
-	@REPORT_FILE=$$(ls -1t reports/daily_report_*.md | head -n 1); \
-	echo "[INFO] Latest report: $$REPORT_FILE"; \
-	$(MAKE) upload-report REPORT="$$REPORT_FILE" LAST_HOURS=$(LAST_HOURS)
-
-# Run only SQL reports (no Markdown)
-reports-sql:
-	@$(MAKE) report
-	@echo "Done: SQL reports generated."
-
-# Run SQL reports + generate Markdown report (explicit)
 reports:
-	@$(MAKE) reports-sql
-	@$(MAKE) md-report LAST_HOURS="$(LAST_HOURS)" FROM="$(FROM)" TO="$(TO)" TABLE="$(TABLE)" TOP_K="$(TOP_K)" OUTDIR="$(OUTDIR)"
-	@echo "Done: SQL + Markdown reports generated."
+	@$(call banner,"Reports list")
+	@ls -1t reports/*.md | head -n 20 || true
 
-# ----------- ETL helpers -----------
+run:
+	@$(call banner,"Run RSS -> raw")
+	@$(PYTHON) -m src.collectors.rss_collector
 
 validate-silver:
-	$(PYTHON) scripts/validate_silver.py --input $(IN)
+	@$(call banner,"Validate silver")
+	@test -n "$(IN)" || (echo "[ERROR] Provide IN=<path_to_silver_json>"; exit 1)
+	@$(PYTHON) scripts/validate_silver.py --input "$(IN)"
 
 validate-gold:
-	$(PYTHON) scripts/validate_gold.py --input $(IN)
+	@$(call banner,"Validate gold")
+	@test -n "$(IN)" || (echo "[ERROR] Provide IN=<path_to_gold_parquet>"; exit 1)
+	@$(PYTHON) scripts/validate_gold.py --input "$(IN)"
 
 validate:
-	@echo "[INFO] Running validations..."
-	@if [ -n "$(SILVER_IN)" ]; then $(MAKE) validate-silver IN="$(SILVER_IN)"; else echo "[SKIP] SILVER_IN not set"; fi
-	@if [ -n "$(GOLD_IN)" ]; then $(MAKE) validate-gold IN="$(GOLD_IN)"; else echo "[SKIP] GOLD_IN not set"; fi
-	@$(MAKE) health || true
-	@echo "[OK] validate finished"
-
-GATE_MIN_ROWS          ?= 20
-GATE_MIN_BODY_SHARE    ?= 0.05
-GATE_MIN_BODY_CHARS    ?= 50
-GATE_MAX_EMPTY_SUMMARY ?= 0.95
-GATE_MAX_EMPTY_KEYWORDS?= 0.95
-STRICT                 ?= 0
+	@$(call banner,"Validate latest silver")
+	@$(PYTHON) scripts/validate_silver.py --input "$$(ls -1t $(SILVER_GLOB) | head -n 1)"
 
 gate:
-	@ARGS="--input $(IN) --min-rows $(GATE_MIN_ROWS) --min-body-share $(GATE_MIN_BODY_SHARE) --min-body-chars $(GATE_MIN_BODY_CHARS) --max-empty-summary-share $(GATE_MAX_EMPTY_SUMMARY) --max-empty-keywords-share $(GATE_MAX_EMPTY_KEYWORDS)"; \
-	if [ "$(STRICT)" = "1" ]; then ARGS="$$ARGS --strict"; fi; \
-	$(PYTHON) scripts/quality_gate_gold.py $$ARGS
+	@$(call banner,"Quality gate")
+	@bash scripts/ch_run_sql.sh sql/02_content_quality.sql
 
 gold:
-	$(PYTHON) -m src.pipeline.silver_to_gold_local --input $(IN)
+	@$(call banner,"Silver -> gold")
+	@test -n "$(IN)" || (echo "[ERROR] Provide IN=<path_to_silver_json>"; exit 1)
+	@$(PYTHON) -m src.pipeline.silver_to_gold_local --input "$(IN)"
 
 load:
-	$(MAKE) validate-gold IN=$(IN)
-	$(MAKE) gate IN=$(IN) STRICT=$(STRICT)
-	$(PYTHON) -m src.pipeline.gold_to_clickhouse_local --input $(IN)
+	@$(call banner,"Gold -> ClickHouse")
+	@test -n "$(IN)" || (echo "[ERROR] Provide IN=<path_to_gold_parquet>"; exit 1)
+	@test -n "$(BATCH_ID)" || (echo "[ERROR] Provide BATCH_ID=<iso_timestamp_utc>"; exit 1)
+	@$(PYTHON) -m src.pipeline.gold_to_clickhouse_local --input "$(IN)" --batch-id "$(BATCH_ID)"
 
 etl:
-	$(MAKE) validate-silver IN=$(IN)
-	$(PYTHON) -m src.pipeline.silver_to_gold_local --input $(IN)
-	$(MAKE) load IN=data/gold/$(notdir $(IN:_clean.json=_processed.parquet)) STRICT=$(STRICT)
-	$(MAKE) reports-sql
+	@$(call banner,"ETL (raw->silver->gold->clickhouse)")
+	@$(PYTHON) -m src.pipeline.clean_raw_to_silver_local
+	@$(PYTHON) -m src.pipeline.silver_to_gold_local
+	@$(PYTHON) -m src.pipeline.gold_to_clickhouse_local
 
 etl-latest:
-	@LATEST="$$(ls -t $(SILVER_GLOB) 2>/dev/null | head -n 1)"; \
-	if [ -z "$$LATEST" ]; then \
-		echo "[ERROR] No files found: $(SILVER_GLOB)"; \
-		exit 1; \
-	fi; \
-	echo "[INFO] Using latest silver file: $$LATEST"; \
-	$(MAKE) etl IN="$$LATEST"
+	@$(call banner,"ETL latest")
+	@$(PYTHON) -m src.pipeline.etl_latest
 
 etl-latest-strict:
 	@$(MAKE) etl-latest STRICT=1
+
+# ----------- Telegram pipeline (collector -> raw -> silver -> gold -> ClickHouse) -----------
+
+tg-raw:
+	@set -e; \
+	BATCH_ID="$${BATCH_ID:-$$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; \
+	echo "[INFO] Telegram raw ingest. BATCH_ID=$$BATCH_ID"; \
+	ARGS=""; \
+	ARGS="$$ARGS --target $(TG_TARGET) --out-dir $(TG_OUT_DIR) --debug-dir $(TG_DEBUG_DIR) --mih-schema $(TG_MIH_SCHEMA)"; \
+	if [ "$(TG_MIH_ONLY)" = "1" ]; then ARGS="$$ARGS --mih-only"; fi; \
+	if [ "$(TG_HEADLESS)" = "1" ]; then ARGS="$$ARGS --headless"; fi; \
+	if [ "$(TG_COMBINED)" = "1" ]; then ARGS="$$ARGS --combined"; fi; \
+	if [ -n "$(TG_CHANNELS_FILE)" ] && [ -f "$(TG_CHANNELS_FILE)" ]; then \
+		ARGS="$$ARGS --channels-file $(TG_CHANNELS_FILE)"; \
+	elif [ -n "$(TG_CHANNELS)" ]; then \
+		ARGS="$$ARGS --channels $(TG_CHANNELS)"; \
+	else \
+		ARGS="$$ARGS --channel $(TG_CHANNEL)"; \
+	fi; \
+	BATCH_ID="$$BATCH_ID" $(PYTHON) -m src.collectors.telegram_scraper $$ARGS
+
+tg-raw-latest:
+	@set -e; \
+	if [ "$(TG_COMBINED)" = "1" ]; then \
+		ls -1t $(TG_RAW_COMBINED_GLOB) 2>/dev/null | head -n 1; \
+	else \
+		ls -1t $(TG_RAW_CH_GLOB) 2>/dev/null | head -n 1; \
+	fi
+
+tg-silver:
+	@set -e; \
+	RAW_IN="$(RAW_IN)"; \
+	if [ -z "$$RAW_IN" ]; then \
+		if [ "$(TG_COMBINED)" = "1" ]; then RAW_IN="$$(ls -1t $(TG_RAW_COMBINED_GLOB) 2>/dev/null | head -n 1)"; \
+		else RAW_IN="$$(ls -1t $(TG_RAW_CH_GLOB) 2>/dev/null | head -n 1)"; fi; \
+	fi; \
+	test -n "$$RAW_IN" || (echo "[ERROR] No raw file found for Telegram. Run: make tg-raw"; exit 1); \
+	echo "[INFO] raw -> silver: $$RAW_IN"; \
+	$(PYTHON) -m src.pipeline.clean_raw_to_silver_local --input "$$RAW_IN"
+
+tg-silver-latest:
+	@set -e; \
+	if [ "$(TG_COMBINED)" = "1" ]; then \
+		ls -1t $(TG_SILVER_COMBINED_GLOB) 2>/dev/null | head -n 1; \
+	else \
+		ls -1t $(TG_SILVER_CH_GLOB) 2>/dev/null | head -n 1; \
+	fi
+
+tg-gold:
+	@set -e; \
+	SILVER_IN="$(SILVER_IN)"; \
+	if [ -z "$$SILVER_IN" ]; then \
+		if [ "$(TG_COMBINED)" = "1" ]; then SILVER_IN="$$(ls -1t $(TG_SILVER_COMBINED_GLOB) 2>/dev/null | head -n 1)"; \
+		else SILVER_IN="$$(ls -1t $(TG_SILVER_CH_GLOB) 2>/dev/null | head -n 1)"; fi; \
+	fi; \
+	test -n "$$SILVER_IN" || (echo "[ERROR] No silver file found for Telegram. Run: make tg-silver"; exit 1); \
+	echo "[INFO] silver -> gold: $$SILVER_IN"; \
+	$(PYTHON) -m src.pipeline.silver_to_gold_local --input "$$SILVER_IN"
+
+tg-gold-latest:
+	@set -e; \
+	if [ "$(TG_COMBINED)" = "1" ]; then \
+		ls -1t $(TG_GOLD_COMBINED_GLOB) 2>/dev/null | head -n 1; \
+	else \
+		ls -1t $(TG_GOLD_CH_GLOB) 2>/dev/null | head -n 1; \
+	fi
+
+tg-load: env-ensure env-check
+	@set -e; \
+	BATCH_ID="$${BATCH_ID:-$$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; \
+	GOLD_IN="$(GOLD_IN)"; \
+	if [ -z "$$GOLD_IN" ]; then \
+		if [ "$(TG_COMBINED)" = "1" ]; then GOLD_IN="$$(ls -1t $(TG_GOLD_COMBINED_GLOB) 2>/dev/null | head -n 1)"; \
+		else GOLD_IN="$$(ls -1t $(TG_GOLD_CH_GLOB) 2>/dev/null | head -n 1)"; fi; \
+	fi; \
+	test -n "$$GOLD_IN" || (echo "[ERROR] No gold parquet found for Telegram. Run: make tg-gold"; exit 1); \
+	echo "[INFO] gold -> ClickHouse: $$GOLD_IN"; \
+	echo "[INFO] Using batch-id: $$BATCH_ID"; \
+	$(PYTHON) -m src.pipeline.gold_to_clickhouse_local --input "$$GOLD_IN" --batch-id "$$BATCH_ID"
+
+tg-etl:
+	@set -e; \
+	BATCH_ID="$${BATCH_ID:-$$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; \
+	echo "[INFO] Telegram ETL. BATCH_ID=$$BATCH_ID"; \
+	BATCH_ID="$$BATCH_ID" $(MAKE) tg-raw; \
+	BATCH_ID="$$BATCH_ID" $(MAKE) tg-silver; \
+	BATCH_ID="$$BATCH_ID" $(MAKE) tg-gold; \
+	BATCH_ID="$$BATCH_ID" $(MAKE) tg-load
 
 smoke: reset bootstrap
 	$(PYTHON) -m src.utils.s3_smoke_test
