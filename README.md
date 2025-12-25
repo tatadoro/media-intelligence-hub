@@ -8,17 +8,52 @@
 - очистка текста и извлечение ключевой информации;
 - семантическое обогащение (summary, keywords, фичи);
 - загрузка витрин в ClickHouse;
-- аналитика/дашборды и отчёты (Markdown сейчас, BI — в планах).
+- аналитика/дашборды и отчёты (Markdown сейчас, BI — в процессе).
 
-Статус: **MVP работает** (raw → silver → gold → ClickHouse + SQL-проверки + Airflow DAG + Markdown-отчёт).
+Статус: **MVP работает** (raw → silver → gold → ClickHouse + SQL-проверки + Airflow DAG + Markdown-отчёт + Superset).
 
 ## Архитектура пайплайна (MVP)
 
-- **raw**: сырые выгрузки из RSS (и/или обогащённые body, если включен шаг enrich)
-- **silver**: очищенный текст (нормализация, чистка, контракт)
-- **gold**: обогащение (summary + keywords + текстовые фичи), контракт
-- **ClickHouse**: витрина `articles` (+ `load_log` для дедупа/защиты от повторных заливок)
+- **collectors**: сбор сырья из источников (RSS, Telegram)
+- **raw**: сырые выгрузки (JSON)
+- **silver**: очищенный текст (нормализация/чистка/контракт)
+- **gold**: обогащение (summary + keywords + текстовые фичи), контракт (parquet)
+- **ClickHouse**:
+  - `media_intel.articles` — основная витрина (загрузка батчами)
+  - `media_intel.articles_dedup` — слой/представление для аналитики без дублей (используем в BI)
+  - `media_intel.load_log` — журнал загрузок (защита от повторных заливок)
 - **reports**: SQL-аналитика + Markdown-дайджест
+
+## Источники данных
+
+### RSS
+Сбор из RSS-лент в `raw`, опционально с шагом enrich (подтянуть body, если нужно).
+
+### Telegram (t.me/s/<channel>)
+Коллектор: `src/collectors/telegram_scraper.py`
+
+Поддерживает:
+- список каналов (`--channels-file` или `--channels`)
+- сбор N постов на канал (`--target`)
+- `--combined` (дополнительно сохраняет общий raw по всем каналам)
+- сохранение в формате raw, совместимом с дальнейшим шагом `raw → silver`
+
+Файл со списком каналов:
+- `config/telegram_channels.txt` (по одному каналу на строку, можно с `#` комментариями)
+
+## Автоматизация через Makefile
+
+Ключевые команды:
+- `make tg-raw` — Telegram → raw
+- `make tg-silver` — raw → silver (берёт самый свежий Telegram raw)
+- `make tg-gold` — silver → gold
+- `make tg-load` — gold → ClickHouse
+- `make tg-etl` — полный цикл Telegram: raw → silver → gold → ClickHouse
+
+Примечание: для ClickHouse-части убедись, что переменные `CH_*` подхвачены из `.env`:
+```bash
+set -a; source .env; set +a
+```
 
 ## Airflow orchestration
 
@@ -73,7 +108,7 @@ volumes:
 ```bash
 cp "$(ls -1t reports/daily_report_*.md | head -n 1)" reports/examples/daily_report_sample.md
 git add reports/examples/daily_report_sample.md
-git commit -m "Docs: update report sample"
+git commit -m "docs: update report sample"
 git push
 ```
 
@@ -121,37 +156,40 @@ CH_DATABASE=media_intel
 python scripts/validate_silver.py --input data/silver/<file>_clean.json
 python scripts/validate_gold.py --input data/gold/<file>_processed.parquet
 ```
-## Идемпотентная загрузка в ClickHouse (batch_id)
 
-Чтобы повторные прогоны DAG не накапливали дубли, в таблице `articles` используется поле `batch_id` (тип `String`).
+## Идемпотентная загрузка в ClickHouse
 
-- `batch_id` вычисляется как имя gold-файла Parquet (например, `articles_..._processed.parquet`).
-- Перед загрузкой нового батча выполняется удаление старых строк этого же батча:
-  `ALTER TABLE articles DELETE WHERE batch_id = '<batch_id>'`.
-- Затем выполняется `load_to_clickhouse`, который загружает строки с тем же `batch_id`.
+Загрузка выполняется батчами. В таблице `articles` есть:
+- `ingest_object_name` — имя объекта/артефакта загрузки (используется для защиты от повторных заливок)
+- `batch_id` — идентификатор запуска/батча (часто UTC timestamp, прокидывается через `BATCH_ID`)
 
-Миграция схемы: `sql/00_schema_batch_id.sql` (добавляет колонку `batch_id`, если её нет).
+Для аналитики без дублей используется `articles_dedup` (рекомендуется подключать именно её в Superset).
 
 ## Запуск пайплайна (локально без Airflow)
 
-### 1 Сбор RSS → raw
+### 1) RSS → raw
 ```bash
 python -m src.collectors.rss_collector
 ```
 
-### 2 raw → silver (очистка)
+### 2) raw → silver (очистка)
 ```bash
 python -m src.pipeline.clean_raw_to_silver_local --input data/raw/<raw_file>.json
 ```
 
-### 3 silver → gold (summary + keywords)
+### 3) silver → gold (summary + keywords)
 ```bash
 python -m src.pipeline.silver_to_gold_local --input data/silver/<silver_file>.json
 ```
 
-### 4 gold → ClickHouse
+### 4) gold → ClickHouse
 ```bash
 python -m src.pipeline.gold_to_clickhouse_local --input data/gold/<gold_file>.parquet
+```
+
+### Telegram ETL через Makefile
+```bash
+make tg-etl
 ```
 
 Перед первой загрузкой и SQL-проверками подготовь ClickHouse-объекты:
@@ -167,6 +205,12 @@ SQL-файлы в `sql/` предназначены для контроля ка
 ```bash
 make report
 ```
+
+## Superset (дашборды)
+
+Для BI-аналитики подключаем ClickHouse и строим чарты/дашборды поверх:
+- `media_intel.articles_dedup` (рекомендуется для большинства графиков)
+- агрегатных датасетов из SQL Lab (saved datasets)
 
 ## Безопасность и артефакты
 - `.env` и любые секреты **не коммитятся**
@@ -202,19 +246,9 @@ brew install minio/stable/mc
 ls -la .env
 ```
 
-### Повторный прогон “не льёт” данные (дедуп по батчу)
-Скрипт загрузки защищает от дублей через `load_log` и проверку наличия строк в `articles` по `ingest_object_name`.
-
-Если хочешь прогнать всё “как с нуля”:
-```bash
-make reset
-make bootstrap
-make etl-latest
-```
-
 ## Roadmap
 - обогащение gold: эмбеддинги, тематическое моделирование, тональность
 - улучшение извлечения ключевых фраз и суммаризации
 - витрины ClickHouse под BI (Superset/DataLens)
 - расписания и уведомления (ежедневные дайджесты)
-- расширение источников (несколько RSS/API)
+- расширение источников (несколько RSS/API/Telegram)
