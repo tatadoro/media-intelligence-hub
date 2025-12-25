@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -20,21 +20,102 @@ from pymorphy3 import MorphAnalyzer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+# Optional NER (B): Natasha. If not installed, we fall back to simple rules (A).
+try:
+    from natasha import Doc, NewsEmbedding, NewsNERTagger, Segmenter, MorphVocab  # type: ignore
+
+    _NATASHA_OK = True
+except Exception:
+    _NATASHA_OK = False
+
 
 # ----------------------------
 # Basic RU stopwords (small but pragmatic)
 # ----------------------------
 RU_STOPWORDS = {
-    "и", "в", "во", "на", "не", "что", "это", "как", "а", "но", "или", "то",
-    "у", "к", "по", "из", "за", "от", "до", "над", "под", "при", "про",
-    "для", "без", "с", "со", "об", "о", "обо", "же", "ли", "бы", "быть",
-    "он", "она", "оно", "они", "мы", "вы", "я", "ты", "его", "ее", "их",
-    "этот", "эта", "эти", "тот", "та", "те", "такой", "такая", "такие",
-    "там", "тут", "здесь", "вот", "уже", "еще", "ещё", "все", "всё",
-    "только", "лишь", "очень", "сам", "сама", "сами",
-    "который", "которая", "которые", "которых", "которому", "которым",
-    "так", "же", "ни", "да", "нет",
-    "сегодня", "вчера", "завтра",
+    "и",
+    "в",
+    "во",
+    "на",
+    "не",
+    "что",
+    "это",
+    "как",
+    "а",
+    "но",
+    "или",
+    "то",
+    "у",
+    "к",
+    "по",
+    "из",
+    "за",
+    "от",
+    "до",
+    "над",
+    "под",
+    "при",
+    "про",
+    "для",
+    "без",
+    "с",
+    "со",
+    "об",
+    "о",
+    "обо",
+    "же",
+    "ли",
+    "бы",
+    "быть",
+    "он",
+    "она",
+    "оно",
+    "они",
+    "мы",
+    "вы",
+    "я",
+    "ты",
+    "его",
+    "ее",
+    "их",
+    "этот",
+    "эта",
+    "эти",
+    "тот",
+    "та",
+    "те",
+    "такой",
+    "такая",
+    "такие",
+    "там",
+    "тут",
+    "здесь",
+    "вот",
+    "уже",
+    "еще",
+    "ещё",
+    "все",
+    "всё",
+    "только",
+    "лишь",
+    "очень",
+    "сам",
+    "сама",
+    "сами",
+    "который",
+    "которая",
+    "которые",
+    "которых",
+    "которому",
+    "которым",
+    "так",
+    "же",
+    "ни",
+    "да",
+    "нет",
+    "сегодня",
+    "вчера",
+    "завтра",
 }
 
 # ----------------------------
@@ -42,27 +123,50 @@ RU_STOPWORDS = {
 # Keep it small; extend empirically from your corpus.
 # ----------------------------
 DOMAIN_STOPWORDS = {
-    "конец", "близкий", "похоже", "кажется",
-    "ранее", "сейчас", "сегодня", "вчера", "завтра",
-    "сообщить", "сообщаться", "заявить", "заявлять", "рассказать",
-    "отметить", "уточнить", "добавить",
-    "якобы", "возможно", "вероятно",
-    "стало", "стать",
-    "дневной", "облёт", "облет", "пересмешник", "щебетать",
-    "канал", "телеграм", "telegram", "вечер",
-    "слово", "утренний", "полдень"
+    "конец",
+    "близкий",
+    "похоже",
+    "кажется",
+    "ранее",
+    "сейчас",
+    "сегодня",
+    "вчера",
+    "завтра",
+    "сообщить",
+    "сообщаться",
+    "заявить",
+    "заявлять",
+    "рассказать",
+    "отметить",
+    "уточнить",
+    "добавить",
+    "якобы",
+    "возможно",
+    "вероятно",
+    "стало",
+    "стать",
+    "дневной",
+    "облёт",
+    "облет",
+    "пересмешник",
+    "щебетать",
+    "канал",
+    "телеграм",
+    "telegram",
+    "вечер",
+    "слово",
+    "утренний",
+    "полдень",
 }
 
 
 def _norm_word(w: str) -> str:
-    """Normalize for stable stopword matching: lower + ё→е."""
-    return w.lower().replace("ё", "е")
+    """Normalize for stable matching: lower + ё→е."""
+    return (w or "").lower().replace("ё", "е")
 
 
 RU_STOPWORDS_NORM = {_norm_word(w) for w in RU_STOPWORDS}
 DOMAIN_STOPWORDS_NORM = {_norm_word(w) for w in DOMAIN_STOPWORDS}
-
-# Extra forms that often appear after lemmatization / different spellings
 DOMAIN_STOPWORDS_NORM.update(
     {_norm_word(w) for w in ["дневный", "дневной", "кремлевский", "кремлёвский"]}
 )
@@ -156,10 +260,155 @@ def split_into_sentences(text: str) -> List[str]:
     text = re.sub(r"\s+", " ", text.strip())
     if not text:
         return []
-
     parts = _SENT_SPLIT_RE.split(text)
-    # final cleanup
     return [p.strip() for p in parts if p and p.strip()]
+
+
+# ----------------------------
+# Entities (B: Natasha NER) + fallback (A: simple rules)
+# ----------------------------
+_ENTITY_CLEAN_RE = re.compile(r"[^0-9A-Za-zА-Яа-яЁё\- ]+", re.UNICODE)
+
+_CAP_SEQ_RE = re.compile(
+    r"\b(?:[А-ЯЁ][а-яё]+|[A-Z][a-z]+)(?:\s+(?:[А-ЯЁ][а-яё]+|[A-Z][a-z]+)){0,2}\b"
+)
+
+_FALLBACK_BAD_START = {
+    "в",
+    "на",
+    "это",
+    "но",
+    "и",
+    "по",
+    "из",
+    "при",
+    "для",
+    "без",
+    "от",
+    "до",
+}
+
+
+def normalize_entity(s: str) -> str:
+    s = (s or "").strip()
+    s = s.replace("ё", "е").replace("Ё", "Е")
+    s = _ENTITY_CLEAN_RE.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _uniq_keep_order(items: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for x in items:
+        k = _norm_word(x)
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        out.append(x)
+    return out
+
+
+@lru_cache(maxsize=1)
+def _get_ner():
+    if not _NATASHA_OK:
+        return None
+    segmenter = Segmenter()
+    emb = NewsEmbedding()
+    ner = NewsNERTagger(emb)
+    vocab = MorphVocab()
+    return segmenter, ner, vocab
+
+
+def extract_entities_ner(text: str, *, max_per_type: int = 10) -> Dict[str, List[str]]:
+    out = {"persons": [], "orgs": [], "geo": []}
+    if not isinstance(text, str) or not text.strip():
+        return out
+
+    ner_pack = _get_ner()
+    if ner_pack is None:
+        return out
+
+    segmenter, ner, vocab = ner_pack
+    doc = Doc(text)
+    doc.segment(segmenter)
+    doc.tag_ner(ner)
+
+    persons: List[str] = []
+    orgs: List[str] = []
+    geo: List[str] = []
+
+    for span in doc.spans:
+        try:
+            span.normalize(vocab)
+            norm = span.normal
+        except TypeError:
+        # на случай несовпадений версий
+            norm = None
+
+        val = normalize_entity(norm or span.text)
+        if not val or len(val) < 2:
+            continue
+        if span.type == "PER":
+            persons.append(val)
+        elif span.type == "ORG":
+            orgs.append(val)
+        elif span.type == "LOC":
+            geo.append(val)
+
+    out["persons"] = _uniq_keep_order(persons)[:max_per_type]
+    out["orgs"] = _uniq_keep_order(orgs)[:max_per_type]
+    out["geo"] = _uniq_keep_order(geo)[:max_per_type]
+    return out
+
+
+def extract_entities_fallback(text: str, *, max_per_type: int = 10) -> Dict[str, List[str]]:
+    out = {"persons": [], "orgs": [], "geo": []}
+    if not isinstance(text, str) or not text.strip():
+        return out
+
+    cands = _CAP_SEQ_RE.findall(text)
+    cleaned: List[str] = []
+    for c in cands:
+        c2 = normalize_entity(c)
+        if not c2:
+            continue
+        first = _norm_word(c2.split()[0])
+        if first in _FALLBACK_BAD_START:
+            continue
+        cleaned.append(c2)
+
+    cleaned = _uniq_keep_order(cleaned)
+    # Fallback does not reliably classify PER/ORG/LOC. Put into persons for "who" trends.
+    out["persons"] = cleaned[:max_per_type]
+    return out
+
+
+def extract_entities(text: str, *, max_per_type: int = 10) -> Dict[str, List[str]]:
+    ent = extract_entities_ner(text, max_per_type=max_per_type)
+    if ent["persons"] or ent["orgs"] or ent["geo"]:
+        return ent
+    return extract_entities_fallback(text, max_per_type=max_per_type)
+
+
+def _sentence_entity_bonus(sentences: List[str], top_entities: List[str]) -> np.ndarray:
+    if not sentences or not top_entities:
+        return np.zeros(len(sentences), dtype=float)
+
+    ents_norm = [_norm_word(normalize_entity(e)) for e in top_entities if e and normalize_entity(e)]
+    ents_norm = [e for e in ents_norm if e]
+    if not ents_norm:
+        return np.zeros(len(sentences), dtype=float)
+
+    bonuses = np.zeros(len(sentences), dtype=float)
+    for i, s in enumerate(sentences):
+        s_norm = _norm_word(s)
+        hit = 0
+        for e in ents_norm:
+            if e and e in s_norm:
+                hit += 1
+        bonuses[i] = float(hit)
+    return bonuses
 
 
 @dataclass(frozen=True)
@@ -167,11 +416,14 @@ class SummaryConfig:
     max_sentences: int = 3
     max_chars: int = 700
     redundancy_threshold: float = 0.65  # cosine sim; lower => more diverse
+    entity_bonus_weight: float = 0.25   # bonus per entity hit (relative)
+    max_entities_for_bonus: int = 6
 
 
 def extractive_summary(text: str, cfg: SummaryConfig = SummaryConfig()) -> str:
     """
     Extractive summary using sentence TF-IDF scoring + redundancy control.
+    Plus optional entity coverage bonus (persons/orgs/geo) to make summaries more "news-like".
     """
     if not isinstance(text, str) or not text.strip():
         return ""
@@ -187,7 +439,6 @@ def extractive_summary(text: str, cfg: SummaryConfig = SummaryConfig()) -> str:
 
     # Build sentence-level TF-IDF inside a single document
     norm_sents = [normalize_for_tfidf(s, keep_pos=None) for s in sentences]
-    # In case everything got filtered out
     if sum(1 for s in norm_sents if s.strip()) == 0:
         s = " ".join(sentences[: cfg.max_sentences])
         return s[: cfg.max_chars].strip()
@@ -200,12 +451,21 @@ def extractive_summary(text: str, cfg: SummaryConfig = SummaryConfig()) -> str:
     )
     X = vect.fit_transform(norm_sents)  # (n_sent, vocab)
 
-    # Score sentence by total TF-IDF mass; add mild bias to early sentences
+    # Base score by TF-IDF mass; mild bias to early sentences
     base = np.asarray(X.sum(axis=1)).ravel()
-    position_bonus = np.linspace(1.0, 0.7, num=len(sentences))  # early sentences slightly preferred
+    position_bonus = np.linspace(1.0, 0.7, num=len(sentences))
     scores = base * position_bonus
 
-    # Select top sentences with redundancy filtering
+    # Entity coverage bonus (optional)
+    ent = extract_entities(text, max_per_type=10)
+    top_entities = (ent["persons"] + ent["orgs"] + ent["geo"])[: cfg.max_entities_for_bonus]
+    if top_entities and cfg.entity_bonus_weight > 0:
+        hits = _sentence_entity_bonus(sentences, top_entities)
+        # normalize hits into [0..1] roughly, then scale by mean TF-IDF
+        if hits.max() > 0:
+            hits = hits / hits.max()
+            scores = scores + cfg.entity_bonus_weight * (scores.mean() + 1e-9) * hits
+
     order = np.argsort(-scores)
 
     chosen: List[int] = []
@@ -221,7 +481,6 @@ def extractive_summary(text: str, cfg: SummaryConfig = SummaryConfig()) -> str:
         if np.max(sims) < cfg.redundancy_threshold:
             chosen.append(int(idx))
 
-    # If redundancy blocked too much, fill by best remaining
     if len(chosen) < cfg.max_sentences:
         for idx in order:
             if int(idx) not in chosen:
@@ -231,7 +490,6 @@ def extractive_summary(text: str, cfg: SummaryConfig = SummaryConfig()) -> str:
 
     chosen_sorted = sorted(chosen)
     summary = " ".join(sentences[i] for i in chosen_sorted).strip()
-
     return summary[: cfg.max_chars].strip()
 
 
@@ -267,8 +525,6 @@ def _postfilter_terms(terms: List[str], cfg: KeywordsConfig) -> List[str]:
             continue
         if len(t) < cfg.min_term_len:
             continue
-
-        # drop junk patterns like "слово X"
         if t.startswith("слово "):
             continue
 
@@ -279,11 +535,8 @@ def _postfilter_terms(terms: List[str], cfg: KeywordsConfig) -> List[str]:
         w0 = _norm_word(words[0])
         wL = _norm_word(words[-1])
 
-        # drop if starts/ends with stopwords (normalized)
         if w0 in RU_STOPWORDS_NORM or wL in RU_STOPWORDS_NORM:
             continue
-
-        # drop if contains domain stopwords anywhere (normalized)
         if any(_norm_word(w) in DOMAIN_STOPWORDS_NORM for w in words):
             continue
 
@@ -296,10 +549,8 @@ def _postfilter_terms(terms: List[str], cfg: KeywordsConfig) -> List[str]:
     if not cleaned:
         return []
 
-    # prefer longer / more specific phrases first
     cleaned.sort(key=lambda s: (len(s.split()), len(s)), reverse=True)
 
-    # anti-nesting: keep phrase, drop subphrases / singletons inside it
     selected: List[str] = []
     for t in cleaned:
         t_norm = f" {t} "
@@ -309,7 +560,6 @@ def _postfilter_terms(terms: List[str], cfg: KeywordsConfig) -> List[str]:
         if len(selected) >= cfg.max_terms:
             break
 
-    # soft backfill: add non-nested single terms if we have too few
     if len(selected) < cfg.max_terms:
         for t in cleaned:
             if t in selected:
@@ -375,6 +625,12 @@ def enrich_articles_with_summary_and_keywords(
       - summary: extractive summary
       - keywords: TF-IDF keywords (batch-level)
 
+    Adds entities (B: Natasha NER; A: fallback):
+      - entities_persons
+      - entities_orgs
+      - entities_geo
+      - num_persons / num_orgs / num_geo
+
     Also adds helper features for compatibility:
       - text_length_chars
       - num_sentences
@@ -389,7 +645,17 @@ def enrich_articles_with_summary_and_keywords(
 
     out[nlp_text_col] = (title + ". " + body).str.strip()
 
-    # summary per row
+    # entities per row
+    ents = out[nlp_text_col].apply(lambda t: extract_entities(t, max_per_type=10))
+    out["entities_persons"] = ents.apply(lambda d: "; ".join(d.get("persons", [])))
+    out["entities_orgs"] = ents.apply(lambda d: "; ".join(d.get("orgs", [])))
+    out["entities_geo"] = ents.apply(lambda d: "; ".join(d.get("geo", [])))
+
+    out["num_persons"] = ents.apply(lambda d: len(d.get("persons", [])))
+    out["num_orgs"] = ents.apply(lambda d: len(d.get("orgs", [])))
+    out["num_geo"] = ents.apply(lambda d: len(d.get("geo", [])))
+
+    # summary per row (now with optional entity bonus)
     out[summary_col] = out[nlp_text_col].apply(lambda t: extractive_summary(t, summary_cfg))
 
     # keywords: batch-level TF-IDF (better for trends + comparability)

@@ -21,3 +21,4 @@ tabulate
 clickhouse-connect
 sqlalchemy
 
+natasha
