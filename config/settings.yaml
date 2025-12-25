@@ -1,4 +1,60 @@
-project_name: "Media Intelligence Hub"
+# Media Intelligence Hub — настройки источников и хранения
+
+sources:
+  rss:
+    - name: lenta.ru
+      url: https://lenta.ru/rss/news
+      enabled: true
+
+    - name: ria.ru
+      url: https://ria.ru/export/rss2/archive/index.xml
+      enabled: true
+
+    - name: tass.ru
+      # https://tass.ru/rss/google.xml -> status 200, но entries=0
+      url: https://tass.ru/rss/v2.xml
+      enabled: true
+
+    - name: rbc.ru
+      url: https://rssexport.rbc.ru/rbcnews/news/30/full.rss
+      enabled: true
+
+    - name: bbc-russian
+      url: https://feeds.bbci.co.uk/russian/rss.xml
+      enabled: true
+
+    - name: kommersant.ru
+      url: https://www.kommersant.ru/RSS/main.xml
+      enabled: true
+
+    - name: vedomosti.ru
+      url: https://www.vedomosti.ru/rss/news
+      enabled: true
+
+    - name: gazeta.ru
+      url: https://www.gazeta.ru/export/rss/first.xml
+      enabled: true
+
+    # Кандидаты (включай по одному и тестируй):
+    - name: rg.ru
+      url: https://rg.ru/xml/index.xml
+      enabled: true
+
+    - name: vesti.ru
+      url: https://www.vesti.ru/vesti.rss
+      enabled: false
+
+    - name: iz.ru
+      url: https://iz.ru/xml/rss/all.xml
+      enabled: true
+
+    - name: tvzvezda.ru
+      url: https://tvzvezda.ru/export/rss.xml
+      enabled: true
+
+    - name: rt-russian
+      url: https://russian.rt.com/rss
+      enabled: true
 
 data:
   raw_dir: "data/raw"
@@ -18,3 +74,4 @@ storage:
     endpoint: ${MINIO_ENDPOINT:-"http://localhost:9000"}
     bucket: ${MINIO_BUCKET:-"media-intel"}
     region: ${MINIO_REGION:-"us-east-1"}
+

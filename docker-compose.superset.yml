@@ -30,6 +30,9 @@ services:
       - .env
 
     environment:
+      # ВАЖНО: фиксируем конфиг, чтобы Superset не падал в SQLite по умолчанию
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+
       SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-change-me-please}
       SUPERSET_ADMIN_USERNAME: ${SUPERSET_ADMIN_USERNAME:-admin}
       SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD:-admin}
@@ -42,6 +45,13 @@ services:
 
       REDIS_HOST: ${REDIS_HOST:-superset-redis}
       REDIS_PORT: ${REDIS_PORT:-6379}
+
+      # Чтобы убрать warning про in-memory rate limiter
+      RATELIMIT_STORAGE_URI: redis://superset-redis:6379/1
+
+    volumes:
+      # чтобы /app/superset_home не был "одноразовым"
+      - superset_home:/app/superset_home
 
     command: ["/app/superset-init.sh"]
     ports:
@@ -57,3 +67,4 @@ services:
 
 volumes:
   superset_pgdata:
+  superset_home:

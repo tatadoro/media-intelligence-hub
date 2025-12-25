@@ -121,7 +121,7 @@ def main() -> None:
 
     transform_raw_to_silver(input_path, output_path)
 
-        if args.upload_minio:
+    if args.upload_minio:
         # Проверим, что mc доступен
         try:
             subprocess.run(["mc", "--version"], check=True, capture_output=True, text=True)
@@ -143,7 +143,6 @@ def main() -> None:
                 "Заполни .env (см. .env.example) и повтори."
             )
 
-        # Убедимся, что alias существует: если нет — создадим
         out = subprocess.run(
             ["mc", "alias", "list"],
             check=True,
@@ -151,7 +150,7 @@ def main() -> None:
             text=True,
         ).stdout
 
-        if f"{alias} " not in out and f"{alias}\t" not in out:
+        if alias not in out:
             subprocess.run(
                 ["mc", "alias", "set", alias, minio_endpoint, minio_access_key, minio_secret_key],
                 check=True,
@@ -160,11 +159,9 @@ def main() -> None:
             )
 
         dst = f"{alias}/{bucket}/silver/{output_path.name}"
-
         print(f"[INFO] Загружаем silver в MinIO: {dst}")
         subprocess.run(["mc", "cp", str(output_path), dst], check=True)
         print("[OK] Silver загружен в MinIO")
-
-
+        
 if __name__ == "__main__":
     main()
