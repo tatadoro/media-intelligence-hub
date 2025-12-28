@@ -5,7 +5,7 @@ USE media_intel;
 
 -- A) Сводка по каждому батчу
 SELECT
-  ingest_object_name,
+  batch_key,
   sum(cnt) AS rows,
   count() AS uniq_keys,
   (sum(cnt) - count()) AS duplicate_rows,
@@ -13,28 +13,28 @@ SELECT
 FROM
 (
   SELECT
-    ingest_object_name,
+    if(empty(batch_id), ingest_object_name, batch_id) AS batch_key,
     if(empty(link), id, link) AS dedup_key,
     count() AS cnt
   FROM articles
   GROUP BY
-    ingest_object_name,
+    batch_key,
     if(empty(link), id, link)
 )
-GROUP BY ingest_object_name
+GROUP BY batch_key
 ORDER BY duplicate_rows DESC, rows DESC
 FORMAT Pretty;
 
 -- B) ТОП дублей (какие ключи задублились и сколько раз)
 SELECT
-  ingest_object_name,
+  if(empty(batch_id), ingest_object_name, batch_id) AS batch_key,
   if(empty(link), id, link) AS dedup_key,
   count() AS c
 FROM articles
 GROUP BY
-  ingest_object_name,
+  batch_key,
   if(empty(link), id, link)
 HAVING c > 1
-ORDER BY c DESC, ingest_object_name
+ORDER BY c DESC, batch_key
 LIMIT 50
 FORMAT Pretty;

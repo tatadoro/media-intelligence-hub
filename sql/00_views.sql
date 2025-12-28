@@ -20,10 +20,22 @@ SELECT
   argMax(num_sentences, score)      AS num_sentences,
   argMax(num_keywords, score)       AS num_keywords,
 
+  argMax(batch_id, score)           AS batch_id,
+  argMax(is_digest, score)          AS is_digest,
+
+  argMax(entities_persons, score)   AS entities_persons,
+  argMax(entities_orgs, score)      AS entities_orgs,
+  argMax(entities_geo, score)       AS entities_geo,
+  argMax(num_persons, score)        AS num_persons,
+  argMax(num_orgs, score)           AS num_orgs,
+  argMax(num_geo, score)            AS num_geo,
+
   argMax(ingest_object_name, score) AS ingest_object_name,
   argMax(clean_len, score)          AS best_clean_len
 FROM
 (
+  WITH
+    (SELECT max(loaded_at) FROM media_intel.load_log WHERE layer = 'gold') AS max_loaded
   SELECT
     a.*,
     if(empty(a.link), a.id, a.link) AS dedup_key,
@@ -35,7 +47,7 @@ FROM
       toDateTime64('1970-01-01 00:00:00', 9, 'Europe/Moscow')
     ) AS loaded_at,
 
-    toUInt8(positionCaseInsensitive(a.ingest_object_name, '_v2_') > 0) AS batch_priority,
+    toUInt8(coalesce(ll.loaded_at, toDateTime('1970-01-01 00:00:00')) = max_loaded) AS batch_priority,
 
     (has_body, clean_len, batch_priority, a.published_at, loaded_at) AS score
   FROM articles AS a

@@ -3,8 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 import argparse
 import os
-import pandas as pd
+import re
+from collections import Counter, defaultdict
+from typing import Tuple, List, Dict, DefaultDict
 
+import pandas as pd
+import hashlib
 from src.processing.summarization import enrich_articles_with_summary_and_keywords
 
 CH_TZ = "Europe/Moscow"
@@ -13,6 +17,232 @@ MIN_PUBLISHED_AT_UTC = pd.Timestamp("2000-01-01", tz="UTC")
 # Фильтрация низкокачественного контента перед обогащением
 EXCLUDE_BODY_STATUS = {"parsed_empty", "fetch_failed", "no_link", "too_short"}
 MIN_CLEAN_TEXT_CHARS = 400
+
+# --- NER (persons/geo) ---
+try:
+    from natasha import Segmenter, NewsEmbedding, NewsNERTagger, Doc, MorphVocab
+
+    _NER_AVAILABLE = True
+    _segmenter = Segmenter()
+    _emb = NewsEmbedding()
+    _tagger = NewsNERTagger(_emb)
+    _morph = MorphVocab()
+except Exception:
+    _NER_AVAILABLE = False
+
+# --- Morphology for canonicalization ---
+try:
+    import pymorphy2
+
+    _MORPH_AVAILABLE = True
+    _morph_analyzer = pymorphy2.MorphAnalyzer()
+except Exception:
+    _MORPH_AVAILABLE = False
+    _morph_analyzer = None  # type: ignore[assignment]
+
+
+_RE_BRACKETS = re.compile(r"\s*\([^)]*\)")
+_RE_SPACES = re.compile(r"\s+")
+
+# Синонимы/унификация для гео (минимально, расширишь по мере надобности)
+GEO_SYNONYMS: Dict[str, str] = {
+    "рф": "россия",
+    "российский федерация": "россия",
+    "российская федерация": "россия",
+    "соединенный штат": "сша",
+    "соединенные штат": "сша",
+    "соединенные штаты": "сша",
+}
+
+
+def _uniq_keep_order(items: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for x in items:
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _clean_entity_text(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = _RE_BRACKETS.sub("", s)  # убрать "(...)"
+    s = s.replace("ё", "е")
+    s = _RE_SPACES.sub(" ", s)
+    return s.strip()
+
+
+def _lemmatize_phrase(s: str) -> str:
+    """
+    Лемматизация фразы для схлопывания падежей:
+    'москве' -> 'москва', 'владимира зеленского' -> 'владимир зеленский'.
+
+    Если pymorphy2 недоступен, возвращаем очищенный текст без лемматизации.
+    """
+    s = _clean_entity_text(s)
+    if not s:
+        return ""
+
+    if not _MORPH_AVAILABLE or _morph_analyzer is None:
+        return s
+
+    tokens = [t for t in re.split(r"[^\w-]+", s) if t]
+    lemmas: List[str] = []
+    for t in tokens:
+        # аббревиатуры оставляем как есть (в нижний регистр уже привели)
+        if t in {"сша", "рф", "ес"}:
+            lemmas.append(t)
+            continue
+        p = _morph_analyzer.parse(t)
+        lemmas.append(p[0].normal_form if p else t)
+    return " ".join(lemmas).strip()
+
+
+def _canonicalize_geo(geo_mentions: List[str]) -> List[str]:
+    out: List[str] = []
+    for g in geo_mentions:
+        g0 = _lemmatize_phrase(g)
+        if not g0:
+            continue
+        g0 = GEO_SYNONYMS.get(g0, g0)
+        out.append(g0)
+    return _uniq_keep_order(out)
+
+
+def _canonicalize_persons(person_mentions: List[str]) -> List[str]:
+    """
+    Локальная каноникализация (в пределах одного текста).
+    Для итоговой склейки one-word -> full используем глобальный проход в add_persons_geo_columns().
+    """
+    canon = [_lemmatize_phrase(p) for p in person_mentions]
+    canon = [p for p in canon if p]
+    return _uniq_keep_order(canon)
+
+
+def extract_persons_geo_lists(text: str) -> Tuple[List[str], List[str]]:
+    """
+    Возвращает (persons_list, geo_list) как списки в канонической форме:
+    - clean + lemmatize
+    - удаление "(...)" хвостов
+    - geo дополнительно прогоняется через словарь GEO_SYNONYMS
+
+    Важно: здесь НЕ делаем глобальную склейку фамилии -> полное имя.
+    Это делается вторым проходом на уровне всего батча в add_persons_geo_columns().
+    """
+    if not _NER_AVAILABLE:
+        return [], []
+
+    if not text or not str(text).strip():
+        return [], []
+
+    doc = Doc(str(text))
+    doc.segment(_segmenter)
+    doc.tag_ner(_tagger)
+
+    persons_raw: List[str] = []
+    geo_raw: List[str] = []
+
+    for span in doc.spans:
+        span.normalize(_morph)
+        raw = (span.normal or span.text or "").strip()
+        if not raw:
+            continue
+
+        # лемматизация/чистка всегда через нашу функцию
+        val = _lemmatize_phrase(raw)
+        if not val:
+            continue
+
+        if span.type == "PER":
+            persons_raw.append(val)
+        elif span.type == "LOC":
+            geo_raw.append(val)
+
+    persons = _canonicalize_persons(persons_raw)
+    geo = _canonicalize_geo(geo_raw)
+
+    return persons, geo
+
+
+def extract_persons_geo(text: str) -> Tuple[str, str]:
+    """
+    Совместимость: возвращает (persons, geo) как строки 'a;b;c' в нижнем регистре.
+    """
+    persons, geo = extract_persons_geo_lists(text)
+    return ";".join(persons), ";".join(geo)
+
+
+def add_persons_geo_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Добавляет колонки persons и geo в gold.
+    Берём текст в приоритете: nlp_text -> clean_text -> raw_text.
+
+    Для persons: 2 прохода на уровне всего датафрейма (батча):
+    1) извлечь списки персон по каждой строке (лемматизация, чистка)
+    2) собрать глобальную мапу: фамилия -> самое частотное полное имя (>=2 токена)
+    3) заменить однословные упоминания (трамп) на полные (дональд трамп), если есть
+
+    Это решает проблему, когда в конкретной статье встречается только "трамп/трампа",
+    а "дональд трамп" встречается в другой статье в рамках того же батча.
+    """
+    out = df.copy()
+
+    # гарантируем колонки даже для пустого датафрейма
+    if out.empty:
+        if "persons" not in out.columns:
+            out["persons"] = pd.Series(dtype="string")
+        if "geo" not in out.columns:
+            out["geo"] = pd.Series(dtype="string")
+        return out
+
+    if "nlp_text" in out.columns:
+        text_s = out["nlp_text"]
+    elif "clean_text" in out.columns:
+        text_s = out["clean_text"]
+    else:
+        text_s = out.get("raw_text", pd.Series([""] * len(out), index=out.index))
+
+    text_s = text_s.fillna("").astype(str)
+
+    # PASS 1: извлекаем списки сущностей
+    persons_lists: List[List[str]] = []
+    geo_lists: List[List[str]] = []
+    for t in text_s.tolist():
+        p_list, g_list = extract_persons_geo_lists(t)
+        persons_lists.append(p_list)
+        geo_lists.append(g_list)
+
+    # строим глобальную мапу фамилия -> самое частотное полное имя
+    by_last: DefaultDict[str, Counter] = defaultdict(Counter)
+    for plist in persons_lists:
+        for p in plist:
+            parts = p.split()
+            if len(parts) >= 2:
+                last = parts[-1]
+                by_last[last][p] += 1
+
+    best_full_by_last: Dict[str, str] = {last: cnt.most_common(1)[0][0] for last, cnt in by_last.items()}
+
+    # PASS 2: маппим однословные упоминания на полные
+    persons_out: List[str] = []
+    geo_out: List[str] = []
+
+    for plist, glist in zip(persons_lists, geo_lists):
+        mapped: List[str] = []
+        for p in plist:
+            parts = p.split()
+            if len(parts) == 1:
+                mapped.append(best_full_by_last.get(parts[0], p))
+            else:
+                mapped.append(p)
+
+        persons_out.append(";".join(_uniq_keep_order(mapped)))
+        geo_out.append(";".join(_uniq_keep_order(glist)))
+
+    out["persons"] = persons_out
+    out["geo"] = geo_out
+    return out
 
 
 def parse_args() -> argparse.Namespace:
@@ -99,6 +329,82 @@ def _safe_col_series(df: pd.DataFrame, col: str) -> pd.Series:
     if col in df.columns:
         return df[col]
     return pd.Series([""] * len(df), index=df.index)
+
+
+def ensure_id_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Гарантирует колонку id для gold-контракта.
+
+    Приоритет:
+    1) если есть 'id' и он заполнен -> оставляем
+    2) если есть 'uid' (telegram) -> используем uid как id
+    3) иначе если есть 'link' -> id = md5(link)
+    4) иначе -> id = md5(source|title|published_at)
+    """
+    out = df.copy()
+
+    # гарантируем базовые колонки
+    if "id" not in out.columns:
+        out["id"] = ""
+
+    id_s = out["id"].fillna("").astype(str).str.strip()
+    if (id_s != "").all():
+        return out
+
+    uid_s = (
+        out["uid"].fillna("").astype(str).str.strip()
+        if "uid" in out.columns
+        else pd.Series([""] * len(out), index=out.index)
+    )
+    link_s = (
+        out["link"].fillna("").astype(str).str.strip()
+        if "link" in out.columns
+        else pd.Series([""] * len(out), index=out.index)
+    )
+    src_s = (
+        out["source"].fillna("").astype(str).str.strip()
+        if "source" in out.columns
+        else pd.Series([""] * len(out), index=out.index)
+    )
+    ttl_s = (
+        out["title"].fillna("").astype(str).str.strip()
+        if "title" in out.columns
+        else pd.Series([""] * len(out), index=out.index)
+    )
+    pub_s = (
+        out["published_at"].astype(str)
+        if "published_at" in out.columns
+        else pd.Series([""] * len(out), index=out.index)
+    )
+
+    def md5_hex(s: str) -> str:
+        return hashlib.md5(s.encode("utf-8")).hexdigest()
+
+    # где id пустой — заполняем
+    mask = id_s == ""
+
+    # 1) uid -> id
+    use_uid = mask & (uid_s != "")
+    if use_uid.any():
+        out.loc[use_uid, "id"] = uid_s[use_uid]
+
+    # обновим маску после uid
+    id_s2 = out["id"].fillna("").astype(str).str.strip()
+    mask2 = id_s2 == ""
+
+    # 2) link -> md5(link)
+    use_link = mask2 & (link_s != "")
+    if use_link.any():
+        out.loc[use_link, "id"] = link_s[use_link].map(md5_hex)
+
+    # 3) fallback -> md5(source|title|published_at)
+    id_s3 = out["id"].fillna("").astype(str).str.strip()
+    mask3 = id_s3 == ""
+    if mask3.any():
+        key = (src_s + "|" + ttl_s + "|" + pub_s).fillna("").astype(str)
+        out.loc[mask3, "id"] = key[mask3].map(md5_hex)
+
+    return out
 
 
 def dedup_batch_silver(df: pd.DataFrame) -> pd.DataFrame:
@@ -198,6 +504,9 @@ def main() -> None:
     # 1) нормализуем время
     df_silver = normalize_published_at(df_silver)
 
+    # 1.1) гарантируем id (важно для Telegram, где есть uid вместо id)
+    df_silver = ensure_id_column(df_silver)
+
     # 2) dedup внутри батча ДО обогащения
     df_silver = dedup_batch_silver(df_silver)
 
@@ -221,8 +530,16 @@ def main() -> None:
             df_gold["summary"] = pd.Series(dtype="string")
         if "keywords" not in df_gold.columns:
             df_gold["keywords"] = pd.Series(dtype="object")
+        if "persons" not in df_gold.columns:
+            df_gold["persons"] = pd.Series(dtype="string")
+        if "geo" not in df_gold.columns:
+            df_gold["geo"] = pd.Series(dtype="string")
     else:
         df_gold = enrich_articles_with_summary_and_keywords(df_silver)
+        df_gold = add_persons_geo_columns(df_gold)
+
+    # 4.1) гарантируем id в gold перед валидацией/загрузкой
+    df_gold = ensure_id_column(df_gold)
 
     print(f"gold:  {output_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)

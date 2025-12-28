@@ -81,3 +81,7 @@ reports/daily_report_*.md
 # temp/debug artifacts
 pythonpath/
 temp_results_*_posts_*.json
+
+# Robust telegram scrape outputs (local artifacts)
+*_robust_*_posts_*.json
+*_robust_*_posts_*.txt

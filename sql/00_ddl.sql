@@ -10,11 +10,28 @@ CREATE TABLE IF NOT EXISTS media_intel.articles
     `raw_text` String,
     `clean_text` String,
     `nlp_text` String,
+
     `summary` String,
     `keywords` String,
+
     `text_length_chars` Int64,
     `num_sentences` Int64,
     `num_keywords` Int64,
+
+    -- batch identity (preferred for grouping)
+    `batch_id` String DEFAULT '',
+
+    -- NER entities
+    `entities_persons` String DEFAULT '',
+    `entities_orgs` String DEFAULT '',
+    `entities_geo` String DEFAULT '',
+    `num_persons` UInt16 DEFAULT 0,
+    `num_orgs` UInt16 DEFAULT 0,
+    `num_geo` UInt16 DEFAULT 0,
+
+    -- digest/noise flag (for analytics filtering)
+    `is_digest` UInt8 DEFAULT 0,
+
     `ingest_object_name` String DEFAULT ''
 )
 ENGINE = MergeTree

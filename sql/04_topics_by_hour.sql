@@ -20,6 +20,7 @@ FROM
       )
     ) AS kw
   FROM articles_dedup
+  WHERE is_digest = 0
 )
 GROUP BY hour, kw
 ORDER BY hour DESC, cnt DESC

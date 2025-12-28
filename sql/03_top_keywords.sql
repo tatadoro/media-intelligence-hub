@@ -1,6 +1,6 @@
 USE media_intel;
 
--- 1) TOP keywords по всем дедуп-данным
+-- 1) TOP keywords по всем дедуп-данным (без дайджестов)
 WITH
   ['стать известно','стать','известно','назвать','рассказать','объяснить','раскрыть','новый'] AS stop_kw
 SELECT
@@ -18,18 +18,19 @@ FROM
            )
        ) AS kw
   FROM articles_dedup
+  WHERE is_digest = 0
 )
 GROUP BY kw
 ORDER BY cnt DESC
 LIMIT 30
 FORMAT Pretty;
 
--- 2) TOP keywords по последнему загруженному batch (автоматически из load_log)
+-- 2) TOP keywords по последнему batch_id
 WITH
-  (SELECT argMax(object_name, loaded_at) FROM load_log WHERE layer = 'gold') AS last_batch,
+  (SELECT max(batch_id) FROM articles WHERE batch_id != '') AS last_batch_id,
   ['стать известно','стать','известно','назвать','рассказать','объяснить','раскрыть','новый'] AS stop_kw
 SELECT
-  last_batch AS ingest_object_name,
+  last_batch_id AS batch_id,
   kw,
   count() AS cnt
 FROM
@@ -44,7 +45,8 @@ FROM
            )
        ) AS kw
   FROM articles_dedup
-  WHERE ingest_object_name = last_batch
+  WHERE batch_id = last_batch_id
+    AND is_digest = 0
 )
 GROUP BY kw
 ORDER BY cnt DESC
