@@ -9,28 +9,37 @@ services:
     volumes:
       - superset_pgdata:/var/lib/postgresql/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SUPERSET_PG_USER:-superset} -d ${SUPERSET_PG_DB:-superset}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
 
   superset-redis:
     image: redis:7
     container_name: superset-redis
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
 
-  superset:
+  # One-off init: миграции/админ/инициализация и выход (Exited 0 — это нормально)
+  superset-init:
     build:
       context: .
       dockerfile: docker/superset/Dockerfile
     image: media_intel_hub-superset
-    container_name: superset
+    container_name: superset-init
     depends_on:
-      - superset-postgres
-      - superset-redis
-
-    # берём секреты/логины из .env в корне проекта
+      superset-postgres:
+        condition: service_healthy
+      superset-redis:
+        condition: service_healthy
     env_file:
       - .env
-
     environment:
-      # ВАЖНО: фиксируем конфиг, чтобы Superset не падал в SQLite по умолчанию
       SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
 
       SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-change-me-please}
@@ -46,14 +55,43 @@ services:
       REDIS_HOST: ${REDIS_HOST:-superset-redis}
       REDIS_PORT: ${REDIS_PORT:-6379}
 
-      # Чтобы убрать warning про in-memory rate limiter
+      RATELIMIT_STORAGE_URI: redis://superset-redis:6379/1
+    volumes:
+      - superset_home:/app/superset_home
+    command: ["/app/superset-init.sh"]
+    restart: "no"
+
+  # Webserver: живой сервис, без init-command
+  superset:
+    image: media_intel_hub-superset
+    container_name: superset
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+      superset-postgres:
+        condition: service_healthy
+      superset-redis:
+        condition: service_healthy
+
+    env_file:
+      - .env
+
+    environment:
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-change-me-please}
+
+      SQLALCHEMY_DATABASE_URI: >-
+        postgresql+psycopg2://${SUPERSET_PG_USER:-superset}:${SUPERSET_PG_PASSWORD:-superset}@superset-postgres:5432/${SUPERSET_PG_DB:-superset}
+
+      REDIS_HOST: ${REDIS_HOST:-superset-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+
       RATELIMIT_STORAGE_URI: redis://superset-redis:6379/1
 
     volumes:
-      # чтобы /app/superset_home не был "одноразовым"
       - superset_home:/app/superset_home
 
-    command: ["/app/superset-init.sh"]
     ports:
       - "${SUPERSET_PORT:-18088}:8088"
     restart: unless-stopped
@@ -67,4 +105,6 @@ services:
 
 volumes:
   superset_pgdata:
+    name: superset_pgdata
   superset_home:
+    name: superset_home
