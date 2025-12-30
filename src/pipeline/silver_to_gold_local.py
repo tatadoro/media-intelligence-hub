@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from pathlib import Path
 import argparse
+import hashlib
 import os
 import re
 from collections import Counter, defaultdict
-from typing import Tuple, List, Dict, DefaultDict
+from functools import lru_cache
+from pathlib import Path
+from typing import DefaultDict, Dict, List, Tuple
 
 import pandas as pd
-import hashlib
+
 from src.processing.summarization import enrich_articles_with_summary_and_keywords
 
 CH_TZ = "Europe/Moscow"
@@ -20,7 +22,7 @@ MIN_CLEAN_TEXT_CHARS = 400
 
 # --- NER (persons/geo) ---
 try:
-    from natasha import Segmenter, NewsEmbedding, NewsNERTagger, Doc, MorphVocab
+    from natasha import Doc, MorphVocab, NewsEmbedding, NewsNERTagger, Segmenter
 
     _NER_AVAILABLE = True
     _segmenter = Segmenter()
@@ -30,7 +32,7 @@ try:
 except Exception:
     _NER_AVAILABLE = False
 
-# --- Morphology for canonicalization ---
+# --- Morphology for canonicalization + verbs ---
 try:
     import pymorphy2
 
@@ -40,9 +42,14 @@ except Exception:
     _MORPH_AVAILABLE = False
     _morph_analyzer = None  # type: ignore[assignment]
 
-
 _RE_BRACKETS = re.compile(r"\s*\([^)]*\)")
 _RE_SPACES = re.compile(r"\s+")
+
+# --- Actions extraction (persons -> verbs) ---
+_SENT_SPLIT = re.compile(r"(?<=[.!?…])\s+")
+_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё-]+")
+
+STOP_VERBS_DEFAULT = {"быть", "стать", "мочь", "иметь", "сказать", "говорить"}
 
 # Синонимы/унификация для гео (минимально, расширишь по мере надобности)
 GEO_SYNONYMS: Dict[str, str] = {
@@ -245,6 +252,166 @@ def add_persons_geo_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _split_sentences(text: str) -> List[str]:
+    t = (text or "").strip()
+    if not t:
+        return []
+    t = re.sub(r"\s+", " ", t)
+    return [s.strip() for s in _SENT_SPLIT.split(t) if s.strip()]
+
+
+@lru_cache(maxsize=50_000)
+def _parse_tok(tok: str):
+    if not _MORPH_AVAILABLE or _morph_analyzer is None:
+        return None
+    return _morph_analyzer.parse(tok)[0]
+
+
+def _extract_verbs_from_tokens(tokens: List[str], stop_verbs: set[str]) -> List[str]:
+    if not _MORPH_AVAILABLE or _morph_analyzer is None:
+        return []
+
+    out: List[str] = []
+    for tok in tokens:
+        p = _parse_tok(tok)
+        if p is None:
+            continue
+        pos = p.tag.POS
+        if pos in {"VERB", "INFN"}:
+            lemma = p.normal_form
+            if lemma and lemma not in stop_verbs:
+                out.append(lemma)
+    return out
+
+
+def _compile_person_patterns(persons: List[str]) -> Dict[str, List[re.Pattern[str]]]:
+    """
+    Компилирует паттерны для матчинга персон в тексте:
+    - полное имя
+    - фамилия (если есть >= 2 токена)
+    Матчинг по границам слова: (?<!\\w) ... (?!\\w) вместо простого 'in'.
+    """
+    out: Dict[str, List[re.Pattern[str]]] = {}
+    for p in persons:
+        p0 = (p or "").strip().lower().replace("ё", "е")
+        if not p0:
+            continue
+
+        parts = p0.split()
+        variants = [p0]
+        if len(parts) >= 2:
+            variants.append(parts[-1])
+
+        pats: List[re.Pattern[str]] = []
+        # uniq без изменения порядка
+        for v in dict.fromkeys(variants):
+            v = (v or "").strip()
+            if not v:
+                continue
+            pats.append(re.compile(rf"(?<!\w){re.escape(v)}(?!\w)"))
+
+        if pats:
+            out[p0] = pats
+    return out
+
+
+def _extract_actions_for_persons(text: str, persons: List[str]) -> Dict[str, List[str]]:
+    """
+    person -> list of verb lemmas extracted from sentences where the person is mentioned.
+    """
+    t = (text or "").strip()
+    if not t or not persons:
+        return {}
+
+    persons_norm: List[str] = []
+    for p in persons:
+        p0 = (p or "").strip().lower().replace("ё", "е")
+        if p0:
+            persons_norm.append(p0)
+
+    if not persons_norm:
+        return {}
+
+    person_patterns = _compile_person_patterns(persons_norm)
+    if not person_patterns:
+        return {}
+
+    res: Dict[str, List[str]] = {p: [] for p in person_patterns.keys()}
+    stop_verbs = set(STOP_VERBS_DEFAULT)
+
+    for sent in _split_sentences(t):
+        s_low = sent.lower().replace("ё", "е")
+
+        matched: List[str] = [p for p, pats in person_patterns.items() if any(pat.search(s_low) for pat in pats)]
+        if not matched:
+            continue
+
+        tokens = [m.group(0).lower().replace("ё", "е") for m in _TOKEN_RE.finditer(sent)]
+        verbs = _extract_verbs_from_tokens(tokens, stop_verbs)
+        if not verbs:
+            continue
+
+        for p in matched:
+            res[p].extend(verbs)
+
+    return {p: v for p, v in res.items() if v}
+
+
+def add_persons_actions_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Добавляет:
+    - persons_actions: строка формата "person:verb1,verb2|person2:verb1,..."
+    - actions_verbs: общий top глаголов по статье (через ;)
+
+    Безопасно: если нет pymorphy2 или persons пуст — колонки будут пустыми строками.
+    """
+    out = df.copy()
+
+    if out.empty:
+        out["persons_actions"] = pd.Series(dtype="string")
+        out["actions_verbs"] = pd.Series(dtype="string")
+        return out
+
+    if "nlp_text" in out.columns:
+        text_s = out["nlp_text"]
+    elif "clean_text" in out.columns:
+        text_s = out["clean_text"]
+    else:
+        text_s = out.get("raw_text", pd.Series([""] * len(out), index=out.index))
+
+    text_s = text_s.fillna("").astype(str)
+    persons_s = out.get("persons", pd.Series([""] * len(out), index=out.index)).fillna("").astype(str)
+
+    persons_actions_out: List[str] = []
+    actions_verbs_out: List[str] = []
+
+    for t, persons_str in zip(text_s.tolist(), persons_s.tolist()):
+        persons = [p.strip() for p in persons_str.split(";") if p.strip()]
+        m = _extract_actions_for_persons(t, persons)
+
+        # persons_actions: стабильный текстовый формат без JSON-зависимостей
+        parts: List[str] = []
+        flat: List[str] = []
+        for person in sorted(m.keys()):
+            cnt = Counter(m[person])
+            top = [v for v, _ in cnt.most_common(10)]
+            if top:
+                parts.append(f"{person}:{','.join(top)}")
+                flat.extend(m[person])
+
+        persons_actions_out.append("|".join(parts) if parts else "")
+
+        if flat:
+            top_all = [v for v, _ in Counter(flat).most_common(15)]
+            actions_verbs_out.append(";".join(top_all))
+        else:
+            actions_verbs_out.append("")
+
+    out["persons_actions"] = persons_actions_out
+    out["actions_verbs"] = actions_verbs_out
+    return out
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Преобразование silver -> gold: summary + keywords (TF-IDF) и выгрузка в MinIO (опционально)."
@@ -267,6 +434,11 @@ def parse_args() -> argparse.Namespace:
         "--upload-minio",
         action="store_true",
         help="Если указан, после сохранения gold-файла загрузить его в MinIO (bucket media-intel, prefix gold/).",
+    )
+    parser.add_argument(
+        "--with-actions",
+        action="store_true",
+        help="Если указан, извлекаем глаголы-действия для персон (persons_actions/actions_verbs).",
     )
     return parser.parse_args()
 
@@ -534,9 +706,16 @@ def main() -> None:
             df_gold["persons"] = pd.Series(dtype="string")
         if "geo" not in df_gold.columns:
             df_gold["geo"] = pd.Series(dtype="string")
+        if args.with_actions:
+            if "persons_actions" not in df_gold.columns:
+                df_gold["persons_actions"] = pd.Series(dtype="string")
+            if "actions_verbs" not in df_gold.columns:
+                df_gold["actions_verbs"] = pd.Series(dtype="string")
     else:
         df_gold = enrich_articles_with_summary_and_keywords(df_silver)
         df_gold = add_persons_geo_columns(df_gold)
+        if args.with_actions:
+            df_gold = add_persons_actions_columns(df_gold)
 
     # 4.1) гарантируем id в gold перед валидацией/загрузкой
     df_gold = ensure_id_column(df_gold)

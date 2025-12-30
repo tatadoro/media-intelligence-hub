@@ -266,6 +266,7 @@ ch-show-schema:
 	@$(call banner,"ClickHouse schema")
 	@bash scripts/ch_run_sql.sh sql/00_ddl.sql
 	@bash scripts/ch_run_sql.sh sql/00_views.sql
+	@bash scripts/ch_run_sql.sh sql/09_actions_views.sql
 
 # Пересоздать DDL (часто используют как “очистить и создать заново”)
 clean-sql:
@@ -276,6 +277,7 @@ clean-sql:
 views:
 	@$(call banner,"Views")
 	@bash scripts/ch_run_sql.sh sql/00_views.sql
+	@bash scripts/ch_run_sql.sh sql/09_actions_views.sql
 
 # Healthchecks SQL
 health:

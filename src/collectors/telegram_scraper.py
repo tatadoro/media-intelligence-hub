@@ -49,7 +49,7 @@ class RobustTelegramScraper:
         target_posts: int = 300,
         headless: bool = False,
         out_dir: str = "data/raw",
-        debug_dir: str = ".",
+        debug_dir: str = "data/debug/telegram",
         mih_only: bool = False,
         mih_schema: str = "bundle",
         batch_id: str = None,
@@ -520,9 +520,13 @@ class RobustTelegramScraper:
     # -------------------- Save & stats --------------------
 
     def save_intermediate_results(self):
+        if self.mih_only:
+            return
+
         try:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = f"temp_results_{len(self.posts)}_posts_{ts}.json"
+            os.makedirs(self.debug_dir, exist_ok=True)
+            path = os.path.join(self.debug_dir, f"temp_results_{len(self.posts)}_posts_{ts}.json")
             payload = {
                 "intermediate_save": True,
                 "timestamp": datetime.now().isoformat(),
@@ -753,8 +757,8 @@ def parse_args():
     p.add_argument(
         "--debug-dir",
         type=str,
-        default=os.getenv("TG_DEBUG_DIR", "."),
-        help="Куда сохранять debug JSON/TXT (по умолчанию: текущая директория)",
+        default=os.getenv("TG_DEBUG_DIR", "data/debug/telegram"),
+        help="Куда сохранять debug JSON/TXT (по умолчанию: data/debug/telegram)",
     )
 
     p.add_argument("--mih-only", action="store_true", help="Сохранять только MIH raw (без debug JSON/TXT)")

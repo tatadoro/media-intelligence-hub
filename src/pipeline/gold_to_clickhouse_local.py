@@ -23,7 +23,6 @@ def _docker_ch_cmd(args: argparse.Namespace) -> list[str]:
 
 
 def _docker_ch_cmd_stdin(args: argparse.Namespace) -> list[str]:
-    # тот же cmd, но чтение данных идёт через stdin -> clickhouse-client
     return _docker_ch_cmd(args)
 
 
@@ -43,13 +42,6 @@ def ch_query(args: argparse.Namespace, query: str) -> str:
             f"stdout:\n{e.stdout}\n"
             f"stderr:\n{e.stderr}\n"
         ) from e
-
-
-def ch_int(args: argparse.Namespace, query: str) -> int:
-    out = ch_query(args, query)
-    if not out:
-        return 0
-    return int(out.strip())
 
 
 def ch_table_columns(args: argparse.Namespace) -> list[str]:
@@ -113,6 +105,23 @@ def validate_ingest_object_name(input_path: Path, object_name: str) -> None:
             )
 
 
+def validate_batch_id(input_path: Path, batch_id: str) -> None:
+    if not batch_id:
+        return
+
+    pf = pq.ParquetFile(str(input_path))
+    names = set(pf.schema_arrow.names)
+    if "batch_id" not in names:
+        raise ValueError("В parquet нет колонки batch_id")
+
+    for rg in range(pf.num_row_groups):
+        col = pf.read_row_group(rg, columns=["batch_id"]).column(0)
+        vals = col.to_pylist()
+        if any(v != batch_id for v in vals):
+            bad = next((v for v in vals if v != batch_id), None)
+            raise ValueError(f"batch_id mismatch in row_group={rg}: expected={batch_id}, got={bad}")
+
+
 def _write_parquet_with_extra_string_col(
     input_path: Path,
     col_name: str,
@@ -120,6 +129,7 @@ def _write_parquet_with_extra_string_col(
 ) -> Path:
     pf = pq.ParquetFile(str(input_path))
     table = pf.read()
+
     if col_name in table.column_names:
         return input_path
 
@@ -133,6 +143,33 @@ def _write_parquet_with_extra_string_col(
     return out_path
 
 
+def _write_parquet_force_string_col(
+    input_path: Path,
+    col_name: str,
+    col_value: str,
+) -> Path:
+    """
+    Принудительно ставит значение строковой колонки (создаёт или заменяет),
+    пишет во временный parquet и возвращает его путь.
+    """
+    pf = pq.ParquetFile(str(input_path))
+    table = pf.read()
+
+    arr = pa.array([col_value] * table.num_rows, type=pa.string())
+
+    if col_name in table.column_names:
+        idx = table.schema.get_field_index(col_name)
+        table2 = table.set_column(idx, col_name, arr)
+    else:
+        table2 = table.append_column(col_name, arr)
+
+    tmpdir = Path(tempfile.gettempdir())
+    out_name = f"{input_path.stem}__forced_{col_name}__{_sanitize_for_filename(col_value)}.parquet"
+    out_path = tmpdir / out_name
+    pq.write_table(table2, out_path)
+    return out_path
+
+
 def ensure_ingest_object_name_in_parquet(input_path: Path, object_name: str) -> Tuple[Path, bool]:
     pf = pq.ParquetFile(str(input_path))
     if "ingest_object_name" in set(pf.schema_arrow.names):
@@ -141,11 +178,36 @@ def ensure_ingest_object_name_in_parquet(input_path: Path, object_name: str) -> 
     return out, True
 
 
-def ensure_batch_id_in_parquet(input_path: Path, batch_id: str) -> Tuple[Path, bool]:
-    pf = pq.ParquetFile(str(input_path))
-    if "batch_id" in set(pf.schema_arrow.names):
+def ensure_batch_id_equals_in_parquet(input_path: Path, batch_id: str) -> Tuple[Path, bool]:
+    """
+    Если batch_id передан:
+    - если колонки нет -> добавляем
+    - если колонка есть и значения уже равны -> ничего не делаем
+    - если колонка есть и значения отличаются -> создаём временный parquet с принудительным batch_id
+    """
+    if not batch_id:
         return input_path, False
-    out = _write_parquet_with_extra_string_col(input_path, "batch_id", batch_id)
+
+    pf = pq.ParquetFile(str(input_path))
+    names = set(pf.schema_arrow.names)
+
+    if "batch_id" not in names:
+        out = _write_parquet_with_extra_string_col(input_path, "batch_id", batch_id)
+        return out, True
+
+    # проверим быстро по row groups, не читая весь table без необходимости
+    all_ok = True
+    for rg in range(pf.num_row_groups):
+        col = pf.read_row_group(rg, columns=["batch_id"]).column(0)
+        vals = col.to_pylist()
+        if any(v != batch_id for v in vals):
+            all_ok = False
+            break
+
+    if all_ok:
+        return input_path, False
+
+    out = _write_parquet_force_string_col(input_path, "batch_id", batch_id)
     return out, True
 
 
@@ -163,12 +225,11 @@ def parse_args() -> argparse.Namespace:
         description="Загрузка gold Parquet в ClickHouse (локально) с batch_id + авто-колонками."
     )
     p.add_argument("--input", required=True, help="Путь к gold parquet")
-    p.add_argument("--batch-id", default="", help="batch_id (если в parquet нет batch_id — добавим)")
+    p.add_argument("--batch-id", default="", help="batch_id (будет принудительно проставлен в parquet при загрузке)")
     p.add_argument("--database", default=os.getenv("CH_DATABASE", "media_intel"))
     p.add_argument("--table", default="articles")
     p.add_argument("--container", default="clickhouse")
     p.add_argument("--host", default=os.getenv("CH_HOST_DOCKER", "clickhouse"))
-    # В .env часто лежит HTTP-порт 8123; для clickhouse-client нужен нативный 9000.
     p.add_argument("--port", type=int, default=int(os.getenv("CH_PORT_DOCKER", "8123")))
     p.add_argument("--user", default=os.getenv("CH_USER", "admin"))
     p.add_argument("--password", default=os.getenv("CH_PASSWORD", "admin12345"))
@@ -178,15 +239,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # --- ВАЖНО: clickhouse-client использует нативный протокол (обычно 9000), а 8123 — это HTTP.
-    # Если мы выполняем clickhouse-client внутри того же контейнера (docker exec),
-    # корректнее подключаться к localhost и нативному порту.
+    # clickhouse-client внутри контейнера: лучше localhost + native port
     if args.host == args.container:
         args.host = "localhost"
 
-    if args.port == 8123:
+    if args.port in {8123, 18123}:
         native_port = int(os.getenv("CH_PORT_NATIVE_DOCKER", os.getenv("CH_NATIVE_PORT_DOCKER", "9000")))
-        print(f"[WARN] Port 8123 is HTTP; using native port {native_port} for clickhouse-client.")
+        print(f"[WARN] Port {args.port} is HTTP/external; using native port {native_port} for clickhouse-client.")
         args.port = native_port
 
     input_path = Path(args.input).expanduser().resolve()
@@ -196,23 +255,22 @@ def main() -> None:
     object_name = input_path.name
     temp_paths: list[Path] = []
 
-    # 1) Гарантируем ingest_object_name
-    load_path, temp1 = ensure_ingest_object_name_in_parquet(input_path, object_name)
-    if temp1:
+    # 1) ingest_object_name
+    load_path, t1 = ensure_ingest_object_name_in_parquet(input_path, object_name)
+    if t1:
         temp_paths.append(load_path)
 
-    # 2) Гарантируем batch_id (если передан)
-    if args.batch_id:
-        load_path2, temp2 = ensure_batch_id_in_parquet(load_path, args.batch_id)
-        if temp2:
-            temp_paths.append(load_path2)
-    else:
-        load_path2 = load_path
+    # 2) batch_id: принудительно равен args.batch_id (если передан)
+    load_path2, t2 = ensure_batch_id_equals_in_parquet(load_path, args.batch_id)
+    if t2:
+        temp_paths.append(load_path2)
 
-    # 3) Проверка ingest_object_name
+    # 3) проверки
     validate_ingest_object_name(load_path2, object_name)
+    if args.batch_id:
+        validate_batch_id(load_path2, args.batch_id)
 
-    # 4) INSERT parquet (через stdin) — берём пересечение колонок (parquet ∩ table)
+    # 4) INSERT (parquet ∩ table)
     insert_cols = build_insert_columns(args, load_path2)
     cols_sql = ", ".join(insert_cols)
     insert_q = f"INSERT INTO {args.database}.{args.table} ({cols_sql}) FORMAT Parquet"
@@ -229,7 +287,7 @@ def main() -> None:
     with load_path2.open("rb") as f:
         subprocess.run(cmd, check=True, stdin=f)
 
-    # 5) Чистим временные файлы
+    # 5) cleanup
     if temp_paths:
         _cleanup_temp(temp_paths)
         for p in temp_paths:
