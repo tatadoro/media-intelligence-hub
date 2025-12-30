@@ -1,254 +1,180 @@
 # Media Intelligence Hub
 
-Учебный пет-проект на стыке Data Analytics и Data Science.
+Учебный пет‑проект на стыке **Data Engineering / Data Analytics / NLP**: собираем публикации из медиа‑источников, приводим тексты к единому виду, извлекаем ключевую информацию и строим витрины в ClickHouse для отчётов и BI.
 
-Цель: построить автоматизированный пайплайн мониторинга медиа:
-- сбор материалов из разных источников (RSS / API / парсеры);
-- хранение данных в Data Lake (S3/MinIO) и локально;
-- очистка текста и извлечение ключевой информации;
-- семантическое обогащение (summary, keywords, фичи);
-- загрузка витрин в ClickHouse;
-- аналитика/дашборды и отчёты (Markdown сейчас, BI — в процессе).
+**Статус:** MVP работает: `raw → silver → gold → ClickHouse → (SQL checks + Markdown‑отчёт + Superset)`
 
-Статус: **MVP работает** (raw → silver → gold → ClickHouse + SQL-проверки + Airflow DAG + Markdown-отчёт + Superset).
+## Что делает проект
 
-## Архитектура пайплайна (MVP)
+- **Сбор данных** из источников (RSS / API / парсеры; в MVP — минимум один источник).
+- **Data Lake** в зонах `raw/silver/gold` (локально и/или S3‑совместимо: MinIO).
+- **Обработка текстов**: очистка и нормализация, `summary`, `keywords`, извлечение **персон** и **географии** (NER), а также (опционально) **глаголов‑действий** по персонам.
+- **Загрузка витрин** в ClickHouse (батчами, с `batch_id` и дедупликацией).
+- **Контроль качества**: базовые SQL‑проверки и «контракты» данных.
+- **Отчётность**:
+  - Markdown‑отчёт (генерация из ClickHouse по окну времени),
+  - BI‑дашборды в Apache Superset поверх витрин/представлений.
 
-- **collectors**: сбор сырья из источников (RSS, Telegram)
-- **raw**: сырые выгрузки (JSON)
-- **silver**: очищенный текст (нормализация/чистка/контракт)
-- **gold**: обогащение (summary + keywords + текстовые фичи), контракт (parquet)
-- **ClickHouse**:
-  - `media_intel.articles` — основная витрина (загрузка батчами)
-  - `media_intel.articles_dedup` — слой/представление для аналитики без дублей (используем в BI)
-  - `media_intel.load_log` — журнал загрузок (защита от повторных заливок)
-- **reports**: SQL-аналитика + Markdown-дайджест
+---
 
-## Источники данных
+## Архитектура (MVP)
 
-### RSS
-Сбор из RSS-лент в `raw`, опционально с шагом enrich (подтянуть body, если нужно).
-
-### Telegram (t.me/s/<channel>)
-Коллектор: `src/collectors/telegram_scraper.py`
-
-Поддерживает:
-- список каналов (`--channels-file` или `--channels`)
-- сбор N постов на канал (`--target`)
-- `--combined` (дополнительно сохраняет общий raw по всем каналам)
-- сохранение в формате raw, совместимом с дальнейшим шагом `raw → silver`
-
-Файл со списком каналов:
-- `config/telegram_channels.txt` (по одному каналу на строку, можно с `#` комментариями)
-
-## Автоматизация через Makefile
-
-Ключевые команды:
-- `make tg-raw` — Telegram → raw
-- `make tg-silver` — raw → silver (берёт самый свежий Telegram raw)
-- `make tg-gold` — silver → gold
-- `make tg-load` — gold → ClickHouse
-- `make tg-etl` — полный цикл Telegram: raw → silver → gold → ClickHouse
-
-Примечание: для ClickHouse-части убедись, что переменные `CH_*` подхвачены из `.env`:
-```bash
-set -a; source .env; set +a
+```mermaid
+flowchart LR
+  A[Источники: RSS/API/парсеры] --> B[RAW: JSON/Parquet<br/>S3/MinIO или локально]
+  B --> C[SILVER: cleaned/enriched<br/>нормализация текста + базовые поля]
+  C --> D[GOLD: features<br/>summary + keywords + агрегаты]
+  D --> E[ClickHouse: витрины]
+  E --> F[SQL checks / views]
+  E --> G[Markdown report]
+  E --> H[Superset dashboards]
 ```
 
-## Airflow orchestration
+Ключевые принципы:
+- **Слои данных** разделены по ответственности: *raw* (как пришло), *silver* (чисто и стабильно), *gold* (готово для аналитики).
+- **Повторяемость**: загрузки в ClickHouse сопровождаются `batch_id`, результаты можно воспроизводить и отлаживать.
+- **Прозрачность**: каждое преобразование — отдельный шаг пайплайна, проверяемый локально.
 
-Основной DAG: `mih_etl_latest_strict` (ручной запуск).
+---
 
-Что делает:
-1) выбирает **самый свежий** silver-файл по паттерну `data/silver/articles_*.json`
-2) `precheck_silver`: быстрый sanity-check, чтобы не подхватить legacy-файл
-3) `validate_silver`: валидация по контракту silver
-4) `silver_to_gold`: преобразование silver → gold parquet
-5) `compute_gold_path`: вычисляет путь до gold-файла
-6) `validate_gold`: валидация по контракту gold
-7) `quality_gate`: quality gate (STRICT=1)
-8) `load_to_clickhouse`: загрузка gold → ClickHouse (с защитой от дублей)
-9) `sql_reports`: прогон SQL-отчётов (`make report`)
-10) `compute_report_window`: строит окно отчёта по **реальным данным в ClickHouse**: `[max(published_at) - last_hours, max(published_at)]`
-11) `md_report`: генерирует Markdown-отчёт
+## Слои данных
 
-Запуск DAG:
-```bash
-docker exec -it airflow-scheduler airflow dags trigger mih_etl_latest_strict
-```
+### RAW (как пришло)
+Назначение: сохранить максимум первичной информации, чтобы можно было переобработать данные, не ходя заново в источник.
 
-Проверка статусов по последнему run_id (через папку логов):
-```bash
-RUN_ID=$(ls -1t airflow/logs/dag_id=mih_etl_latest_strict | head -n 1 | sed 's/^run_id=//')
-docker exec -it airflow-scheduler airflow tasks states-for-dag-run mih_etl_latest_strict "$RUN_ID"
-```
+Типичные поля (минимум): `source`, `published_at`, `link`, `title`, `raw_text` (+ дополнительные поля по источнику).
 
-### Доступ Airflow к Docker (если используешь `docker exec` внутри задач)
+### SILVER (очищенный текст)
+Назначение: единый формат для последующей NLP‑обработки и витрин.
 
-Чтобы шаги, которые делают `docker exec ...` (например, вызов `clickhouse-client`), работали **изнутри Airflow-контейнера**, в `docker-compose.airflow.yml` для `airflow-scheduler` (и при необходимости `airflow-webserver`) должен быть примонтирован Docker socket:
+Типичные преобразования:
+- удаление HTML/скриптов/мусора;
+- нормализация пробелов и переносов строк;
+- приведение даты/времени к согласованному формату и TZ;
+- дедупликация *внутри батча* по стабильным признакам (например, `link`).
 
-```yaml
-volumes:
-  - /var/run/docker.sock:/var/run/docker.sock
-```
+### GOLD (фичи и витрины для аналитики)
+Назначение: всё, что нужно для отчётов/BI без дополнительных вычислений на лету.
 
-Также проект монтируется в контейнер, чтобы DAG мог вызывать `make` и скрипты проекта:
+Примеры фич (в MVP — часть из них):
+- `summary` — краткое саммари;
+- `keywords` — ключевые слова/фразы (TF‑IDF; хранение через разделитель, чтобы удобно было `ARRAY JOIN`);
+- `persons` — персоны из текста (NER, `;`‑разделитель);
+- `geo` — география/локации из текста (NER, `;`‑разделитель; есть минимальная унификация через словарь синонимов);
+- `persons_actions` — действия по персонам (опционально, включается флагом `--with-actions`): формат `person:verb1,verb2|person2:verb1,...`;
+- `actions_verbs` — общий top глаголов по статье (опционально, `;`‑разделитель);
+- текстовые признаки (длины, простые метрики качества и т.п.);
+- агрегаты по времени/источникам (если добавлены).
 
-```yaml
-volumes:
-  - ./:/opt/mih
-```
+---
 
-### Артефакты отчётов
+## Обработка текстов: что сделано и куда расширять
 
-- Runtime Markdown-отчёты: `reports/daily_report_*.md` (в `.gitignore`)
-- Пример отчёта для репозитория: `reports/examples/daily_report_sample.md` (коммитится)
+В проекте выделены отдельные стадии, чтобы было легко улучшать качество NLP без переписывания всего пайплайна:
 
-Обновить пример отчёта:
-```bash
-cp "$(ls -1t reports/daily_report_*.md | head -n 1)" reports/examples/daily_report_sample.md
-git add reports/examples/daily_report_sample.md
-git commit -m "docs: update report sample"
-git push
-```
+1) **Очистка и нормализация**  
+   Превращаем «грязный» HTML/описания RSS в чистый текст и устойчивые метаданные.
 
-## Конфигурация и переменные окружения
+2) **Суммаризация (summary)**  
+   В MVP — быстрый вариант (extractive/правила). Дальше можно расширять до LLM‑саммари/мультиязычности.
 
-Секреты не коммитятся. Локально создай файл `.env` (он должен быть в `.gitignore`).
-В репозитории хранится только шаблон `.env.example` (если добавишь).
+3) **Ключевые слова/фразы (keywords)**  
+   В MVP — TF‑IDF. Дальше логично добавить:
+   - ключевые фразы (n‑граммы, RAKE/YAKE),
+   - лемматизацию (если нужен русский),
+   - стоп‑словари под домен (новости/технологии/политика и т.д.).
 
-### MinIO / S3 (пример)
-```bash
-MINIO_ENDPOINT=http://localhost:9000
-MINIO_ACCESS_KEY=YOUR_MINIO_USER
-MINIO_SECRET_KEY=YOUR_MINIO_PASSWORD
-MINIO_BUCKET=media-intel
-MINIO_REGION=us-east-1
-MINIO_SECURE=false
-```
+4) **Дедупликация**  
+   Есть дедуп *внутри батча* на этапе silver/gold; в ClickHouse — отдельный слой/представление для аналитики.
 
-### ClickHouse (пример)
+5) **NER: персоны и география (persons / geo)**  
+   Извлекаем сущности из текста через **Natasha NER** (типы `PER` и `LOC`) и приводим к канонической форме (чистка + лемматизация; для гео есть минимальная унификация через `GEO_SYNONYMS`).  
+   Дополнительно, на уровне **батча**, делаем «склейку» однословных упоминаний по фамилии в полное имя (если в батче встречается вариант из ≥2 слов).
 
-Важно: SQL-раннер `scripts/ch_run_sql.sh` читает переменные `CH_*`.
+6) **Действия: глаголы рядом с персонами (persons_actions / actions_verbs)** *(опционально)*  
+   Если запустить `silver_to_gold_local.py` с флагом `--with-actions`, то для предложений, где встречается персона, извлекаем **леммы глаголов** (через `pymorphy2`, POS `VERB/INFN`) и собираем:
+   - `persons_actions` — глаголы по каждой персоне (компактный строковый формат),
+   - `actions_verbs` — общий top глаголов по статье.
 
-```bash
-CH_HOST=clickhouse
-CH_PORT=8123
-CH_USER=YOUR_CH_USER
-CH_PASSWORD=YOUR_CH_PASSWORD
-CH_DATABASE=media_intel
-```
+Примечание: если NLP‑зависимости не установлены, пайплайн не падает, а соответствующие поля остаются пустыми.
 
-Примечания:
-- внутри Docker-сети обычно `CH_HOST=clickhouse`, `CH_PORT=8123`
-- с хоста ClickHouse HTTP может быть проброшен на `http://localhost:18123`
+---
 
-Генератор Markdown-отчёта (`src.reporting.generate_report`) читает `CH_*` и `CLICKHOUSE_*` переменные (для совместимости).
+## ClickHouse: витрины и проверки
 
-## Контракты данных (silver/gold)
+ClickHouse — основной аналитический слой. Типичный набор сущностей (по текущему MVP):
 
-В репозитории зафиксированы контракты слоёв (JSON Schema):
-- `contracts/silver.schema.json` — формат **silver** (`*_clean.json`)
-- `contracts/gold.schema.json` — формат **gold** (`*_processed.parquet`)
+- `media_intel.articles` — основная таблица загрузки (gold‑данные по материалам).
+- `media_intel.load_log` — журнал загрузок (batch_id, метрики/статусы).
+- `media_intel.articles_dedup` — слой/представление для аналитики с устранением дублей.
 
-Скрипты валидации:
-```bash
-python scripts/validate_silver.py --input data/silver/<file>_clean.json
-python scripts/validate_gold.py --input data/gold/<file>_processed.parquet
-```
+SQL‑проверки (quality gates) подключаются как отдельные запросы/скрипты:
+- проверка доступности ClickHouse (`/ping`);
+- базовые проверки заполненности/валидности дат;
+- sanity‑checks по количеству строк за окно времени;
+- проверки дублей и корректности ключевых полей.
 
-## Идемпотентная загрузка в ClickHouse
+---
 
-Загрузка выполняется батчами. В таблице `articles` есть:
-- `ingest_object_name` — имя объекта/артефакта загрузки (используется для защиты от повторных заливок)
-- `batch_id` — идентификатор запуска/батча (часто UTC timestamp, прокидывается через `BATCH_ID`)
+## BI в Apache Superset
 
-Для аналитики без дублей используется `articles_dedup` (рекомендуется подключать именно её в Superset).
+Superset подключается к ClickHouse и использует витрины/представления как датасеты.
 
-## Запуск пайплайна (локально без Airflow)
+Примеры визуализаций, которые хорошо ложатся на текущую модель данных:
+- **Keyword trends**: динамика ключевых слов по времени (разбор `keywords` + `published_at`);
+- **Person trends**: динамика упоминаний персон (`persons`) по времени и источникам;
+- **Geo trends**: топ‑локации и динамика географии (`geo`) — как список/бар‑чарт (а при желании — карта, если нормализовать гео в отдельную справочную таблицу);
+- **Top sources**: распределение материалов по источникам;
+- **Articles table**: таблица материалов (title/link/source/published_at) для просмотра первички в BI;
+- *(опционально)* **Actions**: какие глаголы чаще всего встречаются рядом с персонами (`persons_actions`, `actions_verbs`).
 
-### 1) RSS → raw
-```bash
-python -m src.collectors.rss_collector
-```
+---
 
-### 2) raw → silver (очистка)
-```bash
-python -m src.pipeline.clean_raw_to_silver_local --input data/raw/<raw_file>.json
-```
+## Запуск локально (high level)
 
-### 3) silver → gold (summary + keywords)
-```bash
-python -m src.pipeline.silver_to_gold_local --input data/silver/<silver_file>.json
-```
+Проект предполагает запуск сервисов через Docker Compose (ClickHouse, MinIO, Airflow, Superset — отдельным compose‑файлом).
 
-### 4) gold → ClickHouse
-```bash
-python -m src.pipeline.gold_to_clickhouse_local --input data/gold/<gold_file>.parquet
-```
+Общий принцип:
+1) поднять инфраструктуру;
+2) проверить переменные окружения;
+3) прогнать ETL (локально или через Airflow DAG);
+4) убедиться, что данные появились в ClickHouse;
+5) открыть Superset и собрать/посмотреть дашборды;
+6) сгенерировать Markdown‑отчёт из ClickHouse.
 
-### Telegram ETL через Makefile
-```bash
-make tg-etl
-```
+> Подробные команды остаются в `Makefile` и скриптах репозитория (цель — один‑два «make …» для типового сценария).
 
-Перед первой загрузкой и SQL-проверками подготовь ClickHouse-объекты:
-```bash
-make init
-```
+---
 
-## SQL-отчёты и проверки (ClickHouse)
+## Переменные окружения
 
-SQL-файлы в `sql/` предназначены для контроля качества и аналитики поверх загруженных данных.
-
-Запуск набора отчётов:
-```bash
-make report
-```
-
-## Superset (дашборды)
-
-Для BI-аналитики подключаем ClickHouse и строим чарты/дашборды поверх:
-- `media_intel.articles_dedup` (рекомендуется для большинства графиков)
-- агрегатных датасетов из SQL Lab (saved datasets)
-
-## Безопасность и артефакты
-- `.env` и любые секреты **не коммитятся**
-- `data/` и локальные артефакты **не коммитятся**
-- runtime отчёты `reports/daily_report_*.md` **не коммитятся**
-- в `reports/` в git хранится только `reports/examples/`
-
-## Troubleshooting
-
-### ClickHouse не готов / таймаут
-```bash
-docker compose ps
-docker compose logs -f --tail=200 clickhouse
-curl -sSf http://localhost:18123/ping
-```
-
-### MinIO не готов / таймаут
-```bash
-docker compose logs -f --tail=200 minio
-curl -sSf http://localhost:9000/minio/health/ready
-```
-
-### `mc not found. Skip bucket creation.`
-Это не блокирует MVP: raw/silver/gold/ClickHouse работают локально.
-Если хочешь автосоздание бакета — установи MinIO Client:
-```bash
-brew install minio/stable/mc
-```
+Проект использует `.env` в корне репозитория.
 
 ### Переменные окружения не подхватываются
-Проверь, что `.env` лежит в корне репозитория:
+Проверь, что `.env` лежит в корне:
 ```bash
 ls -la .env
 ```
 
+---
+
+## Репозиторий: куда смотреть
+
+- `src/collectors/` — сбор данных из источников
+- `src/processing/` — очистка и NLP‑обогащение (silver/gold)
+- `src/pipeline/` — пайплайны и локальные прогонки слоёв
+- `src/reporting/` — генерация отчётов (Markdown)
+- `sql/` — DDL/представления/quality‑checks
+- `docker-compose*.yml` и `docker/*` — инфраструктура (ClickHouse/Airflow/Superset/MinIO)
+- `reports/` — результаты генерации отчётов
+
+---
+
 ## Roadmap
-- обогащение gold: эмбеддинги, тематическое моделирование, тональность
-- улучшение извлечения ключевых фраз и суммаризации
-- витрины ClickHouse под BI (Superset/DataLens)
-- расписания и уведомления (ежедневные дайджесты)
-- расширение источников (несколько RSS/API/Telegram)
+
+Ближайшие улучшения (в порядке «максимум эффекта на портфолио»):
+- расширить источники (несколько RSS/API/Telegram) + логирование покрытия
+- улучшить NLP: ключевые фразы, мультиязычность, тональность, тематические кластеры
+- витрины ClickHouse под BI (отдельные materialized views под Superset)
+- регулярные отчёты по расписанию + уведомления
+- эмбеддинги и похожие материалы (near‑duplicate / clustering)
