@@ -85,3 +85,6 @@ temp_results_*_posts_*.json
 # Robust telegram scrape outputs (local artifacts)
 *_robust_*_posts_*.json
 *_robust_*_posts_*.txt
+
+# local-only
+telegram_channels.txt
