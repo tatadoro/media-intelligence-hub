@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import feedparser
 import pandas as pd
@@ -27,6 +31,60 @@ class HttpCfg:
     timeout: float = 15.0
     retries_total: int = 3
     backoff_factor: float = 0.6
+
+
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+
+
+def _parse_any_dt(s: str) -> Optional[datetime]:
+    s = (s or "").strip()
+    if not s:
+        return None
+    # ISO (в т.ч. 2025-12-30T10:00:00+00:00 / Z)
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        pass
+    # RFC 2822 (типично для RSS pubDate)
+    try:
+        return parsedate_to_datetime(s)
+    except Exception:
+        return None
+
+
+def _to_ch_dt_str(dt: datetime) -> str:
+    """Формат для DateTime64(3) в CH."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(MOSCOW_TZ)
+    return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def _get_ch_cfg() -> tuple[str, int, str, str, str]:
+    host = os.getenv("CH_HOST", "localhost")
+    port = int(os.getenv("CH_PORT", "18123"))
+    db = os.getenv("CH_DATABASE", "media_intel")
+    user = os.getenv("CH_USER", "admin")
+    pwd = os.getenv("CH_PASSWORD", "")
+    return host, port, db, user, pwd
+
+
+def _insert_coverage_row(row: dict[str, Any]) -> None:
+    """INSERT в media_intel.ingestion_coverage через HTTP JSONEachRow."""
+    host, port, db, user, pwd = _get_ch_cfg()
+    url = f"http://{host}:{port}/?query=INSERT%20INTO%20{db}.ingestion_coverage%20FORMAT%20JSONEachRow"
+    data = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
+
+    try:
+        if pwd:
+            r = requests.post(url, data=data, auth=(user, pwd), timeout=10)
+        else:
+            r = requests.post(url, data=data, timeout=10)
+        if r.status_code >= 300:
+            raise RuntimeError(f"CH insert failed: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        # Не валим сбор источников из-за метрики — только предупреждение
+        print(f"[WARN] Coverage insert failed: {type(e).__name__}: {e}")
 
 
 def load_settings(path: Path = SETTINGS_PATH) -> dict[str, Any]:
@@ -324,11 +382,13 @@ def main() -> None:
         print("[WARN] No enabled RSS sources found. Check config/settings.yaml")
         return
 
-    now_utc = datetime.now(timezone.utc)
     http_cfg = HttpCfg()
     session = make_session(http_cfg)
 
     for src in run_sources:
+        now_utc = datetime.now(timezone.utc)
+        batch_id = os.getenv("BATCH_ID") or now_utc.isoformat()
+
         name = str(src.get("name") or "").strip()
         url = str(src.get("url") or "").strip()
         enabled_flag = bool(src.get("enabled", True))
@@ -338,33 +398,103 @@ def main() -> None:
             continue
 
         if only and not enabled_flag:
-            print(f"[CONFIG] NOTE: source '{name}' is disabled in settings.yaml, running anyway because --only is set")
+            print(
+                f"[CONFIG] NOTE: source '{name}' is disabled in settings.yaml, "
+                f"running anyway because --only is set"
+            )
+
+        run_started = datetime.now(timezone.utc)
+        t0 = time.time()
+
+        status = "ok"
+        error_message = ""
+        raw_object_name = ""
 
         df = collect_one_source(session, name=name, url=url, http_cfg=http_cfg)
 
         print("[RSS] Converting feed to DataFrame ...")
         print(f"[RSS] Got {len(df)} items")
 
+        items_found = int(len(df))
+        items_saved = 0
+
+        # min/max published_at
+        pub_dts: list[datetime] = []
+        if not df.empty and "published_at" in df.columns:
+            for s in df["published_at"].astype(str).tolist():
+                dt = _parse_any_dt(s)
+                if dt:
+                    pub_dts.append(dt)
+
+        min_pub = min(pub_dts) if pub_dts else None
+        max_pub = max(pub_dts) if pub_dts else None
+
         if df.empty:
-            print(f"[RSS] No items for {name}, skipping save.")
-            continue
+            status = "warn"
+            error_message = "0 items"
+        elif args.check:
+            status = "warn"
+            error_message = "check mode (not saved)"
+        else:
+            save_errors: list[str] = []
+            saved_any = False
 
-        if args.check:
-            continue
+            if raw_backend in ("s3", "both"):
+                try:
+                    print("[SAVE] Saving raw data to MinIO (S3)...")
+                    key = save_raw_to_s3(df, source_name=name, now_utc=now_utc)
+                    print(f"[SAVE] Saved {len(df)} items to s3://{MINIO_BUCKET}/{key}")
+                    saved_any = True
+                    raw_object_name = key
+                except Exception as e:
+                    save_errors.append(f"s3:{type(e).__name__}:{e}")
 
-        if raw_backend in ("s3", "both"):
-            print("[SAVE] Saving raw data to MinIO (S3)...")
-            key = save_raw_to_s3(df, source_name=name, now_utc=now_utc)
-            print(f"[SAVE] Saved {len(df)} items to s3://{MINIO_BUCKET}/{key}")
+            if raw_backend in ("local", "both"):
+                try:
+                    print("[SAVE] Saving local backup JSON ...")
+                    filename = save_dataframe_to_json(df, raw_dir_cfg, source_name=name, now_utc=now_utc)
+                    print(f"[SAVE] Saved local copy with {len(df)} items to {filename}")
+                    saved_any = True
+                    if not raw_object_name:
+                        raw_object_name = filename
+                except Exception as e:
+                    save_errors.append(f"local:{type(e).__name__}:{e}")
 
-        if raw_backend in ("local", "both"):
-            print("[SAVE] Saving local backup JSON ...")
-            filename = save_dataframe_to_json(df, raw_dir_cfg, source_name=name, now_utc=now_utc)
-            print(f"[SAVE] Saved local copy with {len(df)} items to {filename}")
+            if saved_any:
+                items_saved = items_found
+                if save_errors:
+                    status = "warn"
+                    error_message = "; ".join(save_errors)
+            else:
+                status = "error"
+                error_message = "; ".join(save_errors) if save_errors else "nothing saved"
 
-        if raw_backend not in ("s3", "local", "both"):
-            print(f"[WARN] Unknown raw_backend='{raw_backend}', nothing was saved.")
-            return
+            if raw_backend not in ("s3", "local", "both"):
+                status = "error"
+                error_message = f"unknown raw_backend='{raw_backend}'"
+                print(f"[WARN] Unknown raw_backend='{raw_backend}', nothing was saved.")
+
+        run_finished = datetime.now(timezone.utc)
+        duration_ms = int((time.time() - t0) * 1000)
+
+        coverage_row: dict[str, Any] = {
+            "batch_id": batch_id,
+            "source_type": "rss",
+            "source": name,
+            "run_started_at": _to_ch_dt_str(run_started),
+            "run_finished_at": _to_ch_dt_str(run_finished),
+            "duration_ms": duration_ms,
+            "items_found": items_found,
+            "items_saved": int(items_saved),
+            "min_published_at": _to_ch_dt_str(min_pub) if min_pub else None,
+            "max_published_at": _to_ch_dt_str(max_pub) if max_pub else None,
+            "status": status,
+            "error_message": error_message,
+            "raw_object_name": raw_object_name,
+        }
+        _insert_coverage_row(coverage_row)
+
+    # не закрываем session явно: requests.Session закроется при завершении процесса
 
 
 if __name__ == "__main__":

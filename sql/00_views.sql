@@ -63,3 +63,60 @@ FROM
     ON a.ingest_object_name = ll.object_name
 ) AS t
 GROUP BY dedup_key;
+
+-- ------------------------------------------------------------------
+-- Latest ingestion status per source (for Superset lag/status widgets)
+-- ------------------------------------------------------------------
+
+CREATE OR REPLACE VIEW ingestion_coverage_latest AS
+SELECT
+  source_type,
+  source,
+  batch_id,
+  run_started_at,
+  run_finished_at,
+  duration_ms,
+  items_found,
+  items_saved,
+  min_published_at,
+  max_published_at,
+  status,
+  error_message,
+  raw_object_name,
+
+  -- флаг "источник отдаёт слишком старые публикации"
+  if(
+    isNull(max_published_at),
+    1,
+    max_published_at < now('Europe/Moscow') - INTERVAL 14 DAY
+  ) AS is_stale,
+
+  -- lag считаем только для НЕ-stale
+  if(
+    isNull(max_published_at) OR max_published_at < now('Europe/Moscow') - INTERVAL 14 DAY,
+    NULL,
+    dateDiff('minute', max_published_at, now('Europe/Moscow'))
+  ) AS lag_minutes
+FROM
+(
+  SELECT
+    ic.source_type AS source_type,
+    ic.source      AS source,
+
+    argMax(ic.batch_id, ic.run_finished_at)        AS batch_id,
+    argMax(ic.run_started_at, ic.run_finished_at)  AS run_started_at,
+    max(ic.run_finished_at)                        AS run_finished_at,
+    argMax(ic.duration_ms, ic.run_finished_at)     AS duration_ms,
+
+    argMax(ic.items_found, ic.run_finished_at)     AS items_found,
+    argMax(ic.items_saved, ic.run_finished_at)     AS items_saved,
+
+    argMax(ic.min_published_at, ic.run_finished_at) AS min_published_at,
+    argMax(ic.max_published_at, ic.run_finished_at) AS max_published_at,
+
+    argMax(ic.status, ic.run_finished_at)          AS status,
+    argMax(ic.error_message, ic.run_finished_at)   AS error_message,
+    argMax(ic.raw_object_name, ic.run_finished_at) AS raw_object_name
+  FROM media_intel.ingestion_coverage AS ic
+  GROUP BY ic.source_type, ic.source
+) AS t;

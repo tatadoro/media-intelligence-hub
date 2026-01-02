@@ -10,7 +10,7 @@ Robust Telegram channel scraper for https://t.me/s/<channel>
 - Допускает пустой/короткий текст (медиа-посты не теряются).
 - Явное ожидание роста числа карточек в DOM после скролла.
 - Обрабатывает только действительно новые ID.
-- CLI параметры: --channel, --target, --headless.
+- CLI параметры: --channels/--channels-file (без дефолтного канала).
 
 Зависимости:
   pip install selenium webdriver-manager
@@ -21,7 +21,126 @@ import sys
 import time
 import json
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone  # [MIH COVERAGE]
+from pathlib import Path
+from typing import List, Tuple, Optional, Any  # [MIH COVERAGE]
+
+import yaml
+
+# [MIH COVERAGE] stdlib-only HTTP insert + datetime parsing
+import base64
+import urllib.request
+import urllib.parse
+from email.utils import parsedate_to_datetime
+from zoneinfo import ZoneInfo
+
+# Путь к корню проекта: .../media_intel_hub
+BASE_DIR = Path(__file__).resolve().parents[2]
+SETTINGS_PATH = BASE_DIR / "config" / "settings.yaml"
+
+# Чтобы `from src...` работало при запуске как файла:
+#   python src/collectors/telegram_scraper.py
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+from src.utils.s3_client import MINIO_BUCKET, upload_json_bytes
+
+# Дефолтный файл каналов (у тебя он в config/)
+DEFAULT_CHANNELS_FILE = str(BASE_DIR / "config" / "telegram_channels.txt")
+
+
+def load_settings(path: Path = SETTINGS_PATH) -> dict:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def get_raw_backend(settings: dict) -> str:
+    storage_cfg = settings.get("storage", {}) or {}
+    backend = os.getenv("RAW_BACKEND") or storage_cfg.get("raw_backend", "local")
+    return str(backend).strip().lower()
+
+
+# =============================================================================
+# [MIH COVERAGE] ClickHouse ingestion_coverage insert helpers (stdlib-only)
+# =============================================================================
+
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+
+
+def _parse_any_dt(s: str) -> Optional[datetime]:
+    s = (s or "").strip()
+    if not s:
+        return None
+    # ISO 8601 (Telegram time@datetime обычно ISO)
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        pass
+    # RFC 2822 (на всякий случай)
+    try:
+        return parsedate_to_datetime(s)
+    except Exception:
+        return None
+
+
+def _to_ch_dt64_3_str(dt: datetime) -> str:
+    """Строка под ClickHouse DateTime64(3) в Europe/Moscow."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(MOSCOW_TZ)
+    return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def _get_ch_cfg() -> Tuple[str, int, str, str, str]:
+    """
+    По умолчанию ориентируемся на Makefile/env проекта:
+      CH_HOST=localhost
+      CH_PORT=18123  (HTTP порт, не native 9000)
+      CH_DATABASE=media_intel
+      CH_USER=admin
+      CH_PASSWORD=...
+    """
+    host = os.getenv("CH_HOST", "localhost")
+    port = int(os.getenv("CH_PORT", "18123"))
+    db = os.getenv("CH_DATABASE", "media_intel")
+
+    # Чуть более устойчиво к разным env-наборам
+    user = os.getenv("CH_USER") or os.getenv("CLICKHOUSE_USER") or "admin"
+    pwd = os.getenv("CH_PASSWORD") or os.getenv("CLICKHOUSE_PASSWORD") or ""
+
+    return host, port, db, user, pwd
+
+
+def _ch_insert_ingestion_coverage(row: dict[str, Any]) -> None:
+    """
+    INSERT в <db>.ingestion_coverage через HTTP FORMAT JSONEachRow.
+    Не должен ломать сбор: ошибки логируем как [WARN].
+
+    Важно:
+    - error_message в CH = String (не Nullable) -> всегда строка (""), не None.
+    - raw_object_name в CH = String (не Nullable) -> всегда строка (""), не None.
+    """
+    host, port, db, user, pwd = _get_ch_cfg()
+    query = f"INSERT INTO {db}.ingestion_coverage FORMAT JSONEachRow"
+    url = f"http://{host}:{port}/?query={urllib.parse.quote(query, safe='')}"
+
+    payload = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
+    req = urllib.request.Request(url, data=payload, method="POST")
+    req.add_header("Content-Type", "application/json; charset=utf-8")
+
+    # Basic auth: отправляем, если задан user (пароль может быть пустым)
+    if user:
+        token = base64.b64encode(f"{user}:{pwd}".encode("utf-8")).decode("ascii")
+        req.add_header("Authorization", f"Basic {token}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            _ = resp.read()  # читаем, чтобы закрыть соединение
+    except Exception as e:
+        print(f"[WARN] Coverage insert failed: {type(e).__name__}: {e}")
+
 
 # --- Selenium imports ---
 try:
@@ -37,6 +156,7 @@ except ImportError:
 # --- WebDriver Manager (необязательно, но удобно) ---
 try:
     from webdriver_manager.chrome import ChromeDriverManager
+
     USE_WEBDRIVER_MANAGER = True
 except ImportError:
     USE_WEBDRIVER_MANAGER = False
@@ -53,6 +173,7 @@ class RobustTelegramScraper:
         mih_only: bool = False,
         mih_schema: str = "bundle",
         batch_id: str = None,
+        raw_backend: str = "local",
     ):
         self.channel = channel
         self.url = f"https://t.me/s/{self.channel}"
@@ -64,14 +185,44 @@ class RobustTelegramScraper:
         self.mih_only = mih_only
         self.mih_schema = mih_schema
         self.batch_id = batch_id or os.getenv("BATCH_ID") or datetime.now().isoformat()
+        self.raw_backend = str(raw_backend or "local").strip().lower()
 
         self.driver = None
         self.posts = []
-        self.seen_ids = set()        # data-post / URL / hash
+        self.seen_ids = set()  # data-post / URL / hash
         self.processed_urls = set()  # для статистики
-        self.batch_size = 100        # верхняя граница обработки за итерацию
+        self.batch_size = 100  # верхняя граница обработки за итерацию
         self._last_dom_count = 0
         self.scroll_direction = "down"  # auto: up/down
+
+    def _recover_datetime_http(self, post_id: str, post_url: str = "") -> str:
+        """
+        Восстанавливает published_at, если Selenium не нашёл time[datetime].
+        Берём HTML ленты /s/ и ищем datetime рядом с data-post="<channel>/<id>".
+        """
+        pid = (post_id or "").strip()
+        if not pid.isdigit():
+            return ""
+
+        before = int(pid) + 1
+        surl = f"https://t.me/s/{self.channel}?before={before}"
+
+        try:
+            req = urllib.request.Request(
+                surl,
+                headers={"User-Agent": "Mozilla/5.0"},
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+        import re
+        # 20k — как ты уже тестировала, этого обычно достаточно
+        pat = rf'data-post="{re.escape(self.channel)}/{pid}".{{0,20000}}?<time[^>]*datetime="([^"]+)"'
+        m = re.search(pat, html, flags=re.I | re.S)
+        return (m.group(1) or "").strip() if m else ""    
 
     # -------------------- Driver setup & page load --------------------
 
@@ -364,19 +515,34 @@ class RobustTelegramScraper:
 
             text = self._get_message_text(element)
 
+            # --- FIX: не цепляем message_video_duration (0:24 и т.п.), берём time[datetime] ---
             datetime_str = ""
             human_date = "Неизвестно"
             try:
-                t = element.find_element(By.CSS_SELECTOR, "time")
-                datetime_str = t.get_attribute("datetime") or ""
+                # Самый надёжный: дата поста в шапке карточки
+                t = element.find_element(By.CSS_SELECTOR, "a.tgme_widget_message_date time[datetime]")
+                datetime_str = (t.get_attribute("datetime") or "").strip()
                 human_date = (t.text or "").strip() or human_date
             except Exception:
                 try:
-                    t2 = element.find_element(By.CSS_SELECTOR, ".tgme_widget_message_date")
-                    human_date = (t2.text or "").strip() or human_date
+                    # Фолбэк: любой time с datetime внутри карточки
+                    t = element.find_element(By.CSS_SELECTOR, "time[datetime]")
+                    datetime_str = (t.get_attribute("datetime") or "").strip()
+                    human_date = (t.text or "").strip() or human_date
                 except Exception:
-                    pass
-
+                    try:
+                        # Последний фолбэк: просто текст даты-ссылки
+                        t2 = element.find_element(By.CSS_SELECTOR, ".tgme_widget_message_date")
+                        human_date = (t2.text or "").strip() or human_date
+                    except Exception:
+                        pass
+            # --- RECOVERY: если datetime всё ещё пустой, достаём по HTTP из /s/ через ?before=post_id+1 ---
+            if not datetime_str:
+                recovered = self._recover_datetime_http(post_id, post_url)
+                if recovered:
+                    datetime_str = recovered
+                    # human_date можно не трогать, но можно синхронизировать:
+                    # human_date = human_date if human_date != "Неизвестно" else recovered
             views = "0"
             try:
                 v = element.find_element(By.CSS_SELECTOR, ".tgme_widget_message_views")
@@ -539,18 +705,11 @@ class RobustTelegramScraper:
         except Exception as e:
             print(f"Ошибка промежуточного сохранения: {e}")
 
-    def save_mih_raw(self, ts: str):
+    def save_mih_raw(self, ts: str) -> Tuple[str, str]:
         """Сохраняет raw JSON в формате, удобном для MIH (raw → silver).
 
-        ВАЖНО: добавляем raw_text/raw_title/raw_url, потому что текущий raw→silver
-        ожидает колонку raw_text.
-
-        Схемы:
-        - list: просто список records
-        - bundle: объект с метаданными и ключом items
+        Возвращает: (local_path_or_empty, s3_key_or_empty)
         """
-        os.makedirs(self.out_dir, exist_ok=True)
-
         records = []
         now_iso = datetime.now().isoformat()
 
@@ -562,7 +721,6 @@ class RobustTelegramScraper:
 
             records.append(
                 {
-                    # Универсальные поля (как было)
                     "uid": p.get("uid"),
                     "source": p.get("source") or f"telegram:{self.channel}",
                     "channel": p.get("channel") or self.channel,
@@ -571,13 +729,10 @@ class RobustTelegramScraper:
                     "published_at": published_at,
                     "content": content,
                     "batch_id": self.batch_id,
-
-                    # Контракт под текущий raw→silver
                     "raw_text": content,
                     "raw_title": title,
                     "raw_url": link,
                     "raw_published_at": published_at,
-
                     "meta": {
                         "tg_post_id": p.get("post_id"),
                         "views": p.get("views"),
@@ -591,7 +746,6 @@ class RobustTelegramScraper:
             )
 
         out_name = f"articles_{ts}_telegram_{self.channel}.json"
-        out_path = os.path.join(self.out_dir, out_name)
 
         if str(self.mih_schema).lower() == "list":
             payload = records
@@ -606,25 +760,37 @@ class RobustTelegramScraper:
                 "items": records,
             }
 
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        local_path = ""
+        s3_key = ""
 
-        print(f"MIH RAW: {out_path}")
-        return out_path
+        if self.raw_backend in ("s3", "both"):
+            date_str = datetime.utcnow().strftime("%Y-%m-%d")
+            s3_key = f"raw/{date_str}/telegram/{self.channel}/{out_name}"
+            upload_json_bytes(MINIO_BUCKET, s3_key, json.dumps(payload, ensure_ascii=False, indent=2))
+            print(f"MIH RAW (S3): s3://{MINIO_BUCKET}/{s3_key}")
+
+        if self.raw_backend in ("local", "both"):
+            os.makedirs(self.out_dir, exist_ok=True)
+            local_path = os.path.join(self.out_dir, out_name)
+            with open(local_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            print(f"MIH RAW (local): {local_path}")
+
+        return local_path, s3_key
 
     def save_final_results(self):
         if not self.posts:
             print("Нет постов для сохранения")
-            return None, None, None
+            return None, None, None, None
 
         print("[4/4] Сохранение результатов...")
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        mih_path = self.save_mih_raw(ts)
+        mih_path, mih_s3_key = self.save_mih_raw(ts)
 
         if self.mih_only:
             self.show_statistics()
-            return mih_path, None, None
+            return mih_path, mih_s3_key, None, None
 
         os.makedirs(self.debug_dir, exist_ok=True)
         base = f"{self.channel}_robust_{len(self.posts)}_posts_{ts}"
@@ -661,7 +827,7 @@ class RobustTelegramScraper:
                 if p.get("post_id"):
                     f.write(f"ID: {p['post_id']}\n")
                 if p.get("post_url"):
-                    f.write(f"Ссылка: {p['post_url']}\n")
+                    f.write(f"Ссылка: {p.get('post_url')}\n")
                 f.write(f"Просмотры: {p.get('views')}\n")
                 f.write(f"Длина: {p.get('text_length')} символов\n")
                 media = []
@@ -679,7 +845,7 @@ class RobustTelegramScraper:
         print(f"TXT:  {txt_path}")
 
         self.show_statistics()
-        return mih_path, json_path, txt_path
+        return mih_path, mih_s3_key, json_path, txt_path
 
     def show_statistics(self):
         if not self.posts:
@@ -718,13 +884,6 @@ def parse_args():
     p = argparse.ArgumentParser(description="Robust Telegram scraper for t.me/s/<channel>")
 
     p.add_argument(
-        "--channel",
-        type=str,
-        default=os.getenv("TG_CHANNEL", "make_your_style"),
-        help="Имя канала без @ (fallback, если не задано --channels/--channels-file)",
-    )
-
-    p.add_argument(
         "--channels",
         type=str,
         default=os.getenv("TG_CHANNELS", ""),
@@ -734,8 +893,16 @@ def parse_args():
     p.add_argument(
         "--channels-file",
         type=str,
-        default=os.getenv("TG_CHANNELS_FILE", ""),
+        default=os.getenv("TG_CHANNELS_FILE", DEFAULT_CHANNELS_FILE),
         help="Файл со списком каналов (по одному на строку, поддерживает комментарии #)",
+    )
+
+    # Один канал оставляем только как ручной override (без дефолта!)
+    p.add_argument(
+        "--channel",
+        type=str,
+        default=os.getenv("TG_CHANNEL", ""),
+        help="Один канал без @ (только для ручного теста; лучше --channels-file/--channels)",
     )
 
     p.add_argument(
@@ -776,50 +943,113 @@ def parse_args():
     return p.parse_args()
 
 
-def _resolve_channels(args) -> list:
-    channels = []
+def _read_channels_file(path: Path) -> Tuple[List[str], int]:
+    """
+    Читает файл каналов и возвращает:
+      - список каналов (сырых, может содержать дубли)
+      - количество НЕпустых НЕкомментарных строк (для диагностики)
+    """
+    channels: List[str] = []
+    meaningful_lines = 0
 
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = (line or "").strip()
+            if not line or line.startswith("#"):
+                continue
+            meaningful_lines += 1
+            channels.append(line.lstrip("@"))
+
+    return channels, meaningful_lines
+
+
+def _resolve_channels(args) -> Tuple[List[str], str]:
+    """
+    Возвращает: (channels, source_info)
+    source_info полезно для логов.
+    """
+    channels: List[str] = []
+    source_info = ""
+
+    # 1) --channels
     if args.channels:
         parts = [p.strip().lstrip("@") for p in args.channels.split(",")]
         channels.extend([c for c in parts if c])
+        source_info = "cli:--channels"
 
+    # 2) --channels-file (по умолчанию telegram_channels.txt)
     if args.channels_file:
-        try:
-            with open(args.channels_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = (line or "").strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    channels.append(line.lstrip("@"))
-        except Exception as e:
-            print(f"Не удалось прочитать channels-file: {e}")
+        pth = Path(args.channels_file)
+        if not pth.is_absolute():
+            pth = (BASE_DIR / pth).resolve()
+
+        if pth.exists():
+            try:
+                file_channels, meaningful = _read_channels_file(pth)
+                if meaningful == 0:
+                    print(f"[ERROR] channels-file is empty (only comments/blank lines): {pth}")
+                    raise SystemExit(2)
+                channels.extend(file_channels)
+                if not source_info:
+                    source_info = f"file:{pth}"
+            except SystemExit:
+                raise
+            except Exception as e:
+                print(f"[ERROR] Не удалось прочитать channels-file: {e}")
+                raise SystemExit(2)
+        else:
+            # Файл по умолчанию должен существовать — это явная ошибка
+            if str(args.channels_file).strip() == DEFAULT_CHANNELS_FILE:
+                print(f"[ERROR] channels-file not found: {pth}")
+                raise SystemExit(2)
+
+    # 3) Один канал — только если явно задан (и список пуст)
+    if not channels and args.channel:
+        channels = [args.channel.lstrip("@")]
+        source_info = "cli/env:--channel"
 
     if not channels:
-        channels = [args.channel.lstrip("@")]
+        print(
+            "[ERROR] Не задан список каналов.\n"
+            f"Положи файл {DEFAULT_CHANNELS_FILE} в корень проекта или укажи --channels-file.\n"
+            "Либо укажи --channels 'a,b,c'."
+        )
+        raise SystemExit(2)
 
-    uniq = []
+    # Дедуп
+    uniq: List[str] = []
     seen = set()
     for c in channels:
-        if c not in seen:
+        c = (c or "").strip()
+        if c and c not in seen:
             uniq.append(c)
             seen.add(c)
 
-    return uniq
+    # Дополнительная защита: вдруг всё отфильтровалось
+    if not uniq:
+        print("[ERROR] После обработки список каналов пуст (проверь файл/параметры).")
+        raise SystemExit(2)
+
+    return uniq, source_info
 
 
 def main():
     args = parse_args()
-    channels = _resolve_channels(args)
+    channels, channels_src = _resolve_channels(args)
 
     print("Robust Telegram Scraper (t.me/s/<channel>)")
     print(f"Каналов: {len(channels)}")
     print("Каналы: " + ", ".join([f"@{c}" for c in channels]))
+    print(f"Channels source: {channels_src}")
     print(f"Цель: {args.target} постов на канал")
     print(f"Headless: {args.headless}")
     print(f"MIH out-dir: {args.out_dir}")
     print(f"Debug dir:  {args.debug_dir}")
     print(f"MIH only:   {args.mih_only}")
     print("=" * 60)
+
+    settings = load_settings()
+    raw_backend = get_raw_backend(settings)
 
     batch_id = os.getenv("BATCH_ID") or datetime.now().isoformat()
     mih_paths = []
@@ -828,6 +1058,10 @@ def main():
         for ch in channels:
             print("=" * 60)
             print(f"[START] @{ch}")
+
+            # [MIH COVERAGE] timing per channel
+            run_started_utc = datetime.now(timezone.utc)
+            t0 = time.perf_counter()
 
             scraper = RobustTelegramScraper(
                 channel=ch,
@@ -838,27 +1072,143 @@ def main():
                 mih_only=args.mih_only,
                 mih_schema=args.mih_schema,
                 batch_id=batch_id,
+                raw_backend=raw_backend,
             )
 
             try:
                 if not scraper.setup_driver():
+                    # [MIH COVERAGE]
+                    run_finished_utc = datetime.now(timezone.utc)
+                    duration_ms = int((time.perf_counter() - t0) * 1000)
+                    _ch_insert_ingestion_coverage(
+                        {
+                            "source_type": "telegram",
+                            "source": ch,
+                            "batch_id": batch_id,
+                            "run_started_at": _to_ch_dt64_3_str(run_started_utc),
+                            "run_finished_at": _to_ch_dt64_3_str(run_finished_utc),
+                            "duration_ms": duration_ms,
+                            "items_found": 0,
+                            "items_saved": 0,
+                            "min_published_at": None,
+                            "max_published_at": None,
+                            "status": "error",
+                            "error_message": "Driver setup failed",
+                            "raw_object_name": "",
+                        }
+                    )
                     continue
+
                 if not scraper.load_page():
+                    # [MIH COVERAGE]
+                    run_finished_utc = datetime.now(timezone.utc)
+                    duration_ms = int((time.perf_counter() - t0) * 1000)
+                    _ch_insert_ingestion_coverage(
+                        {
+                            "source_type": "telegram",
+                            "source": ch,
+                            "batch_id": batch_id,
+                            "run_started_at": _to_ch_dt64_3_str(run_started_utc),
+                            "run_finished_at": _to_ch_dt64_3_str(run_finished_utc),
+                            "duration_ms": duration_ms,
+                            "items_found": 0,
+                            "items_saved": 0,
+                            "min_published_at": None,
+                            "max_published_at": None,
+                            "status": "error",
+                            "error_message": "Page load failed (private/nonexistent/timeout)",
+                            "raw_object_name": "",
+                        }
+                    )
                     continue
 
                 count = scraper.scroll_and_extract()
 
                 if count > 0:
-                    mih_path, debug_json, debug_txt = scraper.save_final_results()
+                    mih_path, mih_s3_key, debug_json, debug_txt = scraper.save_final_results()
                     if mih_path:
                         mih_paths.append(mih_path)
+
+                    # [MIH COVERAGE] compute min/max published_at
+                    dts: List[datetime] = []
+                    for p in (scraper.posts or []):
+                        dt = _parse_any_dt(p.get("published_at") or p.get("datetime") or "")
+                        if dt is not None:
+                            dts.append(dt)
+
+                    min_dt = min(dts) if dts else None
+                    max_dt = max(dts) if dts else None
+
+                    run_finished_utc = datetime.now(timezone.utc)
+                    duration_ms = int((time.perf_counter() - t0) * 1000)
+
+                    _ch_insert_ingestion_coverage(
+                        {
+                            "source_type": "telegram",
+                            "source": ch,
+                            "batch_id": batch_id,
+                            "run_started_at": _to_ch_dt64_3_str(run_started_utc),
+                            "run_finished_at": _to_ch_dt64_3_str(run_finished_utc),
+                            "duration_ms": duration_ms,
+                            "items_found": int(count),
+                            "items_saved": int(count),
+                            "min_published_at": _to_ch_dt64_3_str(min_dt) if min_dt else None,
+                            "max_published_at": _to_ch_dt64_3_str(max_dt) if max_dt else None,
+                            "status": "ok",
+                            "error_message": "",
+                            # для S3 — ключ, для local — путь
+                            "raw_object_name": str(mih_s3_key or mih_path or ""),
+                        }
+                    )
                 else:
                     print("Не удалось извлечь посты")
+
+                    # [MIH COVERAGE]
+                    run_finished_utc = datetime.now(timezone.utc)
+                    duration_ms = int((time.perf_counter() - t0) * 1000)
+                    _ch_insert_ingestion_coverage(
+                        {
+                            "source_type": "telegram",
+                            "source": ch,
+                            "batch_id": batch_id,
+                            "run_started_at": _to_ch_dt64_3_str(run_started_utc),
+                            "run_finished_at": _to_ch_dt64_3_str(run_finished_utc),
+                            "duration_ms": duration_ms,
+                            "items_found": int(count),
+                            "items_saved": 0,
+                            "min_published_at": None,
+                            "max_published_at": None,
+                            "status": "error",
+                            "error_message": "No posts extracted",
+                            "raw_object_name": "",
+                        }
+                    )
 
             except KeyboardInterrupt:
                 raise
             except Exception as e:
                 print(f"Ошибка по каналу @{ch}: {e}")
+
+                # [MIH COVERAGE]
+                run_finished_utc = datetime.now(timezone.utc)
+                duration_ms = int((time.perf_counter() - t0) * 1000)
+                _ch_insert_ingestion_coverage(
+                    {
+                        "source_type": "telegram",
+                        "source": ch,
+                        "batch_id": batch_id,
+                        "run_started_at": _to_ch_dt64_3_str(run_started_utc),
+                        "run_finished_at": _to_ch_dt64_3_str(run_finished_utc),
+                        "duration_ms": duration_ms,
+                        "items_found": 0,
+                        "items_saved": 0,
+                        "min_published_at": None,
+                        "max_published_at": None,
+                        "status": "error",
+                        "error_message": f"{type(e).__name__}: {e}",
+                        "raw_object_name": "",
+                    }
+                )
             finally:
                 scraper.cleanup()
 

@@ -117,3 +117,73 @@ CREATE TABLE IF NOT EXISTS media_intel.load_log
     `rows_loaded` UInt64
 )
 ENGINE = Log;
+
+-- ------------------------------------------------------------------
+-- Ingestion coverage: monitoring table for collectors (RSS/Telegram/API)
+-- Used by Superset charts (lag/volume) and operational checks.
+-- ------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS media_intel.ingestion_coverage
+(
+    `batch_id` String DEFAULT '',
+    `source_type` LowCardinality(String) DEFAULT '',
+    `source` String DEFAULT '',
+
+    `run_started_at` DateTime64(3, 'Europe/Moscow'),
+    `run_finished_at` DateTime64(3, 'Europe/Moscow'),
+    `duration_ms` UInt32 DEFAULT 0,
+
+    `items_found` UInt32 DEFAULT 0,
+    `items_saved` UInt32 DEFAULT 0,
+
+    `min_published_at` Nullable(DateTime64(3, 'Europe/Moscow')),
+    `max_published_at` Nullable(DateTime64(3, 'Europe/Moscow')),
+
+    `status` LowCardinality(String) DEFAULT 'ok',          -- ok / warn / error
+    `error_message` String DEFAULT '',
+    `raw_object_name` String DEFAULT ''                   -- mih_s3_key preferred; local path fallback
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(run_finished_at)
+ORDER BY (source_type, source, run_finished_at, batch_id)
+SETTINGS index_granularity = 8192;
+
+-- Online-migration block for ingestion_coverage
+ALTER TABLE media_intel.ingestion_coverage
+    ADD COLUMN IF NOT EXISTS `batch_id` String DEFAULT '';
+
+ALTER TABLE media_intel.ingestion_coverage
+    ADD COLUMN IF NOT EXISTS `source_type` LowCardinality(String) DEFAULT '';
+
+ALTER TABLE media_intel.ingestion_coverage
+    ADD COLUMN IF NOT EXISTS `source` String DEFAULT '';
+
+ALTER TABLE media_intel.ingestion_coverage
+    ADD COLUMN IF NOT EXISTS `run_started_at` DateTime64(3, 'Europe/Moscow');
+
+ALTER TABLE media_intel.ingestion_coverage
+    ADD COLUMN IF NOT EXISTS `run_finished_at` DateTime64(3, 'Europe/Moscow');
+
+ALTER TABLE media_intel.ingestion_coverage
+    ADD COLUMN IF NOT EXISTS `duration_ms` UInt32 DEFAULT 0;
+
+ALTER TABLE media_intel.ingestion_coverage
+    ADD COLUMN IF NOT EXISTS `items_found` UInt32 DEFAULT 0;
+
+ALTER TABLE media_intel.ingestion_coverage
+    ADD COLUMN IF NOT EXISTS `items_saved` UInt32 DEFAULT 0;
+
+ALTER TABLE media_intel.ingestion_coverage
+    ADD COLUMN IF NOT EXISTS `min_published_at` Nullable(DateTime64(3, 'Europe/Moscow'));
+
+ALTER TABLE media_intel.ingestion_coverage
+    ADD COLUMN IF NOT EXISTS `max_published_at` Nullable(DateTime64(3, 'Europe/Moscow'));
+
+ALTER TABLE media_intel.ingestion_coverage
+    ADD COLUMN IF NOT EXISTS `status` LowCardinality(String) DEFAULT 'ok';
+
+ALTER TABLE media_intel.ingestion_coverage
+    ADD COLUMN IF NOT EXISTS `error_message` String DEFAULT '';
+
+ALTER TABLE media_intel.ingestion_coverage
+    ADD COLUMN IF NOT EXISTS `raw_object_name` String DEFAULT '';
