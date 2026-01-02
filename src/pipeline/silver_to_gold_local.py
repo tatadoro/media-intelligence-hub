@@ -12,6 +12,7 @@ from typing import DefaultDict, Dict, List, Tuple
 import pandas as pd
 
 from src.processing.summarization import enrich_articles_with_summary_and_keywords
+from src.processing.nlp_extras import add_lang_keyphrases_sentiment
 
 CH_TZ = "Europe/Moscow"
 MIN_PUBLISHED_AT_UTC = pd.Timestamp("2000-01-01", tz="UTC")
@@ -711,14 +712,25 @@ def main() -> None:
                 df_gold["persons_actions"] = pd.Series(dtype="string")
             if "actions_verbs" not in df_gold.columns:
                 df_gold["actions_verbs"] = pd.Series(dtype="string")
+        if "lang" not in df_gold.columns:
+            df_gold["lang"] = pd.Series(dtype="string")
+        if "keyphrases" not in df_gold.columns:
+            df_gold["keyphrases"] = pd.Series(dtype="string")
+        if "sentiment_label" not in df_gold.columns:
+            df_gold["sentiment_label"] = pd.Series(dtype="string")
+        if "sentiment_score" not in df_gold.columns:
+            df_gold["sentiment_score"] = pd.Series(dtype="float")
     else:
+        
         df_gold = enrich_articles_with_summary_and_keywords(df_silver)
         df_gold = add_persons_geo_columns(df_gold)
         if args.with_actions:
-            df_gold = add_persons_actions_columns(df_gold)
+             df_gold = add_persons_actions_columns(df_gold)
 
-    # 4.1) гарантируем id в gold перед валидацией/загрузкой
-    df_gold = ensure_id_column(df_gold)
+        df_gold = add_lang_keyphrases_sentiment(df_gold)
+
+        # 4.1) гарантируем id в gold перед валидацией/загрузкой
+        df_gold = ensure_id_column(df_gold)
 
     print(f"gold:  {output_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)

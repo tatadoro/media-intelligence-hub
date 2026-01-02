@@ -22,3 +22,8 @@ clickhouse-connect
 sqlalchemy
 
 natasha
+
+langid>=1.1.6
+yake>=0.4.8
+transformers>=4.41.0
+torch>=2.1.0
