@@ -24,6 +24,10 @@ CREATE VIEW media_intel.articles_dedup
     `num_keywords` Int64,
     `batch_id` String,
     `is_digest` UInt8,
+
+    `persons_actions` String,
+    `actions_verbs` String,
+
     `entities_persons` String,
     `entities_orgs` String,
     `entities_geo` String,
@@ -57,6 +61,10 @@ SELECT
     argMax(num_keywords, score) AS num_keywords,
     argMax(batch_id, score) AS batch_id,
     argMax(is_digest, score) AS is_digest,
+
+    argMax(persons_actions, score) AS persons_actions,
+    argMax(actions_verbs, score) AS actions_verbs,
+
     argMax(entities_persons, score) AS entities_persons,
     argMax(entities_orgs, score) AS entities_orgs,
     argMax(entities_geo, score) AS entities_geo,
@@ -85,12 +93,15 @@ FROM
             OR (a.sentiment_label != 'neu')
             OR (coalesce(a.sentiment_score, 0) != 0)
         ) AS has_nlp_extras,
-
+        toUInt8(
+            notEmpty(coalesce(a.persons_actions, ''))
+            OR notEmpty(coalesce(a.actions_verbs, ''))
+        ) AS has_actions,
         coalesce(ll.loaded_at, toDateTime64('1970-01-01 00:00:00', 9, 'Europe/Moscow')) AS loaded_at,
         toUInt8(coalesce(ll.loaded_at, toDateTime('1970-01-01 00:00:00')) = max_loaded) AS batch_priority,
 
         -- UPDATED score: has_nlp_extras goes BEFORE batch_priority
-        (has_body, clean_len, has_nlp_extras, batch_priority, a.published_at, loaded_at) AS score
+        (has_body, clean_len, has_nlp_extras,  has_actions, batch_priority, a.published_at, loaded_at) AS score
     FROM media_intel.articles AS a
     LEFT JOIN
     (

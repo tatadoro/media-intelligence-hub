@@ -298,6 +298,7 @@ with DAG(
             "cd /opt/mih && "
             "python -m src.pipeline.silver_to_gold_local "
             "--input \"{{ ti.xcom_pull(task_ids='pick_latest_silver') }}\""
+            "--with-actions"
         ),
     )
 

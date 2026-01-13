@@ -119,6 +119,14 @@ COMPOSE_ALL := COMPOSE_IGNORE_ORPHANS=1 $(COMPOSE_BIN) --project-directory $(PRO
                -f $(PROJECT_DIR)/docker-compose.superset.yml
 
 # ------------------------------------------------------------
+# Docker Compose для полного стека (core + Superset + Airflow)
+# ------------------------------------------------------------
+COMPOSE_FULL := COMPOSE_IGNORE_ORPHANS=1 $(COMPOSE_BIN) --project-directory $(PROJECT_DIR) --env-file $(ENV_FILE) \
+               -f $(PROJECT_DIR)/docker-compose.yml \
+               -f $(PROJECT_DIR)/docker-compose.superset.yml \
+               -f $(PROJECT_DIR)/docker-compose.airflow.yml
+
+# ------------------------------------------------------------
 # ClickHouse (переменные с fallback’ами)
 # ВАЖНО: избегаем рекурсивных определений вида CH_USER ?= $(or $(CH_USER),...)
 # ------------------------------------------------------------
@@ -192,21 +200,29 @@ env-ensure:
 
 # Поднять инфраструктуру (core + Superset) в фоне, тихо (без orphan warning)
 up: env-ensure
-	@$(call banner,"Docker up (core + Superset)")
+	@$(call banner,"Docker up (core + Superset + Airflow)")
 	@test -f docker-compose.superset.yml || (echo "[ERROR] docker-compose.superset.yml not found"; exit 1)
-	@$(COMPOSE_ALL) up -d clickhouse minio superset-postgres superset-redis
-	@$(COMPOSE_ALL) up superset-init
-	@$(COMPOSE_ALL) up -d superset
-	@$(COMPOSE_ALL) ps
+	@test -f docker-compose.airflow.yml || (echo "[ERROR] docker-compose.airflow.yml not found"; exit 1)
+
+	# Базовые сервисы
+	@$(COMPOSE_FULL) up -d clickhouse minio superset-postgres superset-redis airflow-postgres
+
+	# One-off init контейнеры (должны завершиться успешно)
+	@$(COMPOSE_FULL) up superset-init
+	@$(COMPOSE_FULL) up airflow-init
+
+	# Основные сервисы
+	@$(COMPOSE_FULL) up -d superset airflow-webserver airflow-scheduler
+	@$(COMPOSE_FULL) ps
 
 # Остановить весь стек (core + Superset), volumes НЕ удаляем
 down:
-	@$(call banner,"Docker down (core + Superset)")
-	@$(COMPOSE_ALL) down
+	@$(call banner,"Docker down (core + Superset + Airflow)")
+	@$(COMPOSE_FULL) down
 
 ps:
-	@$(call banner,"Docker ps (core + Superset)")
-	@$(COMPOSE_ALL) ps
+	@$(call banner,"Docker ps (core + Superset + Airflow)")
+	@$(COMPOSE_FULL) ps
 
 # Логи основного стека
 logs:
@@ -265,7 +281,9 @@ bootstrap:
 ch-show-schema:
 	@$(call banner,"ClickHouse schema")
 	@bash scripts/ch_run_sql.sh sql/00_ddl.sql
+	@bash scripts/ch_run_sql.sh sql/04_alter_articles_add_nlp_extras.sql
 	@bash scripts/ch_run_sql.sh sql/00_views.sql
+	@bash scripts/ch_run_sql.sh sql/06_update_view_articles_dedup_score_prefers_nlp.sql
 	@bash scripts/ch_run_sql.sh sql/09_actions_views.sql
 
 # Пересоздать DDL (часто используют как “очистить и создать заново”)
@@ -277,6 +295,7 @@ clean-sql:
 views:
 	@$(call banner,"Views")
 	@bash scripts/ch_run_sql.sh sql/00_views.sql
+	@bash scripts/ch_run_sql.sh sql/06_update_view_articles_dedup_score_prefers_nlp.sql
 	@bash scripts/ch_run_sql.sh sql/09_actions_views.sql
 
 # Healthchecks SQL

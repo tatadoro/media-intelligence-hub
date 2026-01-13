@@ -381,7 +381,14 @@ def add_persons_actions_columns(df: pd.DataFrame) -> pd.DataFrame:
         text_s = out.get("raw_text", pd.Series([""] * len(out), index=out.index))
 
     text_s = text_s.fillna("").astype(str)
-    persons_s = out.get("persons", pd.Series([""] * len(out), index=out.index)).fillna("").astype(str)
+    if "persons" in out.columns:
+        persons_s = out["persons"]
+    elif "entities_persons" in out.columns:
+        persons_s = out["entities_persons"]
+    else:
+        persons_s = pd.Series([""] * len(out), index=out.index)
+
+    persons_s = persons_s.fillna("").astype(str)
 
     persons_actions_out: List[str] = []
     actions_verbs_out: List[str] = []

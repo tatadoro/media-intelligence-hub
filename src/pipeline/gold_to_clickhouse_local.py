@@ -66,6 +66,15 @@ def parquet_columns(path: Path) -> set[str]:
     return set(pf.schema_arrow.names)
 
 
+def parquet_num_rows(path: Path) -> int:
+    """Быстрое количество строк в parquet без чтения таблицы целиком."""
+    pf = pq.ParquetFile(str(path))
+    md = pf.metadata
+    if md is None:
+        return pf.read().num_rows
+    return int(md.num_rows)
+
+
 def build_insert_columns(args: argparse.Namespace, parquet_path: Path) -> list[str]:
     tbl_cols = ch_table_columns(args)
     pq_cols = parquet_columns(parquet_path)
@@ -222,7 +231,10 @@ def _cleanup_temp(paths: list[Path]) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Загрузка gold Parquet в ClickHouse (локально) с batch_id + авто-колонками."
+        description=(
+            "Загрузка gold Parquet в ClickHouse (локально) с batch_id + авто-колонками. "
+            "После успешной загрузки пишет запись в media_intel.load_log (можно отключить флагом)."
+        )
     )
     p.add_argument("--input", required=True, help="Путь к gold parquet")
     p.add_argument("--batch-id", default="", help="batch_id (будет принудительно проставлен в parquet при загрузке)")
@@ -233,6 +245,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--port", type=int, default=int(os.getenv("CH_PORT_DOCKER", "8123")))
     p.add_argument("--user", default=os.getenv("CH_USER", "admin"))
     p.add_argument("--password", default=os.getenv("CH_PASSWORD", "admin12345"))
+    p.add_argument(
+        "--no-load-log",
+        action="store_true",
+        help="Не писать запись в таблицу load_log после загрузки parquet",
+    )
     return p.parse_args()
 
 
@@ -286,6 +303,21 @@ def main() -> None:
     print(f"[INFO] Загружаем {load_path2} -> {args.database}.{args.table}")
     with load_path2.open("rb") as f:
         subprocess.run(cmd, check=True, stdin=f)
+
+    # 4.1) Автоматически пишем запись в load_log, чтобы articles_dedup мог предпочитать "последний" батч
+    # Важно: object_name должен совпадать с ingest_object_name, который мы проставили в parquet.
+    if not getattr(args, "no_load_log", False):
+        try:
+            rows_loaded = parquet_num_rows(load_path2)
+            obj_esc = _sql_escape(object_name)
+            log_q = (
+                f"INSERT INTO {args.database}.load_log (layer, object_name, loaded_at, rows_loaded) "
+                f"VALUES ('gold', '{obj_esc}', now(), {rows_loaded})"
+            )
+            ch_query(args, log_q)
+            print(f"[INFO] load_log: записали layer=gold object_name={object_name} rows_loaded={rows_loaded}")
+        except Exception as e:
+            print(f"[WARN] Не смогли записать load_log после загрузки parquet: {e}")
 
     # 5) cleanup
     if temp_paths:
