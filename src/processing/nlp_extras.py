@@ -11,11 +11,26 @@ Adds columns:
 from __future__ import annotations
 
 import pandas as pd
+from typing import Any
 
 from src.processing.language import detect_lang
 from src.processing.keyphrases import extract_keyphrases, keyphrases_to_str
 from src.processing.sentiment import analyze_sentiment
 
+def _safe_text(x: Any) -> str:
+    # важно: NaN/None -> ""
+    if x is None:
+        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    s = str(x)
+    # str(nan) -> "nan" (плохой кейс) — считаем пустым
+    if s.strip().lower() == "nan":
+        return ""
+    return s 
 
 def add_lang_keyphrases_sentiment(
     df: pd.DataFrame,
@@ -58,10 +73,15 @@ def add_lang_keyphrases_sentiment(
     # 3) sentiment (faster/cleaner by summary; fallback to text if summary empty)
     s_labels = []
     s_scores = []
-    for s, t in zip(summary.tolist(), text.tolist()):
+
+    for _, row in out.iterrows():
+        s = _safe_text(row.get("summary"))
+        t = _safe_text(row.get("nlp_text")) or _safe_text(row.get("clean_text"))
+
         sent = analyze_sentiment(s if s.strip() else t)
         s_labels.append(sent.label)
-        s_scores.append(sent.score)
+        s_scores.append(float(sent.score))
+
     out["sentiment_label"] = s_labels
     out["sentiment_score"] = s_scores
 
