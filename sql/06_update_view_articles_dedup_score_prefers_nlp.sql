@@ -1,43 +1,8 @@
+/* sql/06_update_view_articles_dedup_score_prefers_nlp.sql */
+
 DROP VIEW IF EXISTS media_intel.articles_dedup;
 
-CREATE VIEW media_intel.articles_dedup
-(
-    `dedup_key` String,
-    `id` String,
-    `title` String,
-    `link` String,
-    `published_at` DateTime64(9, 'Europe/Moscow'),
-    `source` String,
-    `raw_text` String,
-    `clean_text` String,
-    `nlp_text` String,
-    `summary` String,
-    `keywords` String,
-
-    `lang` LowCardinality(String),
-    `keyphrases` String,
-    `sentiment_label` LowCardinality(String),
-    `sentiment_score` Float32,
-
-    `text_length_chars` Int64,
-    `num_sentences` Int64,
-    `num_keywords` Int64,
-    `batch_id` String,
-    `is_digest` UInt8,
-
-    `persons_actions` String,
-    `actions_verbs` String,
-
-    `entities_persons` String,
-    `entities_orgs` String,
-    `entities_geo` String,
-    `num_persons` UInt16,
-    `num_orgs` UInt16,
-    `num_geo` UInt16,
-    `ingest_object_name` String,
-    `best_clean_len` UInt64
-)
-AS
+CREATE VIEW media_intel.articles_dedup AS
 SELECT
     dedup_key,
     argMax(id, score) AS id,
@@ -50,22 +15,19 @@ SELECT
     argMax(nlp_text, score) AS nlp_text,
     argMax(summary, score) AS summary,
     argMax(keywords, score) AS keywords,
-
     argMax(lang, score) AS lang,
     argMax(keyphrases, score) AS keyphrases,
     argMax(sentiment_label, score) AS sentiment_label,
     argMax(sentiment_score, score) AS sentiment_score,
-
     argMax(text_length_chars, score) AS text_length_chars,
     argMax(num_sentences, score) AS num_sentences,
     argMax(num_keywords, score) AS num_keywords,
     argMax(batch_id, score) AS batch_id,
     argMax(is_digest, score) AS is_digest,
-
     argMax(persons_actions, score) AS persons_actions,
     argMax(actions_verbs, score) AS actions_verbs,
-
     argMax(entities_persons, score) AS entities_persons,
+    argMax(entities_persons_canon, score) AS entities_persons_canon,
     argMax(entities_orgs, score) AS entities_orgs,
     argMax(entities_geo, score) AS entities_geo,
     argMax(num_persons, score) AS num_persons,
@@ -75,43 +37,51 @@ SELECT
     argMax(clean_len, score) AS best_clean_len
 FROM
 (
-    WITH (
-        SELECT max(loaded_at)
-        FROM media_intel.load_log
-        WHERE layer = 'gold'
-    ) AS max_loaded
     SELECT
         a.*,
         if(empty(a.link), a.id, a.link) AS dedup_key,
         lengthUTF8(coalesce(a.clean_text, '')) AS clean_len,
+
         toUInt8(clean_len >= 40) AS has_body,
 
-        -- NEW: prefer rows where NLP extras are present
+        /* есть ли “что-то” NLP, кроме голого текста */
         toUInt8(
             (a.lang != 'unknown')
-            OR (notEmpty(coalesce(a.keyphrases, '')))
+            OR notEmpty(coalesce(a.keyphrases, ''))
             OR (a.sentiment_label != 'neu')
             OR (coalesce(a.sentiment_score, 0) != 0)
         ) AS has_nlp_extras,
+
+        /* важно: канон персон */
+        toUInt8(notEmpty(coalesce(a.entities_persons_canon, ''))) AS has_persons_canon,
+
+        /* важно: sentiment */
+        toUInt8((a.sentiment_label != 'neu') OR (coalesce(a.sentiment_score, 0) != 0)) AS has_sentiment,
+
+        /* важно: actions */
         toUInt8(
             notEmpty(coalesce(a.persons_actions, ''))
             OR notEmpty(coalesce(a.actions_verbs, ''))
         ) AS has_actions,
-        coalesce(ll.loaded_at, toDateTime64('1970-01-01 00:00:00', 9, 'Europe/Moscow')) AS loaded_at,
-        toUInt8(coalesce(ll.loaded_at, toDateTime('1970-01-01 00:00:00')) = max_loaded) AS batch_priority,
 
-        -- UPDATED score: has_nlp_extras goes BEFORE batch_priority
-        (has_body, clean_len, has_nlp_extras,  has_actions, batch_priority, a.published_at, loaded_at) AS score
+        /* тай-брейкер по “времени загрузки” из batch_id */
+        if(
+            startsWith(a.batch_id, '20'),
+            parseDateTimeBestEffortOrZero(a.batch_id),
+            parseDateTimeBestEffortOrZero(extract(a.batch_id, '(\\d{8}T\\d{6}Z)'))
+        ) AS loaded_at,
+
+        /* score: чем левее — тем важнее */
+        (
+          has_body,
+          clean_len,
+          has_nlp_extras,
+          has_persons_canon,
+          has_sentiment,
+          has_actions,
+          loaded_at,
+          a.published_at
+        ) AS score
     FROM media_intel.articles AS a
-    LEFT JOIN
-    (
-        SELECT
-            object_name,
-            max(loaded_at) AS loaded_at
-        FROM media_intel.load_log
-        WHERE layer = 'gold'
-        GROUP BY object_name
-    ) AS ll
-        ON a.ingest_object_name = ll.object_name
 ) AS t
 GROUP BY dedup_key;
