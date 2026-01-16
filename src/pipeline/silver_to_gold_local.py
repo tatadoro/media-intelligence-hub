@@ -11,8 +11,8 @@ from typing import DefaultDict, Dict, List, Tuple
 
 import pandas as pd
 
-from src.processing.summarization import enrich_articles_with_summary_and_keywords
 from src.processing.nlp_extras import add_lang_keyphrases_sentiment
+from src.processing.summarization import enrich_articles_with_summary_and_keywords
 
 CH_TZ = "Europe/Moscow"
 MIN_PUBLISHED_AT_UTC = pd.Timestamp("2000-01-01", tz="UTC")
@@ -81,6 +81,28 @@ def _clean_entity_text(s: str) -> str:
     return s.strip()
 
 
+def _lemma_surname_nomn(token: str) -> str:
+    """
+    Приводим фамилию к именительному падежу (nomn), если можем.
+    Если не получилось — fallback на normal_form.
+    """
+    t = (token or "").strip().lower().replace("ё", "е")
+    if not t:
+        return ""
+    if not _MORPH_AVAILABLE or _morph_analyzer is None:
+        return t
+
+    parses = _morph_analyzer.parse(t)
+    if not parses:
+        return t
+
+    best = parses[0]
+    inf = best.inflect({"nomn"})
+    if inf is not None and inf.word:
+        return inf.word
+    return best.normal_form
+
+
 def _lemmatize_phrase(s: str) -> str:
     """
     Лемматизация фразы для схлопывания падежей.
@@ -108,10 +130,12 @@ def _lemmatize_phrase(s: str) -> str:
             lemmas.append(_lemma_surname_nomn(t))
             continue
 
-        p = _morph_analyzer.parse(t)
+        p = _morph_analyzer.parse(t) if _morph_analyzer is not None else []
         lemmas.append(p[0].normal_form if p else t)
 
     return " ".join(lemmas).strip()
+
+
 def _normalize_lastname_form(last: str, all_last_forms: set[str]) -> str:
     """
     Практичная эвристика:
@@ -129,26 +153,7 @@ def _normalize_lastname_form(last: str, all_last_forms: set[str]) -> str:
         return l[:-1]
 
     return l
-def _lemma_surname_nomn(token: str) -> str:
-    """
-    Приводим фамилию к именительному падежу (nomn), если можем.
-    Если не получилось — fallback на normal_form.
-    """
-    t = (token or "").strip().lower().replace("ё", "е")
-    if not t:
-        return ""
-    if not _MORPH_AVAILABLE or _morph_analyzer is None:
-        return t
 
-    parses = _morph_analyzer.parse(t)
-    if not parses:
-        return t
-
-    best = parses[0]
-    inf = best.inflect({"nomn"})
-    if inf is not None and inf.word:
-        return inf.word
-    return best.normal_form
 
 def _canonicalize_geo(geo_mentions: List[str]) -> List[str]:
     out: List[str] = []
@@ -260,18 +265,15 @@ def add_persons_geo_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     # 2) Глобальная мапа фамилия -> самое частотное полное имя (>=2 токена)
     by_last: DefaultDict[str, Counter] = defaultdict(Counter)
-
     for plist in persons_lists:
         for p in plist:
             parts = p.split()
-        if len(parts) >= 2:
-            last = parts[-1].strip().lower()
-            if last:
-                by_last[last][p] += 1
+            if len(parts) >= 2:
+                last = parts[-1].strip().lower()
+                if last:
+                    by_last[last][p] += 1
 
-    best_full_by_last: Dict[str, str] = {
-    last: cnt.most_common(1)[0][0] for last, cnt in by_last.items()
-    }
+    best_full_by_last: Dict[str, str] = {last: cnt.most_common(1)[0][0] for last, cnt in by_last.items()}
 
     persons_out: List[str] = []
     geo_out: List[str] = []
@@ -364,16 +366,6 @@ def add_entities_persons_canon_column(df: pd.DataFrame) -> pd.DataFrame:
     out["entities_persons_canon"] = canon_out
     return out
 
-def _lastname_to_normal_form(last: str) -> str:
-    last = (last or "").strip().lower().replace("ё", "е")
-    if not last:
-        return ""
-    if not _MORPH_AVAILABLE or _morph_analyzer is None:
-        return last
-    p = _morph_analyzer.parse(last)
-    if not p:
-        return last
-    return (p[0].normal_form or last).strip()
 
 def _split_sentences(text: str) -> List[str]:
     t = (text or "").strip()
@@ -407,12 +399,33 @@ def _extract_verbs_from_tokens(tokens: List[str], stop_verbs: set[str]) -> List[
     return out
 
 
+def _surname_variants_for_matching(last: str) -> List[str]:
+    """
+    Для матчинга в тексте добавляем простые русские падежные варианты фамилии:
+    X -> X, Xа, Xя (чтобы 'кобылаш' матчился на 'кобылаша').
+    Это именно ДЛЯ ПОИСКА в тексте, ключ персоны остаётся каноническим.
+    """
+    l = (last or "").strip().lower().replace("ё", "е")
+    if not l:
+        return []
+    variants = [l]
+
+    # если уже оканчивается на 'а/я' — оставим как есть
+    if not l.endswith(("а", "я")):
+        variants.append(l + "а")
+        variants.append(l + "я")
+
+    return _uniq_keep_order([v for v in variants if v])
+
+
 def _compile_person_patterns(persons: List[str]) -> Dict[str, List[re.Pattern[str]]]:
     """
     Компилирует паттерны для матчинга персон в тексте:
     - полное имя
-    - фамилия (если есть >= 2 токена)
-    Матчинг по границам слова: (?<!\\w) ... (?!\\w).
+    - фамилия (если есть >= 2 токена) + простые падежные варианты фамилии
+
+    Важно: ключ в словаре — ВСЕГДА полное имя p0 (канон),
+    фамилия/падежи — только варианты для поиска.
     """
     out: Dict[str, List[re.Pattern[str]]] = {}
     for p in persons:
@@ -421,9 +434,11 @@ def _compile_person_patterns(persons: List[str]) -> Dict[str, List[re.Pattern[st
             continue
 
         parts = p0.split()
-        variants = [p0]
+        variants: List[str] = [p0]
+
         if len(parts) >= 2:
-            variants.append(parts[-1])
+            last = parts[-1]
+            variants.extend(_surname_variants_for_matching(last))
 
         pats: List[re.Pattern[str]] = []
         for v in dict.fromkeys(variants):
@@ -434,6 +449,7 @@ def _compile_person_patterns(persons: List[str]) -> Dict[str, List[re.Pattern[st
 
         if pats:
             out[p0] = pats
+
     return out
 
 
@@ -451,6 +467,7 @@ def _extract_actions_for_persons(text: str, persons: List[str]) -> Dict[str, Lis
         if p0:
             persons_norm.append(p0)
 
+    persons_norm = _uniq_keep_order(persons_norm)
     if not persons_norm:
         return {}
 
@@ -479,6 +496,44 @@ def _extract_actions_for_persons(text: str, persons: List[str]) -> Dict[str, Lis
     return {p: v for p, v in res.items() if v}
 
 
+def _drop_oneword_surnames_if_full_present(persons: List[str]) -> List[str]:
+    """
+    Удаляет однословные упоминания фамилии, если в списке уже есть полное имя (>=2 токена)
+    с этой фамилией. Работает с простыми падежными вариантами типа "кобылаш/кобылаша".
+    """
+    persons = _uniq_keep_order([p.strip() for p in persons if p and p.strip()])
+    full = [p for p in persons if len(p.split()) >= 2]
+    if not full:
+        return persons
+
+    def _base_last(x: str) -> str:
+        x = (x or "").strip().lower().replace("ё", "е")
+        if x.endswith(("а", "я")) and len(x) > 2:
+            return x[:-1]
+        return x
+
+    full_last_bases = set()
+    for p in full:
+        last = p.split()[-1]
+        full_last_bases.add(_base_last(last))
+        full_last_bases.add(last)
+
+    out: List[str] = []
+    for p in persons:
+        parts = p.split()
+        if len(parts) >= 2:
+            out.append(p)
+            continue
+
+        one = parts[0]
+        if _base_last(one) in full_last_bases or one in full_last_bases:
+            continue
+
+        out.append(p)
+
+    return _uniq_keep_order(out)
+
+
 def add_persons_actions_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Добавляет:
@@ -494,6 +549,7 @@ def add_persons_actions_columns(df: pd.DataFrame) -> pd.DataFrame:
         out["actions_verbs"] = pd.Series(dtype="string")
         return out
 
+    # текст для анализа
     if "nlp_text" in out.columns:
         text_s = out["nlp_text"]
     elif "clean_text" in out.columns:
@@ -503,7 +559,13 @@ def add_persons_actions_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     text_s = text_s.fillna("").astype(str)
 
-    if "persons" in out.columns:
+    # persons source priority:
+    # 1) entities_persons_canon (лучше: уже склеено и меньше дублей)
+    # 2) persons (эвристики пайплайна)
+    # 3) entities_persons (сырые из NER)
+    if "entities_persons_canon" in out.columns:
+        persons_s = out["entities_persons_canon"]
+    elif "persons" in out.columns:
         persons_s = out["persons"]
     elif "entities_persons" in out.columns:
         persons_s = out["entities_persons"]
@@ -517,10 +579,13 @@ def add_persons_actions_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     for t, persons_str in zip(text_s.tolist(), persons_s.tolist()):
         persons = [p.strip() for p in persons_str.split(";") if p.strip()]
+        persons = _drop_oneword_surnames_if_full_present(persons)
+
         m = _extract_actions_for_persons(t, persons)
 
         parts: List[str] = []
         flat: List[str] = []
+
         for person in sorted(m.keys()):
             cnt = Counter(m[person])
             top = [v for v, _ in cnt.most_common(10)]
@@ -621,10 +686,26 @@ def ensure_id_column(df: pd.DataFrame) -> pd.DataFrame:
     if (id_s != "").all():
         return out
 
-    uid_s = out["uid"].fillna("").astype(str).str.strip() if "uid" in out.columns else pd.Series([""] * len(out), index=out.index)
-    link_s = out["link"].fillna("").astype(str).str.strip() if "link" in out.columns else pd.Series([""] * len(out), index=out.index)
-    src_s = out["source"].fillna("").astype(str).str.strip() if "source" in out.columns else pd.Series([""] * len(out), index=out.index)
-    ttl_s = out["title"].fillna("").astype(str).str.strip() if "title" in out.columns else pd.Series([""] * len(out), index=out.index)
+    uid_s = (
+        out["uid"].fillna("").astype(str).str.strip()
+        if "uid" in out.columns
+        else pd.Series([""] * len(out), index=out.index)
+    )
+    link_s = (
+        out["link"].fillna("").astype(str).str.strip()
+        if "link" in out.columns
+        else pd.Series([""] * len(out), index=out.index)
+    )
+    src_s = (
+        out["source"].fillna("").astype(str).str.strip()
+        if "source" in out.columns
+        else pd.Series([""] * len(out), index=out.index)
+    )
+    ttl_s = (
+        out["title"].fillna("").astype(str).str.strip()
+        if "title" in out.columns
+        else pd.Series([""] * len(out), index=out.index)
+    )
     pub_s = out["published_at"].astype(str) if "published_at" in out.columns else pd.Series([""] * len(out), index=out.index)
 
     def md5_hex(s: str) -> str:
@@ -803,16 +884,23 @@ def main() -> None:
         alias = os.getenv("MINIO_ALIAS", "local")
 
         if not minio_access_key or not minio_secret_key:
-            raise ValueError("Не заданы MINIO_ACCESS_KEY/MINIO_SECRET_KEY. Заполни .env (см. .env.example) и повтори.")
+            raise ValueError(
+                "Не заданы MINIO_ACCESS_KEY/MINIO_SECRET_KEY. Заполни .env (см. .env.example) и повтори."
+            )
 
         try:
             subprocess.run(["mc", "--version"], check=True, capture_output=True, text=True)
         except FileNotFoundError as e:
             raise FileNotFoundError("Команда 'mc' не найдена. Установи MinIO Client (mc) и повтори.") from e
 
-        out = subprocess.run(["mc", "alias", "list"], check=True, capture_output=True, text=True).stdout
-        if f"{alias} " not in out and f"{alias}\t" not in out:
-            subprocess.run(["mc", "alias", "set", alias, minio_endpoint, minio_access_key, minio_secret_key], check=True, capture_output=True, text=True)
+        out_aliases = subprocess.run(["mc", "alias", "list"], check=True, capture_output=True, text=True).stdout
+        if f"{alias} " not in out_aliases and f"{alias}\t" not in out_aliases:
+            subprocess.run(
+                ["mc", "alias", "set", alias, minio_endpoint, minio_access_key, minio_secret_key],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
 
         dst = f"{alias}/{bucket}/gold/{output_path.name}"
         print(f"[INFO] Загружаем gold в MinIO: {dst}")
