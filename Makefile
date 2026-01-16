@@ -27,7 +27,7 @@ export
         tg-load tg-etl \
         superset-up superset-down superset-stop superset-ps superset-logs \
         superset-backup superset-backup-list superset-restore \
-        etl-latest-rss etl-latest-tg etl-latest-all
+        etl-latest-rss etl-latest-tg etl-latest-all tg-etl-refresh
 
 # ------------------------------------------------------------
 # Настройки Python/путей по умолчанию
@@ -50,6 +50,16 @@ etl-latest-rss:
 
 etl-latest-tg:
 	@$(MAKE) tg-etl
+
+tg-etl-refresh:
+	@set -e; \
+	BATCH_ID="$${BATCH_ID:-$$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; \
+	echo "[INFO] Telegram ETL + refresh. BATCH_ID=$$BATCH_ID"; \
+	BATCH_ID="$$BATCH_ID" $(MAKE) tg-raw; \
+	BATCH_ID="$$BATCH_ID" $(MAKE) tg-silver; \
+	BATCH_ID="$$BATCH_ID" $(MAKE) tg-gold; \
+	BATCH_ID="$$BATCH_ID" $(MAKE) tg-load; \
+	$(MAKE) refresh
 
 etl-latest-all: etl-latest-rss etl-latest-tg
 	@echo "============================================================"
@@ -297,6 +307,20 @@ views:
 	@bash scripts/ch_run_sql.sh sql/00_views.sql
 	@bash scripts/ch_run_sql.sh sql/06_update_view_articles_dedup_score_prefers_nlp.sql
 	@bash scripts/ch_run_sql.sh sql/09_actions_views.sql
+
+
+# --- Витрины должны выполняться только при валидном окружении ---
+views: env-ensure env-check
+	@$(PYTHON) -m src.cli.ch_sql --file sql/00_views.sql
+	@$(PYTHON) -m src.cli.ch_sql --file sql/06_update_view_articles_dedup_score_prefers_nlp.sql
+	@$(PYTHON) -m src.cli.ch_sql --file sql/09_actions_views.sql
+
+hour: env-ensure env-check
+	@$(PYTHON) -m src.cli.ch_sql --file sql/04_by_hour.sql
+
+.PHONY: refresh
+refresh: views hour
+	@echo "[INFO] refreshed: views + hourly aggregates"
 
 # Healthchecks SQL
 health:
