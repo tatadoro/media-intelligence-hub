@@ -83,10 +83,8 @@ def _clean_entity_text(s: str) -> str:
 
 def _lemmatize_phrase(s: str) -> str:
     """
-    Лемматизация фразы для схлопывания падежей:
-    'москве' -> 'москва', 'владимира зеленского' -> 'владимир зеленский'.
-
-    Если pymorphy2 недоступен, возвращаем очищенный текст без лемматизации.
+    Лемматизация фразы для схлопывания падежей.
+    Для ФИО: последний токен (фамилия) стараемся привести к именительному падежу (nomn).
     """
     s = _clean_entity_text(s)
     if not s:
@@ -96,16 +94,61 @@ def _lemmatize_phrase(s: str) -> str:
         return s
 
     tokens = [t for t in re.split(r"[^\w-]+", s) if t]
+    if not tokens:
+        return ""
+
     lemmas: List[str] = []
-    for t in tokens:
-        # аббревиатуры оставляем как есть (в нижний регистр уже привели)
+    for i, t in enumerate(tokens):
         if t in {"сша", "рф", "ес"}:
             lemmas.append(t)
             continue
+
+        # если это последняя часть фразы из 2+ слов — считаем, что это фамилия
+        if len(tokens) >= 2 and i == len(tokens) - 1:
+            lemmas.append(_lemma_surname_nomn(t))
+            continue
+
         p = _morph_analyzer.parse(t)
         lemmas.append(p[0].normal_form if p else t)
-    return " ".join(lemmas).strip()
 
+    return " ".join(lemmas).strip()
+def _normalize_lastname_form(last: str, all_last_forms: set[str]) -> str:
+    """
+    Практичная эвристика:
+    если встречаются формы X и Xа (или X и Xя), то canonical = X.
+    Это чинит "кобылаша" -> "кобылаш" при наличии "кобылаш" в исходных сущностях.
+    """
+    l = (last or "").strip().lower().replace("ё", "е")
+    if not l:
+        return ""
+
+    # генитив мужских фамилий часто добавляет "а/я"
+    if l.endswith("а") and l[:-1] in all_last_forms:
+        return l[:-1]
+    if l.endswith("я") and l[:-1] in all_last_forms:
+        return l[:-1]
+
+    return l
+def _lemma_surname_nomn(token: str) -> str:
+    """
+    Приводим фамилию к именительному падежу (nomn), если можем.
+    Если не получилось — fallback на normal_form.
+    """
+    t = (token or "").strip().lower().replace("ё", "е")
+    if not t:
+        return ""
+    if not _MORPH_AVAILABLE or _morph_analyzer is None:
+        return t
+
+    parses = _morph_analyzer.parse(t)
+    if not parses:
+        return t
+
+    best = parses[0]
+    inf = best.inflect({"nomn"})
+    if inf is not None and inf.word:
+        return inf.word
+    return best.normal_form
 
 def _canonicalize_geo(geo_mentions: List[str]) -> List[str]:
     out: List[str] = []
@@ -157,7 +200,6 @@ def extract_persons_geo_lists(text: str) -> Tuple[List[str], List[str]]:
         if not raw:
             continue
 
-        # лемматизация/чистка всегда через нашу функцию
         val = _lemmatize_phrase(raw)
         if not val:
             continue
@@ -190,13 +232,9 @@ def add_persons_geo_columns(df: pd.DataFrame) -> pd.DataFrame:
     1) извлечь списки персон по каждой строке (лемматизация, чистка)
     2) собрать глобальную мапу: фамилия -> самое частотное полное имя (>=2 токена)
     3) заменить однословные упоминания (трамп) на полные (дональд трамп), если есть
-
-    Это решает проблему, когда в конкретной статье встречается только "трамп/трампа",
-    а "дональд трамп" встречается в другой статье в рамках того же батча.
     """
     out = df.copy()
 
-    # гарантируем колонки даже для пустого датафрейма
     if out.empty:
         if "persons" not in out.columns:
             out["persons"] = pd.Series(dtype="string")
@@ -213,7 +251,6 @@ def add_persons_geo_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     text_s = text_s.fillna("").astype(str)
 
-    # PASS 1: извлекаем списки сущностей
     persons_lists: List[List[str]] = []
     geo_lists: List[List[str]] = []
     for t in text_s.tolist():
@@ -221,18 +258,21 @@ def add_persons_geo_columns(df: pd.DataFrame) -> pd.DataFrame:
         persons_lists.append(p_list)
         geo_lists.append(g_list)
 
-    # строим глобальную мапу фамилия -> самое частотное полное имя
+    # 2) Глобальная мапа фамилия -> самое частотное полное имя (>=2 токена)
     by_last: DefaultDict[str, Counter] = defaultdict(Counter)
+
     for plist in persons_lists:
         for p in plist:
             parts = p.split()
-            if len(parts) >= 2:
-                last = parts[-1]
+        if len(parts) >= 2:
+            last = parts[-1].strip().lower()
+            if last:
                 by_last[last][p] += 1
 
-    best_full_by_last: Dict[str, str] = {last: cnt.most_common(1)[0][0] for last, cnt in by_last.items()}
+    best_full_by_last: Dict[str, str] = {
+    last: cnt.most_common(1)[0][0] for last, cnt in by_last.items()
+    }
 
-    # PASS 2: маппим однословные упоминания на полные
     persons_out: List[str] = []
     geo_out: List[str] = []
 
@@ -252,6 +292,88 @@ def add_persons_geo_columns(df: pd.DataFrame) -> pd.DataFrame:
     out["geo"] = geo_out
     return out
 
+
+def add_entities_persons_canon_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    canonical для entities_persons:
+    - для набора возможных фамилий используем raw-формы (без морфологии),
+      чтобы не потерять "кобылаш" (если морфология превращает в "кобылаша")
+    - затем: лемматизация/чистка + склейка фамилия->ФИО + эвристика X vs Xа/Xя
+    """
+    out = df.copy()
+
+    if out.empty:
+        if "entities_persons_canon" not in out.columns:
+            out["entities_persons_canon"] = pd.Series(dtype="string")
+        return out
+
+    src_col = "entities_persons" if "entities_persons" in out.columns else ("persons" if "persons" in out.columns else None)
+    if src_col is None:
+        out["entities_persons_canon"] = ""
+        return out
+
+    src_s = out[src_col].fillna("").astype(str)
+
+    # PASS 0: соберём raw формы фамилий БЕЗ морфологии (это важно)
+    all_last_forms_raw: set[str] = set()
+    raw_lists: List[List[str]] = []
+    for s in src_s.tolist():
+        items_raw = [x.strip() for x in s.split(";") if x.strip()]
+        items_raw = [_clean_entity_text(x) for x in items_raw]
+        items_raw = [x for x in items_raw if x]
+        raw_lists.append(items_raw)
+        for ent in items_raw:
+            parts = ent.split()
+            if parts:
+                all_last_forms_raw.add(parts[-1])
+
+    # PASS 1: лемматизация/чистка -> списки (для дальнейшей склейки)
+    persons_lists: List[List[str]] = []
+    for items_raw in raw_lists:
+        items = [_lemmatize_phrase(x) for x in items_raw]
+        items = [x for x in items if x]
+        persons_lists.append(_uniq_keep_order(items))
+
+    # строим глобальную мапу фамилия -> самое частотное полное имя (>=2 токена)
+    by_last: DefaultDict[str, Counter] = defaultdict(Counter)
+    for plist in persons_lists:
+        for p in plist:
+            parts = p.split()
+            if len(parts) >= 2:
+                last_norm = _normalize_lastname_form(parts[-1], all_last_forms_raw)
+                full = " ".join(parts[:-1] + [last_norm]).strip()
+                by_last[last_norm][full] += 1
+
+    best_full_by_last: Dict[str, str] = {last: cnt.most_common(1)[0][0] for last, cnt in by_last.items()}
+
+    # PASS 2: нормализуем фамилии и маппим однословные на ФИО
+    canon_out: List[str] = []
+    for plist in persons_lists:
+        mapped: List[str] = []
+        for p in plist:
+            parts = p.split()
+            if len(parts) == 1:
+                last_norm = _normalize_lastname_form(parts[0], all_last_forms_raw)
+                mapped.append(best_full_by_last.get(last_norm, last_norm))
+            else:
+                last_norm = _normalize_lastname_form(parts[-1], all_last_forms_raw)
+                mapped.append(" ".join(parts[:-1] + [last_norm]).strip())
+
+        canon_out.append(";".join(_uniq_keep_order(mapped)))
+
+    out["entities_persons_canon"] = canon_out
+    return out
+
+def _lastname_to_normal_form(last: str) -> str:
+    last = (last or "").strip().lower().replace("ё", "е")
+    if not last:
+        return ""
+    if not _MORPH_AVAILABLE or _morph_analyzer is None:
+        return last
+    p = _morph_analyzer.parse(last)
+    if not p:
+        return last
+    return (p[0].normal_form or last).strip()
 
 def _split_sentences(text: str) -> List[str]:
     t = (text or "").strip()
@@ -290,7 +412,7 @@ def _compile_person_patterns(persons: List[str]) -> Dict[str, List[re.Pattern[st
     Компилирует паттерны для матчинга персон в тексте:
     - полное имя
     - фамилия (если есть >= 2 токена)
-    Матчинг по границам слова: (?<!\\w) ... (?!\\w) вместо простого 'in'.
+    Матчинг по границам слова: (?<!\\w) ... (?!\\w).
     """
     out: Dict[str, List[re.Pattern[str]]] = {}
     for p in persons:
@@ -304,7 +426,6 @@ def _compile_person_patterns(persons: List[str]) -> Dict[str, List[re.Pattern[st
             variants.append(parts[-1])
 
         pats: List[re.Pattern[str]] = []
-        # uniq без изменения порядка
         for v in dict.fromkeys(variants):
             v = (v or "").strip()
             if not v:
@@ -381,6 +502,7 @@ def add_persons_actions_columns(df: pd.DataFrame) -> pd.DataFrame:
         text_s = out.get("raw_text", pd.Series([""] * len(out), index=out.index))
 
     text_s = text_s.fillna("").astype(str)
+
     if "persons" in out.columns:
         persons_s = out["persons"]
     elif "entities_persons" in out.columns:
@@ -397,7 +519,6 @@ def add_persons_actions_columns(df: pd.DataFrame) -> pd.DataFrame:
         persons = [p.strip() for p in persons_str.split(";") if p.strip()]
         m = _extract_actions_for_persons(t, persons)
 
-        # persons_actions: стабильный текстовый формат без JSON-зависимостей
         parts: List[str] = []
         flat: List[str] = []
         for person in sorted(m.keys()):
@@ -424,13 +545,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Преобразование silver -> gold: summary + keywords (TF-IDF) и выгрузка в MinIO (опционально)."
     )
-    parser.add_argument(
-        "-i",
-        "--input",
-        type=str,
-        required=True,
-        help="Путь к silver-файлу (json/jsonl/parquet/csv).",
-    )
+    parser.add_argument("-i", "--input", type=str, required=True, help="Путь к silver-файлу (json/jsonl/parquet/csv).")
     parser.add_argument(
         "-o",
         "--output",
@@ -452,10 +567,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def infer_output_path(input_path: Path) -> Path:
-    """
-    Если вход: data/silver/articles_20251210_155554_enriched_clean.json
-    Выход:     data/gold/articles_20251210_155554_enriched_clean_processed.parquet
-    """
     project_root = Path(__file__).resolve().parents[2]
     gold_dir = project_root / "data" / "gold"
     gold_dir.mkdir(parents=True, exist_ok=True)
@@ -477,17 +588,10 @@ def load_silver_df(input_path: Path) -> pd.DataFrame:
         return pd.read_json(input_path, lines=(suffix == ".jsonl"))
     if suffix == ".csv":
         return pd.read_csv(input_path)
-
     raise ValueError(f"Неподдерживаемый формат файла: {suffix}")
 
 
 def normalize_published_at(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Нормализуем published_at:
-    - парсим в datetime (в UTC)
-    - валидируем (не допускаем NaT и мусор < 2000)
-    - приводим к TZ Europe/Moscow и делаем tz-naive
-    """
     out = df.copy()
 
     if "published_at" not in out.columns:
@@ -502,28 +606,14 @@ def normalize_published_at(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _safe_col_series(df: pd.DataFrame, col: str) -> pd.Series:
-    """
-    Возвращает Series для колонки `col`.
-    Если колонки нет — возвращает пустые строки нужной длины.
-    """
     if col in df.columns:
         return df[col]
     return pd.Series([""] * len(df), index=df.index)
 
 
 def ensure_id_column(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Гарантирует колонку id для gold-контракта.
-
-    Приоритет:
-    1) если есть 'id' и он заполнен -> оставляем
-    2) если есть 'uid' (telegram) -> используем uid как id
-    3) иначе если есть 'link' -> id = md5(link)
-    4) иначе -> id = md5(source|title|published_at)
-    """
     out = df.copy()
 
-    # гарантируем базовые колонки
     if "id" not in out.columns:
         out["id"] = ""
 
@@ -531,53 +621,28 @@ def ensure_id_column(df: pd.DataFrame) -> pd.DataFrame:
     if (id_s != "").all():
         return out
 
-    uid_s = (
-        out["uid"].fillna("").astype(str).str.strip()
-        if "uid" in out.columns
-        else pd.Series([""] * len(out), index=out.index)
-    )
-    link_s = (
-        out["link"].fillna("").astype(str).str.strip()
-        if "link" in out.columns
-        else pd.Series([""] * len(out), index=out.index)
-    )
-    src_s = (
-        out["source"].fillna("").astype(str).str.strip()
-        if "source" in out.columns
-        else pd.Series([""] * len(out), index=out.index)
-    )
-    ttl_s = (
-        out["title"].fillna("").astype(str).str.strip()
-        if "title" in out.columns
-        else pd.Series([""] * len(out), index=out.index)
-    )
-    pub_s = (
-        out["published_at"].astype(str)
-        if "published_at" in out.columns
-        else pd.Series([""] * len(out), index=out.index)
-    )
+    uid_s = out["uid"].fillna("").astype(str).str.strip() if "uid" in out.columns else pd.Series([""] * len(out), index=out.index)
+    link_s = out["link"].fillna("").astype(str).str.strip() if "link" in out.columns else pd.Series([""] * len(out), index=out.index)
+    src_s = out["source"].fillna("").astype(str).str.strip() if "source" in out.columns else pd.Series([""] * len(out), index=out.index)
+    ttl_s = out["title"].fillna("").astype(str).str.strip() if "title" in out.columns else pd.Series([""] * len(out), index=out.index)
+    pub_s = out["published_at"].astype(str) if "published_at" in out.columns else pd.Series([""] * len(out), index=out.index)
 
     def md5_hex(s: str) -> str:
         return hashlib.md5(s.encode("utf-8")).hexdigest()
 
-    # где id пустой — заполняем
     mask = id_s == ""
 
-    # 1) uid -> id
     use_uid = mask & (uid_s != "")
     if use_uid.any():
         out.loc[use_uid, "id"] = uid_s[use_uid]
 
-    # обновим маску после uid
     id_s2 = out["id"].fillna("").astype(str).str.strip()
     mask2 = id_s2 == ""
 
-    # 2) link -> md5(link)
     use_link = mask2 & (link_s != "")
     if use_link.any():
         out.loc[use_link, "id"] = link_s[use_link].map(md5_hex)
 
-    # 3) fallback -> md5(source|title|published_at)
     id_s3 = out["id"].fillna("").astype(str).str.strip()
     mask3 = id_s3 == ""
     if mask3.any():
@@ -588,15 +653,6 @@ def ensure_id_column(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def dedup_batch_silver(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Dedup внутри одного файла/батча.
-    Ключ: (source + link) или (source + title + published_at) как fallback.
-
-    Выбираем лучшую запись по:
-    1) есть ли body/raw_text
-    2) длина clean_text
-    3) published_at (последняя)
-    """
     out = df.copy()
 
     def _dedup_key(row: pd.Series) -> str:
@@ -616,8 +672,6 @@ def dedup_batch_silver(df: pd.DataFrame) -> pd.DataFrame:
 
     out["clean_len"] = clean_text_s.str.len()
     out["has_body"] = (raw_text_s.str.len() > 0) | (body_s.str.len() > 0)
-
-    # для стабильного sort используем mergesort
     out["published_at_dt"] = pd.to_datetime(out.get("published_at"), errors="coerce")
 
     before = len(out)
@@ -635,13 +689,6 @@ def dedup_batch_silver(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def filter_low_quality_for_gold(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Отсекаем записи, которые не стоит отправлять в gold:
-    - явно помеченные как 'too_short' / 'parsed_empty' / etc. (если колонка body_status есть)
-    - с слишком коротким clean_text (страница/парсер вернули мало контента)
-
-    Функция безопасна: если body_status нет — фильтрация идёт только по длине clean_text.
-    """
     out = df.copy()
     before = len(out)
 
@@ -684,13 +731,13 @@ def main() -> None:
     # 1) нормализуем время
     df_silver = normalize_published_at(df_silver)
 
-    # 1.1) гарантируем id (важно для Telegram, где есть uid вместо id)
+    # 1.1) гарантируем id
     df_silver = ensure_id_column(df_silver)
 
     # 2) dedup внутри батча ДО обогащения
     df_silver = dedup_batch_silver(df_silver)
 
-    # 3) фильтрация низкокачественных записей (too_short/empty)
+    # 3) фильтрация низкокачественных записей
     df_silver = filter_low_quality_for_gold(df_silver)
 
     # output path
@@ -702,41 +749,44 @@ def main() -> None:
     else:
         output_path = infer_output_path(input_path)
 
-    # 4) если после фильтра пусто — не вызываем enrichment
     if df_silver.empty:
         print("[WARN] После фильтрации quality не осталось строк. Сохраняем пустой gold.")
         df_gold = df_silver.copy()
-        if "summary" not in df_gold.columns:
-            df_gold["summary"] = pd.Series(dtype="string")
-        if "keywords" not in df_gold.columns:
-            df_gold["keywords"] = pd.Series(dtype="object")
-        if "persons" not in df_gold.columns:
-            df_gold["persons"] = pd.Series(dtype="string")
-        if "geo" not in df_gold.columns:
-            df_gold["geo"] = pd.Series(dtype="string")
+
+        for col, dtype in [
+            ("summary", "string"),
+            ("keywords", "object"),
+            ("persons", "string"),
+            ("geo", "string"),
+            ("entities_persons_canon", "string"),
+            ("lang", "string"),
+            ("keyphrases", "string"),
+            ("sentiment_label", "string"),
+            ("sentiment_score", "float"),
+        ]:
+            if col not in df_gold.columns:
+                df_gold[col] = pd.Series(dtype=dtype)
+
         if args.with_actions:
             if "persons_actions" not in df_gold.columns:
                 df_gold["persons_actions"] = pd.Series(dtype="string")
             if "actions_verbs" not in df_gold.columns:
                 df_gold["actions_verbs"] = pd.Series(dtype="string")
-        if "lang" not in df_gold.columns:
-            df_gold["lang"] = pd.Series(dtype="string")
-        if "keyphrases" not in df_gold.columns:
-            df_gold["keyphrases"] = pd.Series(dtype="string")
-        if "sentiment_label" not in df_gold.columns:
-            df_gold["sentiment_label"] = pd.Series(dtype="string")
-        if "sentiment_score" not in df_gold.columns:
-            df_gold["sentiment_score"] = pd.Series(dtype="float")
     else:
-        
         df_gold = enrich_articles_with_summary_and_keywords(df_silver)
+
+        # NER persons/geo (внутренние колонки)
         df_gold = add_persons_geo_columns(df_gold)
+
+        # canonical именно для entities_persons (для BI/ClickHouse)
+        df_gold = add_entities_persons_canon_column(df_gold)
+
         if args.with_actions:
-             df_gold = add_persons_actions_columns(df_gold)
+            df_gold = add_persons_actions_columns(df_gold)
 
         df_gold = add_lang_keyphrases_sentiment(df_gold)
 
-        # 4.1) гарантируем id в gold перед валидацией/загрузкой
+        # гарантируем id в gold перед валидацией/загрузкой
         df_gold = ensure_id_column(df_gold)
 
     print(f"gold:  {output_path}")
@@ -753,9 +803,7 @@ def main() -> None:
         alias = os.getenv("MINIO_ALIAS", "local")
 
         if not minio_access_key or not minio_secret_key:
-            raise ValueError(
-                "Не заданы MINIO_ACCESS_KEY/MINIO_SECRET_KEY. Заполни .env (см. .env.example) и повтори."
-            )
+            raise ValueError("Не заданы MINIO_ACCESS_KEY/MINIO_SECRET_KEY. Заполни .env (см. .env.example) и повтори.")
 
         try:
             subprocess.run(["mc", "--version"], check=True, capture_output=True, text=True)
@@ -764,12 +812,7 @@ def main() -> None:
 
         out = subprocess.run(["mc", "alias", "list"], check=True, capture_output=True, text=True).stdout
         if f"{alias} " not in out and f"{alias}\t" not in out:
-            subprocess.run(
-                ["mc", "alias", "set", alias, minio_endpoint, minio_access_key, minio_secret_key],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+            subprocess.run(["mc", "alias", "set", alias, minio_endpoint, minio_access_key, minio_secret_key], check=True, capture_output=True, text=True)
 
         dst = f"{alias}/{bucket}/gold/{output_path.name}"
         print(f"[INFO] Загружаем gold в MinIO: {dst}")
