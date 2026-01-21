@@ -39,10 +39,25 @@ FROM
 (
     SELECT
         a.*,
-        if(empty(a.link), a.id, a.link) AS dedup_key,
+
+        /* ---- dedup_key ----
+           Telegram: source|published_at(ms)|hash(text) (id/link у тебя не уникальны)
+           Остальные источники: link (если есть) иначе id
+        */
+        if(
+            a.source ILIKE '%telegram%',
+            concat(
+                a.source, '|',
+                toString(toUnixTimestamp64Milli(a.published_at)), '|',
+                toString(cityHash64(coalesce(a.clean_text, a.raw_text, a.title)))
+            ),
+            if(empty(a.link), a.id, a.link)
+        ) AS dedup_key,
+
         lengthUTF8(coalesce(a.clean_text, '')) AS clean_len,
 
-        toUInt8(clean_len >= 40) AS has_body,
+        /* “есть тело” — синхронизируем с pipeline (min_len=400) */
+        toUInt8(clean_len >= 400) AS has_body,
 
         /* есть ли “что-то” NLP, кроме голого текста */
         toUInt8(
@@ -56,7 +71,10 @@ FROM
         toUInt8(notEmpty(coalesce(a.entities_persons_canon, ''))) AS has_persons_canon,
 
         /* важно: sentiment */
-        toUInt8((a.sentiment_label != 'neu') OR (coalesce(a.sentiment_score, 0) != 0)) AS has_sentiment,
+        toUInt8(
+            (a.sentiment_label != 'neu')
+            OR (coalesce(a.sentiment_score, 0) != 0)
+        ) AS has_sentiment,
 
         /* важно: actions */
         toUInt8(
@@ -73,15 +91,16 @@ FROM
 
         /* score: чем левее — тем важнее */
         (
-          has_body,
-          clean_len,
-          has_nlp_extras,
-          has_persons_canon,
-          has_sentiment,
-          has_actions,
-          loaded_at,
-          a.published_at
+            has_body,
+            clean_len,
+            has_nlp_extras,
+            has_persons_canon,
+            has_sentiment,
+            has_actions,
+            loaded_at,
+            a.published_at
         ) AS score
     FROM media_intel.articles AS a
 ) AS t
-GROUP BY dedup_key;
+GROUP BY dedup_key
+;

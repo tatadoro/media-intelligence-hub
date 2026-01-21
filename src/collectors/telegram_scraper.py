@@ -219,10 +219,14 @@ class RobustTelegramScraper:
             return ""
 
         import re
+
         # 20k — как ты уже тестировала, этого обычно достаточно
-        pat = rf'data-post="{re.escape(self.channel)}/{pid}".{{0,20000}}?<time[^>]*datetime="([^"]+)"'
+        pat = (
+            rf'data-post="{re.escape(self.channel)}/{pid}".{{0,20000}}?'
+            r'<time[^>]*datetime="([^"]+)"'
+        )
         m = re.search(pat, html, flags=re.I | re.S)
-        return (m.group(1) or "").strip() if m else ""    
+        return (m.group(1) or "").strip() if m else ""
 
     # -------------------- Driver setup & page load --------------------
 
@@ -536,13 +540,13 @@ class RobustTelegramScraper:
                         human_date = (t2.text or "").strip() or human_date
                     except Exception:
                         pass
+
             # --- RECOVERY: если datetime всё ещё пустой, достаём по HTTP из /s/ через ?before=post_id+1 ---
             if not datetime_str:
                 recovered = self._recover_datetime_http(post_id, post_url)
                 if recovered:
                     datetime_str = recovered
-                    # human_date можно не трогать, но можно синхронизировать:
-                    # human_date = human_date if human_date != "Неизвестно" else recovered
+
             views = "0"
             try:
                 v = element.find_element(By.CSS_SELECTOR, ".tgme_widget_message_views")
@@ -610,6 +614,22 @@ class RobustTelegramScraper:
 
         self._last_dom_count = len(self.get_posts_elements())
 
+        # --- NEW: альтернативный "прогресс" для случаев виртуализации DOM ---
+        def _min_numeric_post_id() -> Optional[int]:
+            numeric_ids = [
+                int(p.get("post_id"))
+                for p in (self.posts or [])
+                if str(p.get("post_id", "")).isdigit()
+            ]
+            return min(numeric_ids) if numeric_ids else None
+
+        prev_min_id = _min_numeric_post_id()
+        prev_url = ""
+        try:
+            prev_url = self.driver.current_url if self.driver else ""
+        except Exception:
+            prev_url = ""
+
         while attempts < max_attempts and failures < max_failures and len(self.posts) < self.target_posts:
             if not self.is_driver_alive():
                 print("Браузер недоступен — остановка")
@@ -650,7 +670,25 @@ class RobustTelegramScraper:
             self._scroll_more()
             grew = self._wait_for_dom_growth(timeout=25 if len(self.posts) < 100 else 15)
 
-            if new_count == 0 and not grew:
+            # --- NEW: прогресс не только через рост DOM ---
+            cur_min_id = _min_numeric_post_id()
+            try:
+                cur_url = self.driver.current_url if self.driver else ""
+            except Exception:
+                cur_url = ""
+
+            moved_to_older = (
+                (prev_min_id is None and cur_min_id is not None)
+                or (prev_min_id is not None and cur_min_id is not None and cur_min_id < prev_min_id)
+            )
+            url_changed = bool(cur_url and cur_url != prev_url)
+
+            if moved_to_older or url_changed:
+                failures = 0
+                prev_min_id = cur_min_id
+                prev_url = cur_url
+
+            if new_count == 0 and not grew and not moved_to_older and not url_changed:
                 failures += 1
                 print(f"Нет прогресса ({failures}/{max_failures}). Пробуем альтернативы.")
                 try:
@@ -660,8 +698,11 @@ class RobustTelegramScraper:
                 except Exception:
                     pass
 
-                if failures >= 3:
-                    numeric_ids = [int(p["post_id"]) for p in self.posts if str(p.get("post_id", "")).isdigit()]
+                # --- CHANGE: раньше пытаемся прыгать по before/after ---
+                if failures >= 2:
+                    numeric_ids = [
+                        int(p["post_id"]) for p in self.posts if str(p.get("post_id", "")).isdigit()
+                    ]
                     min_id = min(numeric_ids) if numeric_ids else None
 
                     if min_id is not None and min_id <= 5:
@@ -671,7 +712,15 @@ class RobustTelegramScraper:
 
                     if jumped:
                         failures = 0
+                        # зафиксируем новый URL как прогресс
+                        try:
+                            prev_url = self.driver.current_url if self.driver else prev_url
+                        except Exception:
+                            pass
+                        # min_id может измениться после jump
+                        prev_min_id = _min_numeric_post_id()
             else:
+                # если был хоть какой-то признак движения — сбрасываем failures
                 failures = 0
 
             time.sleep(1.2 if len(self.posts) >= 100 else 2.0)

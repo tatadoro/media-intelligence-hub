@@ -23,7 +23,8 @@ export
         views health quality topkw hour batches survival dupes report \
         gold load etl md-report reports etl-latest run validate-silver \
         validate-gold validate gate etl-latest-strict env-check env-ensure \
-        tg-raw tg-raw-latest tg-silver tg-silver-latest tg-gold tg-gold-latest \
+        tg-raw tg-raw-latest tg-raw-latest-any tg-raw-latest-chan \
+        tg-silver tg-silver-latest tg-gold tg-gold-latest \
         tg-load tg-etl \
         superset-up superset-down superset-stop superset-ps superset-logs \
         superset-backup superset-backup-list superset-restore \
@@ -81,6 +82,9 @@ TG_MIH_SCHEMA    ?= list                          # схема MIH (list/json и
 TG_COMBINED      ?= 1                             # объединять каналы в один файл
 TG_HEADLESS      ?= 1                             # запуск браузера headless
 
+# NEW: принудительно использовать один канал TG_CHANNEL (игнорировать channels-file/channels)
+TG_FORCE_CHANNEL ?= 0                             # 1 = всегда --channel $(TG_CHANNEL)
+
 # --- Normalize возможных "липких" пробелов/табов в значениях (частая причина падений) ---
 TG_CHANNELS_FILE := $(strip $(TG_CHANNELS_FILE))
 TG_CHANNELS      := $(strip $(TG_CHANNELS))
@@ -92,6 +96,7 @@ TG_MIH_ONLY      := $(strip $(TG_MIH_ONLY))
 TG_MIH_SCHEMA    := $(strip $(TG_MIH_SCHEMA))
 TG_COMBINED      := $(strip $(TG_COMBINED))
 TG_HEADLESS      := $(strip $(TG_HEADLESS))
+TG_FORCE_CHANNEL := $(strip $(TG_FORCE_CHANNEL))
 
 # Шаблоны путей для последних файлов (combined/канал)
 TG_RAW_COMBINED_GLOB    ?= $(TG_OUT_DIR)/articles_*_telegram_combined.json
@@ -106,6 +111,39 @@ TG_GOLD_CH_GLOB         ?= data/gold/articles_*_telegram_$(TG_CHANNEL)*_processe
 TG_RAW_ANY_GLOB    ?= $(TG_OUT_DIR)/articles_*_telegram*.json
 TG_SILVER_ANY_GLOB ?= data/silver/articles_*_telegram*_clean.json
 TG_GOLD_ANY_GLOB   ?= data/gold/articles_*_telegram*_processed.parquet
+
+# ------------------------------------------------------------
+# Telegram: сбор аргументов на уровне Make (без shell if)
+# Это убирает “странное поведение”, когда внезапно выбирается
+# channels-file несмотря на TG_FORCE_CHANNEL=1.
+# ------------------------------------------------------------
+TG_SCRAPER_ARGS := --target $(TG_TARGET) --out-dir $(TG_OUT_DIR) --debug-dir $(TG_DEBUG_DIR) --mih-schema $(TG_MIH_SCHEMA)
+
+ifeq ($(TG_MIH_ONLY),1)
+TG_SCRAPER_ARGS += --mih-only
+endif
+
+ifeq ($(TG_HEADLESS),1)
+TG_SCRAPER_ARGS += --headless
+endif
+
+ifeq ($(TG_COMBINED),1)
+TG_SCRAPER_ARGS += --combined
+endif
+
+# ВАЖНО: принудительный одиночный канал должен иметь максимальный приоритет
+ifeq ($(TG_FORCE_CHANNEL),1)
+TG_SCRAPER_ARGS += --channel $(TG_CHANNEL)
+else
+  # Если channels-file существует — используем его
+  ifneq ($(wildcard $(TG_CHANNELS_FILE)),)
+TG_SCRAPER_ARGS += --channels-file $(TG_CHANNELS_FILE)
+  else ifneq ($(strip $(TG_CHANNELS)),)
+TG_SCRAPER_ARGS += --channels $(TG_CHANNELS)
+  else
+TG_SCRAPER_ARGS += --channel $(TG_CHANNEL)
+  endif
+endif
 
 # ============================================================
 # Базовые переменные проекта/окружения
@@ -192,12 +230,14 @@ endef
 env-check:
 	@$(call banner,"Env check")
 	@echo "CH_USER=$(CH_USER)"
-	@echo "CH_PASSWORD=$$($(PYTHON) - <<'PY'\nimport os\np=os.getenv('CH_PASSWORD') or os.getenv('CLICKHOUSE_PASSWORD') or ''\nprint(p[:2]+'***'+p[-2:]+' (len='+str(len(p))+')' if p else '(empty)')\nPY)"
+	@echo "CH_PASSWORD=$${CH_PASSWORD:+(set)}"
+	@echo "CH_PASSWORD_LEN=$${#CH_PASSWORD}"
 	@echo "CH_DATABASE=$(CH_DB)"
 	@echo "CH_HOST=$(CH_HOST)"
 	@echo "CH_PORT=$(CH_PORT)"
 	@echo "CLICKHOUSE_USER=$(or $(CLICKHOUSE_USER),$(CH_USER))"
-	@echo "CLICKHOUSE_PASSWORD=$$($(PYTHON) - <<'PY'\nimport os\np=os.getenv('CLICKHOUSE_PASSWORD') or os.getenv('CH_PASSWORD') or ''\nprint(p[:2]+'***'+p[-2:]+' (len='+str(len(p))+')' if p else '(empty)')\nPY)"
+	@echo "CLICKHOUSE_PASSWORD=$${CLICKHOUSE_PASSWORD:+(set)}"
+	@echo "CLICKHOUSE_PASSWORD_LEN=$${#CLICKHOUSE_PASSWORD}"
 
 # Гарантия, что .env существует (иначе объясняем, что делать)
 env-ensure:
@@ -302,21 +342,18 @@ clean-sql:
 	@bash scripts/ch_run_sql.sh sql/00_ddl.sql
 
 # Пересоздать вьюхи ClickHouse
-views:
-	@$(call banner,"Views")
+views-bash:
+	@$(call banner,"Views (bash)")
 	@bash scripts/ch_run_sql.sh sql/00_views.sql
 	@bash scripts/ch_run_sql.sh sql/06_update_view_articles_dedup_score_prefers_nlp.sql
 	@bash scripts/ch_run_sql.sh sql/09_actions_views.sql
 
+views: views-bash
+hour: hour-bash
 
-# --- Витрины должны выполняться только при валидном окружении ---
-views: env-ensure env-check
-	@$(PYTHON) -m src.cli.ch_sql --file sql/00_views.sql
-	@$(PYTHON) -m src.cli.ch_sql --file sql/06_update_view_articles_dedup_score_prefers_nlp.sql
-	@$(PYTHON) -m src.cli.ch_sql --file sql/09_actions_views.sql
+views-py: env-ensure env-check
 
-hour: env-ensure env-check
-	@$(PYTHON) -m src.cli.ch_sql --file sql/04_by_hour.sql
+hour-py: env-ensure env-check
 
 .PHONY: refresh
 refresh: views hour
@@ -338,8 +375,8 @@ topkw:
 	@bash scripts/ch_run_sql.sh sql/03_top_keywords.sql
 
 # Агрегация по часам
-hour:
-	@$(call banner,"By hour")
+hour-bash:
+	@$(call banner,"By hour (bash)")
 	@bash scripts/ch_run_sql.sh sql/04_by_hour.sql
 
 # Отчёт по batch-ам
@@ -449,64 +486,112 @@ tg-raw:
 	@set -e; \
 	BATCH_ID="$${BATCH_ID:-$$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; \
 	echo "[INFO] Telegram raw ingest. BATCH_ID=$$BATCH_ID"; \
+	echo "[INFO] TG_TARGET=$(TG_TARGET) TG_OUT_DIR=$(TG_OUT_DIR) TG_DEBUG_DIR=$(TG_DEBUG_DIR) TG_MIH_SCHEMA=$(TG_MIH_SCHEMA)"; \
+	echo "[INFO] TG_MIH_ONLY=$(TG_MIH_ONLY) TG_HEADLESS=$(TG_HEADLESS) TG_COMBINED=$(TG_COMBINED) TG_FORCE_CHANNEL=$(TG_FORCE_CHANNEL)"; \
+	echo "[INFO] TG_CHANNEL=$(TG_CHANNEL) TG_CHANNELS=$(TG_CHANNELS) TG_CHANNELS_FILE=$(TG_CHANNELS_FILE)"; \
 	ARGS=""; \
 	ARGS="$$ARGS --target $(TG_TARGET) --out-dir $(TG_OUT_DIR) --debug-dir $(TG_DEBUG_DIR) --mih-schema $(TG_MIH_SCHEMA)"; \
 	if [ "$(TG_MIH_ONLY)" = "1" ]; then ARGS="$$ARGS --mih-only"; fi; \
 	if [ "$(TG_HEADLESS)" = "1" ]; then ARGS="$$ARGS --headless"; fi; \
 	if [ "$(TG_COMBINED)" = "1" ]; then ARGS="$$ARGS --combined"; fi; \
-	if [ -n "$(TG_CHANNELS_FILE)" ] && [ -f "$(TG_CHANNELS_FILE)" ]; then \
+	if [ "$(TG_FORCE_CHANNEL)" = "1" ]; then \
+		ARGS="$$ARGS --channel $(TG_CHANNEL) --channels-file= --channels="; \
+	elif [ -n "$(TG_CHANNELS_FILE)" ] && [ -f "$(TG_CHANNELS_FILE)" ]; then \
 		ARGS="$$ARGS --channels-file $(TG_CHANNELS_FILE)"; \
 	elif [ -n "$(TG_CHANNELS)" ]; then \
 		ARGS="$$ARGS --channels $(TG_CHANNELS)"; \
 	else \
 		ARGS="$$ARGS --channel $(TG_CHANNEL)"; \
 	fi; \
+	echo "[INFO] TG args: $$ARGS"; \
 	BATCH_ID="$$BATCH_ID" $(PYTHON) -m src.collectors.telegram_scraper $$ARGS
 
-# Показать “последний” raw-файл Telegram (устойчиво)
+# Показать “последний” raw-файл Telegram (по логике TG_COMBINED/TG_CHANNEL)
 tg-raw-latest:
 	@set -e; \
-	ls -1t $(TG_RAW_ANY_GLOB) 2>/dev/null | head -n 1
+	if [ "$(TG_COMBINED)" = "1" ]; then \
+		f="$$(ls -1t $(TG_RAW_COMBINED_GLOB) 2>/dev/null | head -n 1)"; \
+		if [ -z "$$f" ]; then echo "[ERROR] No combined Telegram raw found: $(TG_RAW_COMBINED_GLOB)"; exit 1; fi; \
+		echo "$$f"; \
+	else \
+		f="$$(ls -1t $(TG_RAW_CH_GLOB) 2>/dev/null | head -n 1)"; \
+		if [ -z "$$f" ]; then \
+			echo "[ERROR] No channel Telegram raw found for '$(TG_CHANNEL)': $(TG_RAW_CH_GLOB)"; \
+			echo "[HINT] If you scrape multiple channels via channels-file, set TG_COMBINED=1 or use tg-raw-latest-any."; \
+			exit 1; \
+		fi; \
+		echo "$$f"; \
+	fi
+
+# Показать “последний” raw-файл Telegram (любой канал) — fallback/диагностика
+tg-raw-latest-any:
+	@set -e; \
+	f="$$(ls -1t $(TG_RAW_ANY_GLOB) 2>/dev/null | head -n 1)"; \
+	if [ -z "$$f" ]; then echo "[ERROR] No Telegram raw files found: $(TG_RAW_ANY_GLOB)"; exit 1; fi; \
+	echo "$$f"
+
+# Показать “последний” raw-файл Telegram для TG_CHANNEL (всегда по каналу, игнорируя TG_COMBINED)
+tg-raw-latest-chan:
+	@set -e; \
+	f="$$(ls -1t $(TG_RAW_CH_GLOB) 2>/dev/null | head -n 1)"; \
+	if [ -z "$$f" ]; then echo "[ERROR] No channel Telegram raw found for '$(TG_CHANNEL)': $(TG_RAW_CH_GLOB)"; exit 1; fi; \
+	echo "$$f"
 
 # Raw -> Silver для Telegram (по RAW_IN или берём latest; устойчиво)
 tg-silver:
 	@set -e; \
-	RAW_IN="$(RAW_IN)"; \
+	RAW_IN="$${RAW_IN:-}"; \
 	if [ -z "$$RAW_IN" ]; then \
-		RAW_IN="$$(ls -1t $(TG_RAW_ANY_GLOB) 2>/dev/null | head -n 1)"; \
+		RAW_IN="$$( $(MAKE) -s tg-raw-latest )"; \
 	fi; \
-	test -n "$$RAW_IN" || (echo "[ERROR] No raw file found for Telegram in $(TG_OUT_DIR). Run: make tg-raw"; exit 1); \
+	test -n "$$RAW_IN" || (echo "[ERROR] No raw file found for Telegram. Run: make tg-raw"; exit 1); \
 	echo "[INFO] raw -> silver: $$RAW_IN"; \
 	$(PYTHON) -m src.pipeline.clean_raw_to_silver_local --input "$$RAW_IN"
 
-# Показать “последний” silver-файл Telegram (устойчиво)
+# Показать “последний” silver-файл Telegram (по логике TG_COMBINED/TG_CHANNEL)
 tg-silver-latest:
 	@set -e; \
-	ls -1t $(TG_SILVER_ANY_GLOB) 2>/dev/null | head -n 1
+	if [ "$(TG_COMBINED)" = "1" ]; then \
+		f="$$(ls -1t $(TG_SILVER_COMBINED_GLOB) 2>/dev/null | head -n 1)"; \
+		if [ -z "$$f" ]; then echo "[ERROR] No combined Telegram silver found: $(TG_SILVER_COMBINED_GLOB)"; exit 1; fi; \
+		echo "$$f"; \
+	else \
+		f="$$(ls -1t $(TG_SILVER_CH_GLOB) 2>/dev/null | head -n 1)"; \
+		if [ -z "$$f" ]; then echo "[ERROR] No channel Telegram silver found for '$(TG_CHANNEL)': $(TG_SILVER_CH_GLOB)"; exit 1; fi; \
+		echo "$$f"; \
+	fi
 
 # Silver -> Gold для Telegram (по SILVER_IN или берём latest; устойчиво)
 tg-gold:
 	@set -e; \
-	SILVER_IN="$(SILVER_IN)"; \
+	SILVER_IN="$${SILVER_IN:-}"; \
 	if [ -z "$$SILVER_IN" ]; then \
-		SILVER_IN="$$(ls -1t $(TG_SILVER_ANY_GLOB) 2>/dev/null | head -n 1)"; \
+		SILVER_IN="$$( $(MAKE) -s tg-silver-latest )"; \
 	fi; \
 	test -n "$$SILVER_IN" || (echo "[ERROR] No silver file found for Telegram. Run: make tg-silver"; exit 1); \
 	echo "[INFO] silver -> gold: $$SILVER_IN"; \
 	$(PYTHON) -m src.pipeline.silver_to_gold_local --input "$$SILVER_IN"
 
-# Показать “последний” gold-файл Telegram (устойчиво)
+# Показать “последний” gold-файл Telegram (по логике TG_COMBINED/TG_CHANNEL)
 tg-gold-latest:
 	@set -e; \
-	ls -1t $(TG_GOLD_ANY_GLOB) 2>/dev/null | head -n 1
+	if [ "$(TG_COMBINED)" = "1" ]; then \
+		f="$$(ls -1t $(TG_GOLD_COMBINED_GLOB) 2>/dev/null | head -n 1)"; \
+		if [ -z "$$f" ]; then echo "[ERROR] No combined Telegram gold found: $(TG_GOLD_COMBINED_GLOB)"; exit 1; fi; \
+		echo "$$f"; \
+	else \
+		f="$$(ls -1t $(TG_GOLD_CH_GLOB) 2>/dev/null | head -n 1)"; \
+		if [ -z "$$f" ]; then echo "[ERROR] No channel Telegram gold found for '$(TG_CHANNEL)': $(TG_GOLD_CH_GLOB)"; exit 1; fi; \
+		echo "$$f"; \
+	fi
 
 # Gold -> ClickHouse для Telegram (по GOLD_IN или берём latest; batch-id генерируем; устойчиво)
 tg-load: env-ensure env-check
 	@set -e; \
 	BATCH_ID="$${BATCH_ID:-$$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; \
-	GOLD_IN="$(GOLD_IN)"; \
+	GOLD_IN="$${GOLD_IN:-}"; \
 	if [ -z "$$GOLD_IN" ]; then \
-		GOLD_IN="$$(ls -1t $(TG_GOLD_ANY_GLOB) 2>/dev/null | head -n 1)"; \
+		GOLD_IN="$$( $(MAKE) -s tg-gold-latest )"; \
 	fi; \
 	test -n "$$GOLD_IN" || (echo "[ERROR] No gold parquet found for Telegram. Run: make tg-gold"; exit 1); \
 	echo "[INFO] gold -> ClickHouse: $$GOLD_IN"; \

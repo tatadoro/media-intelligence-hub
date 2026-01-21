@@ -108,6 +108,30 @@ ALTER TABLE media_intel.articles
 ALTER TABLE media_intel.articles
     ADD COLUMN IF NOT EXISTS `is_digest` UInt8 DEFAULT 0;
 
+ALTER TABLE media_intel.articles
+    ADD COLUMN IF NOT EXISTS `entities_persons_canon` String DEFAULT '';
+
+ALTER TABLE media_intel.articles
+    ADD COLUMN IF NOT EXISTS `entities_orgs_canon` String DEFAULT '';
+
+ALTER TABLE media_intel.articles
+    ADD COLUMN IF NOT EXISTS `entities_geo_canon` String DEFAULT '';
+
+ALTER TABLE media_intel.articles
+    ADD COLUMN IF NOT EXISTS `lang` String DEFAULT '';
+
+ALTER TABLE media_intel.articles
+    ADD COLUMN IF NOT EXISTS `keyphrases` String DEFAULT '';
+
+ALTER TABLE media_intel.articles
+    ADD COLUMN IF NOT EXISTS `sentiment_label` String DEFAULT '';
+
+ALTER TABLE media_intel.articles
+    ADD COLUMN IF NOT EXISTS `sentiment_score` Nullable(Float64);
+
+ALTER TABLE media_intel.articles
+    ADD COLUMN IF NOT EXISTS `sentiment_ok` UInt8 DEFAULT 0;
+
 -- Load log (for simple audit)
 CREATE TABLE IF NOT EXISTS media_intel.load_log
 (
