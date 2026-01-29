@@ -1,50 +1,52 @@
 from __future__ import annotations
 
-import re
-from typing import Iterable
 import html
-import pandas as pd
-from bs4 import BeautifulSoup
+import re
+from typing import Any
 
-def clean_html(raw_html: str) -> str:
+import pandas as pd
+
+
+# Регексы компилируем один раз
+_WS_RE = re.compile(r"\s+")
+_PUNCT_SPACE_RE = re.compile(r"\s+([,.!?;:])")
+
+
+def clean_html(raw_html: Any) -> str:
     """
-    Принимает строку с HTML/шумным текстом и возвращает очищенный текст.
+    Очищает HTML/шумный текст и возвращает нормализованный plain-text.
 
     Шаги:
-    1. Обрабатываем пустые и нестроковые значения.
-    2. Парсим HTML через BeautifulSoup.
-    3. Удаляем теги <script> и <style>.
-    4. Достаём текст.
-    5. Раскодируем HTML-сущности (&nbsp; и т.п.).
-    6. Чистим пробелы вокруг знаков препинания.
-    7. Нормализуем пробельные символы.
+    1) пустые и нестроковые значения -> ""
+    2) если похоже на HTML — вычищаем через BeautifulSoup (если доступен)
+    3) html.unescape
+    4) нормализация пробелов и пробелов перед пунктуацией
     """
-    # 1. Пустые значения
     if not isinstance(raw_html, str) or not raw_html.strip():
         return ""
 
-    # 2. Парсим HTML
-    soup = BeautifulSoup(raw_html, "html.parser")
+    text = raw_html
 
-    # 3. Удаляем скрипты и стили
-    for tag in soup(["script", "style"]):
-        tag.decompose()
+    # Быстрый путь: если нет признаков HTML и сущностей — просто нормализуем пробелы.
+    # Это сильно ускоряет обработку "обычных" текстов.
+    looks_like_html = ("<" in text and ">" in text) or ("&" in text and ";" in text)
+    if looks_like_html:
+        try:
+            from bs4 import BeautifulSoup  # локальный импорт: модуль может быть не установлен в окружении
 
-    # 4. Получаем текст, между блоками ставим пробел
-    text = soup.get_text(separator=" ")
+            soup = BeautifulSoup(text, "html.parser")
+            for tag in soup(["script", "style"]):
+                tag.decompose()
+            text = soup.get_text(separator=" ")
+        except Exception:
+            # Фоллбек: грубое удаление тегов (хуже, чем BS4, но лучше чем падение)
+            text = re.sub(r"<[^>]+>", " ", text)
 
-    # 5. Раскодируем HTML-сущности (&nbsp;, &amp; и т.п.)
     text = html.unescape(text)
+    text = _PUNCT_SPACE_RE.sub(r"\1", text)
+    text = _WS_RE.sub(" ", text).strip()
+    return text
 
-    # 6. Убираем пробелы перед знаками препинания
-    # "слово , слово" -> "слово, слово"
-    text = re.sub(r"\s+([,.!?;:])", r"\1", text)
-
-    # 7. Нормализуем пробельные символы (переносы, табы, множественные пробелы)
-    text = re.sub(r"\s+", " ", text)
-
-    # Обрезаем пробелы по краям
-    return text.strip()
 
 def clean_articles_df(
     df: pd.DataFrame,
@@ -52,10 +54,9 @@ def clean_articles_df(
     new_column: str = "clean_text",
 ) -> pd.DataFrame:
     """
-    Принимает DataFrame с колонкой text_column (сырой текст) и
-    добавляет колонку new_column (очищенный текст).
-
-    Возвращает НОВУЮ копию DataFrame, не меняя исходный df.
+    Принимает DataFrame с колонкой text_column (сырой текст)
+    и добавляет колонку new_column (очищенный текст).
+    Возвращает новую копию DataFrame.
     """
     if text_column not in df.columns:
         raise ValueError(f"В DataFrame нет колонки '{text_column}'")
@@ -63,25 +64,3 @@ def clean_articles_df(
     df_clean = df.copy()
     df_clean[new_column] = df_clean[text_column].apply(clean_html)
     return df_clean
-
-def _demo():
-    """Небольшая демонстрация работы очистки."""
-    raw_examples = [
-        "<p>Привет, мир!</p>",
-        "<div>Текст со <b>strong</b> тегами и скриптом"
-        "<script>console.log('test');</script></div>",
-        None,
-        "Уже чистый текст без HTML.",
-    ]
-
-    df = pd.DataFrame({"raw_text": raw_examples})
-    df_clean = clean_articles_df(df)
-
-    print("=== ОРИГИНАЛ ===")
-    print(df["raw_text"])
-    print("\n=== ОЧИЩЕНО ===")
-    print(df_clean["clean_text"])
-
-
-if __name__ == "__main__":
-    _demo()

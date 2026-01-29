@@ -1,9 +1,11 @@
 from __future__ import annotations
+
 import os
 import argparse
 import json
 import subprocess
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pandas as pd
 
@@ -22,6 +24,68 @@ def find_latest_raw_file(raw_dir: Path) -> Path:
         raise FileNotFoundError(f"Не найдено ни одного файла articles_*.json в {raw_dir}")
 
     return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _extract_domain_from_url(url: str) -> str:
+    """
+    Извлекает домен из URL. Возвращает '' если извлечь не удалось.
+    """
+    url = (url or "").strip()
+    if not url:
+        return ""
+    try:
+        p = urlparse(url)
+        return (p.netloc or "").lower().strip()
+    except Exception:
+        return ""
+
+
+def _normalize_source_for_silver(rec: dict) -> None:
+    """
+    Нормализуем поле source в silver, чтобы дальше можно было надёжно
+    определять тип источника (telegram vs rss).
+
+    Правило:
+    - если source уже telegram:* или rss:* -> не трогаем
+    - если есть channel -> telegram:<channel>
+    - иначе, если source выглядит как домен (tvzvezda.ru) или можно извлечь домен из link
+      -> rss:<domain>
+    - если удалось определить тип -> проставляем source_type
+    """
+    src = str(rec.get("source") or "").strip()
+    src_l = src.lower()
+
+    # Уже нормализовано
+    if src_l.startswith("telegram:"):
+        rec["source_type"] = rec.get("source_type") or "telegram"
+        return
+    if src_l.startswith("rss:"):
+        rec["source_type"] = rec.get("source_type") or "rss"
+        return
+
+    # Telegram: если есть channel
+    ch = str(rec.get("channel") or "").strip()
+    if ch:
+        rec["source"] = f"telegram:{ch}"
+        rec["source_type"] = "telegram"
+        return
+
+    # RSS: source часто доменом (tvzvezda.ru), иначе домен извлечём из link
+    link = str(rec.get("link") or rec.get("raw_url") or "").strip()
+
+    domain = ""
+    if src and ("." in src) and (" " not in src) and ("/" not in src) and (":" not in src):
+        domain = src.lower()
+    else:
+        domain = _extract_domain_from_url(link)
+
+    if domain:
+        rec["source"] = f"rss:{domain}"
+        rec["source_type"] = "rss"
+        return
+
+    # Фолбек
+    rec["source_type"] = rec.get("source_type") or "other"
 
 
 def transform_raw_to_silver(input_path: Path, output_path: Path) -> None:
@@ -43,6 +107,11 @@ def transform_raw_to_silver(input_path: Path, output_path: Path) -> None:
     )
 
     cleaned_records = df_clean.to_dict(orient="records")
+
+    # Нормализуем source/source_type для устойчивой аналитики (TG vs RSS) на следующих шагах
+    for rec in cleaned_records:
+        if isinstance(rec, dict):
+            _normalize_source_for_silver(rec)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:
@@ -162,6 +231,7 @@ def main() -> None:
         print(f"[INFO] Загружаем silver в MinIO: {dst}")
         subprocess.run(["mc", "cp", str(output_path), dst], check=True)
         print("[OK] Silver загружен в MinIO")
-        
+
+
 if __name__ == "__main__":
     main()

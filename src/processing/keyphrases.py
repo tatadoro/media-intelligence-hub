@@ -1,276 +1,182 @@
 """
-Keyphrases extraction (multilingual) using YAKE.
+Keyphrase extraction utilities.
 
-- dependency: yake (moderate, but usually easy)
-- output: list of normalized keyphrases (deduped for BI)
+Goal: be robust on RU/EN short news texts and Telegram posts.
+We keep the implementation simple and deterministic:
+- tokenize -> generate ngrams -> score by tf-idf-like heuristic + penalties
+- drop noisy tokens and generic singletons
+- dedupe by substring
 """
 
 from __future__ import annotations
 
 import re
-from typing import List, Tuple
+from collections import Counter
+from typing import Iterable, List, Tuple, Dict, Set, Optional
 
-try:
-    import yake  # type: ignore
 
-    _AVAILABLE = True
-except Exception:
-    yake = None  # type: ignore
-    _AVAILABLE = False
+_WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё]+", re.UNICODE)
 
-# Optional: better dedup for Russian keyphrases via lemmatization
-try:
-    import pymorphy3  # type: ignore
-
-    _MORPH = pymorphy3.MorphAnalyzer(lang="ru")
-    _MORPH_OK = True
-except Exception:
-    _MORPH = None
-    _MORPH_OK = False
-
-_RE_SPACES = re.compile(r"\s+")
-_RE_TOKEN = re.compile(r"[A-Za-zА-Яа-яЁё0-9-]+", re.UNICODE)
-
-# Слишком общие «фразы», которые YAKE иногда возвращает, но для BI это шум.
-_GENERIC_SINGLE = {
+# Часто встречающиеся одиночные слова, которые почти всегда мусор как "ключевая фраза"
+_GENERIC_SINGLE: Set[str] = {
     # ru
-    "суд",
-    "банк",
-    "университет",
-    "институт",
-    "компания",
-    "корпорация",
-    "группа",
-    "холдинг",
-    "министерство",
-    "ведомство",
-    "правительство",
-    "администрация",
-    "прокуратура",
-    "полиция",
-    "комитет",
-    "департамент",
-    "служба",
-    "комиссия",
-    "флот",
+    "это", "эта", "этот", "эти",
+    "так", "там", "тут", "здесь",
+    "уже", "еще", "ещё",
+    "будет", "быть", "есть",
+    "очень", "просто", "сейчас",
+    "сегодня", "вчера", "завтра",
+    "тогда", "потом", "сразу",
+    "снова", "опять",
+    "время", "год", "года", "лет",
+    "человек", "люди",
+    "страна", "страны",
     # en
-    "company",
-    "bank",
-    "ministry",
-    "government",
+    "this", "that", "these", "those",
+    "here", "there",
+    "already", "still", "just",
+    "today", "yesterday", "tomorrow",
+    "time", "year", "years", "people",
+}
+
+# Базовые стоп-слова (минимальный набор, без внешних зависимостей).
+_RU_STOP: Set[str] = {
+    "и","в","во","не","что","он","на","я","с","со","как","а","то","все","она","так","его","но","да","ты",
+    "к","у","же","вы","за","бы","по","только","ее","мне","было","вот","от","меня","еще","нет","о","из",
+    "ему","теперь","когда","даже","ну","вдруг","ли","если","уже","или","ни","быть","был","него","до",
+    "вас","нибудь","опять","уж","вам","ведь","там","потом","себя","ничего","ей","может","они","тут","где",
+    "есть","надо","ней","для","мы","тебя","их","чем","была","сам","чтоб","без","будто","чего","раз",
+    "тоже","себе","под","будет","ж","тогда","кто","этот","того","потому","этого","какой","совсем","ним",
+    "здесь","этом","один","почти","мой","тем","чтобы","нее","сейчас","были","куда","зачем","всех","никогда",
+    "можно","при","наконец","два","об","другой","хоть","после","над","больше","тот","через","эти","нас",
+    "про","всего","них","какая","много","разве","три","эту","моя","впрочем","хорошо","свою","этой","перед",
+    "иногда","лучше","чуть","том","нельзя","такой","им","более","всегда","конечно","всю","между",
+}
+
+_EN_STOP: Set[str] = {
+    "the","a","an","and","or","but","if","then","else","so","to","of","in","on","at","for","from","by",
+    "with","about","as","is","are","was","were","be","been","being","it","its","this","that","these","those",
+    "i","you","he","she","we","they","them","his","her","our","their","my","your","me","him","us",
+    "not","no","yes","do","does","did","done","have","has","had","will","would","can","could","may","might",
+    "there","here","when","where","why","how","what","which","who","whom",
+}
+
+_STOP_BY_LANG: Dict[str, Set[str]] = {
+    "ru": _RU_STOP,
+    "en": _EN_STOP,
 }
 
 
-def _norm_phrase(p: str) -> str:
-    """Нормализация для сравнения/дедупа."""
-    p = _RE_SPACES.sub(" ", (p or "").strip().lower())
-    return p
+def _norm_phrase(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 
-def _tokenize(p: str) -> List[str]:
-    return [m.group(0).lower() for m in _RE_TOKEN.finditer(p or "") if m.group(0)]
+def _tokenize(text: str) -> List[str]:
+    return [m.group(0).lower() for m in _WORD_RE.finditer(text or "")]
 
 
-def _lemma_tokens_ru(tokens: List[str]) -> List[str]:
-    if not _MORPH_OK or _MORPH is None:
-        return tokens
-    out: List[str] = []
-    for t in tokens:
-        try:
-            parses = _MORPH.parse(t)
-            if parses:
-                out.append((parses[0].normal_form or t).lower())
-            else:
-                out.append(t)
-        except Exception:
-            out.append(t)
-    return out
-
-
-def _is_trivial(tokens: List[str]) -> bool:
-    """Отсечь очевидный шум (одиночные общие слова)."""
-    if not tokens:
+def _is_bad_keyword(phrase: str, lang: str) -> bool:
+    p = _norm_phrase(phrase)
+    if not p:
         return True
-    if len(tokens) == 1:
-        t = tokens[0]
-        if len(t) < 4:
+
+    toks = p.split()
+    if len(toks) == 1:
+        t = toks[0]
+        # слишком короткие
+        if len(t) < 2:
+            return True
+        # стоп-слова и "генерик"
+        if t in _STOP_BY_LANG.get(lang, set()):
             return True
         if t in _GENERIC_SINGLE:
             return True
+
+    # если все токены — стоп-слова
+    stop = _STOP_BY_LANG.get(lang, set())
+    if stop and all(t in stop for t in toks):
+        return True
+
     return False
 
 
-def _anchor_key(tokens: List[str]) -> str:
-    """Якорь для дедупа: первые 2 токена (или 1, если меньше)."""
-    if not tokens:
-        return ""
-    return " ".join(tokens[:2])
+def _score_ngram(tokens: List[str], n: int, stop: Set[str]) -> Counter:
+    """
+    Простой скоринг: считаем частоты n-грамм, но penalize если внутри есть стоп-слова.
+    """
+    c = Counter()
+    if n <= 0 or len(tokens) < n:
+        return c
+
+    for i in range(len(tokens) - n + 1):
+        ng = tokens[i:i+n]
+        if any(t in stop for t in ng):
+            continue
+        # не берём ngram, где все токены слишком короткие
+        if all(len(t) <= 2 for t in ng):
+            continue
+        c[" ".join(ng)] += 1
+    return c
 
 
-def _dedupe_by_anchor(items: List[Tuple[str, float]], *, lang: str) -> List[Tuple[str, float]]:
-    """Дедуп по якорю: оставляем лучший (у YAKE score меньше = лучше)."""
-    best: dict[str, Tuple[str, float]] = {}
-    for phrase, score in items:
-        toks = _tokenize(phrase)
-        toks_key = _lemma_tokens_ru(toks) if lang == "ru" else toks
-        if _is_trivial(toks_key):
+def _dedupe_by_substring(phrases: List[str]) -> List[str]:
+    """
+    Удаляем фразы, которые являются подстрокой другой, более длинной фразы.
+    """
+    out: List[str] = []
+    sorted_ph = sorted({_norm_phrase(p) for p in phrases if p}, key=lambda x: (-len(x), x))
+    for p in sorted_ph:
+        if any(p != q and p in q for q in out):
             continue
-        a = _anchor_key(toks_key)
-        if not a:
-            continue
-        cur = best.get(a)
-        if cur is None:
-            best[a] = (phrase, score)
-        else:
-            p0, s0 = cur
-            # YAKE: меньше score — лучше; при равенстве берём более длинную фразу
-            if score < s0 or (score == s0 and len(phrase) > len(p0)):
-                best[a] = (phrase, score)
-    return list(best.values())
-
-
-def _dedupe_by_substring(items: List[Tuple[str, float]]) -> List[Tuple[str, float]]:
-    """Убираем короткие фразы, которые являются подстрокой уже выбранных длинных."""
-    kept: List[Tuple[str, float]] = []
-    # сначала длинные (и лучшие по score), чтобы они «поглотили» короткие варианты
-    items_sorted = sorted(items, key=lambda x: (-len(_norm_phrase(x[0])), x[1]))
-    kept_norm: List[str] = []
-    for phrase, score in items_sorted:
-        p = _norm_phrase(phrase)
-        if not p:
-            continue
-        if any((p != q) and (p in q) for q in kept_norm):
-            continue
-        kept.append((phrase, score))
-        kept_norm.append(p)
-    # вернём в порядке «качества» (YAKE score ASC)
-    return sorted(kept, key=lambda x: x[1])
+        out.append(p)
+    # возвращаем в “естественном” порядке: короткие выше после дедупа не нужно,
+    # поэтому просто отсортируем по длине и алфавиту для стабильности
+    return sorted(out, key=lambda x: (-len(x), x))
 
 
 def extract_keyphrases(
     text: str,
-    *,
-    lang: str,
+    lang: str = "ru",
     top_k: int = 15,
-    max_ngram: int = 3,
-) -> List[str]:
-    t = (text or "").strip()
-    if not t or not _AVAILABLE or yake is None:
-        return []
-
-    # YAKE expects language codes like 'en', 'ru'. For unknown -> 'en'.
-    lan = lang if lang and lang != "unknown" else "en"
-
-    # Берём кандидатов с запасом, потому что мы потом сильно фильтруем.
-    try:
-        kw_extractor = yake.KeywordExtractor(lan=lan, n=max_ngram, top=max(top_k * 3, 30))
-        kws = kw_extractor.extract_keywords(t)
-    except Exception:
-        kw_extractor = yake.KeywordExtractor(lan="en", n=max_ngram, top=max(top_k * 3, 30))
-        kws = kw_extractor.extract_keywords(t)
-
-    # 1) первичная нормализация + exact dedup
-    raw: List[Tuple[str, float]] = []
-    seen = set()
-    for phrase, score in kws:
-        p = _norm_phrase(phrase)
-        if len(p) < 3:
-            continue
-        if p in seen:
-            continue
-        seen.add(p)
-        raw.append((p, float(score) if score is not None else 1.0))
-
-    if not raw:
-        return []
-
-    # 2) дедуп по якорю (первые 2 токена, для ru — по леммам)
-    filtered = _dedupe_by_anchor(raw, lang=lan)
-    if not filtered:
-        return []
-
-    # 3) убрать подстроки/короткие варианты
-    filtered = _dedupe_by_substring(filtered)
-
-    # 4) финальный top_k (по score)
-    return [p for p, _s in sorted(filtered, key=lambda x: x[1])[:top_k]]
-
-
-def keyphrases_to_str(keyphrases: List[str]) -> str:
-    """Compatibility with your CH schema style: 'a;b;c'."""
-    return ";".join([p for p in keyphrases if p and p.strip()])
-
-
-import re
-from typing import Iterable, List, Tuple
-
-_RE_SPACES = re.compile(r"\s+")
-_RE_PUNCT = re.compile(r"[^\w\s\-\.]", re.UNICODE)
-
-_RU_STOP = {
-    "и","в","во","на","к","ко","о","об","обо","от","до","из","за","для","по","при","про","у","без",
-    "что","это","как","так","то","же","ли","бы","не","ни",
-    "его","ее","их","ему","ей","им","ними","она","они","он",
-    "год","годы","лет","сегодня","вчера","завтра",
-}
-
-def _norm_phrase(s: str) -> str:
-    s = (s or "").strip().lower().replace("ё", "е")
-    s = _RE_PUNCT.sub(" ", s)
-    s = _RE_SPACES.sub(" ", s).strip()
-    return s
-
-def _is_noise_phrase(p: str) -> bool:
-    if not p:
-        return True
-    if len(p) < 4:
-        return True
-    toks = p.split()
-    if len(toks) == 1 and toks[0] in _RU_STOP:
-        return True
-    # фразы из одних стоп-слов
-    if toks and all(t in _RU_STOP for t in toks):
-        return True
-    # одиночные прилагательные/общие слова часто шумят
-    if len(toks) == 1 and toks[0].endswith(("ский","ская","ское","ские","ной","ная","ное","ные")):
-        return True
-    return False
-
-def _drop_substrings(phrases: List[str]) -> List[str]:
-    # удаляем фразы, которые являются подстрокой другой фразы
-    out: List[str] = []
-    for p in sorted(phrases, key=len, reverse=True):
-        if any(p != q and p in q for q in out):
-            continue
-        out.append(p)
-    return list(reversed(out))
-
-def postprocess_keyphrases(
-    keyphrases: Iterable[Tuple[str, float]] | Iterable[str],
-    *,
-    top_k: int = 15,
+    ngrams: Tuple[int, ...] = (1, 2, 3),
 ) -> List[str]:
     """
-    Принимает либо список (phrase, score), либо список phrase.
-    Возвращает очищенный список phrase (top_k).
+    Извлекает ключевые фразы из текста.
+    Возвращает список строк (фраз).
     """
-    items: List[str] = []
-    for x in keyphrases:
-        if isinstance(x, tuple) and len(x) >= 1:
-            items.append(str(x[0]))
-        else:
-            items.append(str(x))
+    lang = (lang or "ru").lower()
+    stop = _STOP_BY_LANG.get(lang, set())
 
-    normed = []
+    tokens = _tokenize(text)
+    if not tokens:
+        return []
+
+    scored = Counter()
+    for n in ngrams:
+        scored.update(_score_ngram(tokens, n, stop))
+
+    # базовая сортировка: частота, затем длина (длиннее чуть выше), затем лексикографически
+    cand = [p for p, _ in scored.most_common()]
+    # фильтры качества
+    cand = [p for p in cand if not _is_bad_keyword(p, lang)]
+    # дедуп по подстроке
+    cand = _dedupe_by_substring(cand)
+
+    return cand[:top_k]
+
+
+def postprocess_keyphrases(keyphrases: Iterable[str]) -> str:
+    """
+    Нормализует и склеивает ключевые фразы в строку (как у тебя в пайплайне).
+    """
+    uniq = []
     seen = set()
-    for s in items:
-        p = _norm_phrase(s)
-        if _is_noise_phrase(p):
+    for k in keyphrases or []:
+        k2 = _norm_phrase(k)
+        if not k2 or k2 in seen:
             continue
-        if p in seen:
-            continue
-        seen.add(p)
-        normed.append(p)
-
-    normed = _drop_substrings(normed)
-    return normed[:top_k]
+        seen.add(k2)
+        uniq.append(k2)
+    return ";".join(uniq)

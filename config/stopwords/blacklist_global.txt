@@ -1,0 +1,6 @@
+# Технический мусор
+amp
+utm
+http
+https
+www

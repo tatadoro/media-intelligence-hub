@@ -1,0 +1,19 @@
+# Auto-generated stopwords (corpus-based)
+# generated_at_utc: 2026-01-21T10:39:07Z
+# silver_files: 2
+# docs_total: 807
+# lang: ru
+# min_df_ratio: 0.25
+# min_len: 2, max_len: 20
+# top_n: 800
+# format: one token per line
+
+на
+по
+что
+не
+за
+как
+новости
+он
+после
