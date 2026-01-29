@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import os
 import re
 from collections import Counter
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Callable, Optional, Any
+from typing import Dict, List, Callable, Optional, Iterable
 
 import pandas as pd
 
@@ -281,7 +282,7 @@ def add_persons_actions_columns(df: pd.DataFrame) -> pd.DataFrame:
     - persons_actions: строка формата "person:verb1,verb2|person2:verb1,..."
     - actions_verbs: общий top глаголов по статье (через ;)
 
-    Безопасно: если нет pymorphy2 или persons пуст — колонки будут пустыми строками.
+    Безопасно: если нет pymorphy3 или persons пуст — колонки будут пустыми строками.
     """
     out = df.copy()
 
@@ -301,9 +302,9 @@ def add_persons_actions_columns(df: pd.DataFrame) -> pd.DataFrame:
     text_s = text_s.fillna("").astype(str)
 
     # persons source priority:
-    # 1) entities_persons_canon (лучше: уже склеено и меньше дублей)
-    # 2) persons (если оставишь как отдельную совместимую колонку)
-    # 3) entities_persons (сырой NER)
+    # 1) entities_persons_canon
+    # 2) persons
+    # 3) entities_persons
     if "entities_persons_canon" in out.columns:
         persons_s = out["entities_persons_canon"]
     elif "persons" in out.columns:
@@ -354,9 +355,6 @@ def add_entities_persons_geo_from_text_if_missing(df: pd.DataFrame) -> pd.DataFr
     """
     Гарантирует наличие entities_persons/entities_geo.
     Если этих колонок нет — извлекаем NER из текста (nlp_text -> clean_text -> raw_text).
-
-    Важно:
-    - Это “извлечение”, каноникализация делается отдельно (add_entities_*_canon_column).
     """
     out = df.copy()
 
@@ -388,7 +386,7 @@ def add_entities_persons_geo_from_text_if_missing(df: pd.DataFrame) -> pd.DataFr
         persons_out.append(p or "")
         geo_out.append(g or "")
 
-    # Важно: не затираем существующее, добавляем только отсутствующее
+    # не затираем существующее, добавляем только отсутствующее
     if "entities_persons" not in out.columns:
         out["entities_persons"] = persons_out
     if "entities_geo" not in out.columns:
@@ -420,7 +418,7 @@ def add_entities_orgs_canon_column(df: pd.DataFrame) -> pd.DataFrame:
     """
     out = df.copy()
     if "entities_orgs" not in out.columns:
-        out["entities_orgs"] = ""  # держим стабильный контракт
+        out["entities_orgs"] = ""
         out["entities_orgs_canon"] = ""
         return out
     out["entities_orgs_canon"] = out["entities_orgs"].fillna("").astype(str).map(canon_orgs_semicolon)
@@ -433,7 +431,7 @@ def add_entities_geo_canon_column(df: pd.DataFrame) -> pd.DataFrame:
     """
     out = df.copy()
     if "entities_geo" not in out.columns:
-        out["entities_geo"] = ""  # держим стабильный контракт
+        out["entities_geo"] = ""
         out["entities_geo_canon"] = ""
         return out
     out["entities_geo_canon"] = out["entities_geo"].fillna("").astype(str).map(canon_geo_semicolon)
@@ -445,15 +443,25 @@ def add_entities_geo_canon_column(df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Преобразование silver -> gold: summary + keywords (TF-IDF) и выгрузка в MinIO (опционально)."
+        description="Преобразование silver -> gold: summary + keywords и доп. NLP колонки."
     )
-    parser.add_argument("-i", "--input", type=str, required=True, help="Путь к silver-файлу (json/jsonl/parquet/csv).")
+    parser.add_argument(
+        "-i",
+        "--input",
+        type=str,
+        required=True,
+        help="Файл/директория/glob для silver (json/jsonl/parquet/csv). Пример: data/silver/articles_*_clean.json",
+    )
     parser.add_argument(
         "-o",
         "--output",
         type=str,
         required=False,
-        help="Куда сохранить gold Parquet. Если не указан — путь будет выведен из input (data/gold/..._processed.parquet).",
+        help=(
+            "Куда сохранить gold. "
+            "Если вход один — можно указать файл .parquet. "
+            "Если входов несколько — укажи директорию, и файлы будут сохранены как <stem>_processed.parquet."
+        ),
     )
     parser.add_argument(
         "--upload-minio",
@@ -641,17 +649,125 @@ def filter_low_quality_for_gold(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def main() -> None:
-    args = parse_args()
-    project_root = Path(__file__).resolve().parents[2]
+def _expand_input_to_files(input_arg: str, project_root: Path) -> List[Path]:
+    """
+    Разворачивает --input в список существующих файлов.
+    Поддерживает:
+      - конкретный файл
+      - директорию (берём *.json/*.jsonl/*.parquet/*.csv)
+      - glob (например data/silver/articles_*_clean.json)
+    Все относительные пути считаем относительно project_root.
+    """
+    s = str(input_arg).strip()
+    if not s:
+        return []
 
-    input_path = Path(args.input)
-    if not input_path.is_absolute():
-        input_path = project_root / input_path
+    # Если есть wildcard — обрабатываем как glob
+    has_glob = any(ch in s for ch in ["*", "?", "["])
 
-    if not input_path.exists():
-        raise FileNotFoundError(f"Не найден входной файл: {input_path}")
+    if has_glob:
+        pat = s
+        if not Path(pat).is_absolute():
+            pat = str(project_root / pat)
+        files = sorted([Path(x) for x in glob.glob(pat) if Path(x).is_file()])
+        return files
 
+    p = Path(s)
+    if not p.is_absolute():
+        p = project_root / p
+
+    if p.exists() and p.is_dir():
+        exts = (".json", ".jsonl", ".parquet", ".csv")
+        files: List[Path] = []
+        for ext in exts:
+            files.extend([x for x in p.glob(f"*{ext}") if x.is_file()])
+        return sorted(files)
+
+    if p.exists() and p.is_file():
+        return [p]
+
+    # На всякий случай пробуем как glob даже без wildcard (иногда передают "path/{a,b}.json" и т.п.)
+    files2 = sorted([Path(x) for x in glob.glob(str(p)) if Path(x).is_file()])
+    return files2
+
+
+def _resolve_output_paths(
+    input_files: List[Path],
+    output_arg: Optional[str],
+    project_root: Path,
+) -> List[Path]:
+    """
+    Возвращает список output_path той же длины, что и input_files.
+    Правила:
+      - output_arg is None: infer_output_path(input_file) для каждого
+      - один input + output_arg: это путь к файлу (если относительный — от project_root)
+      - много input + output_arg: трактуем output_arg как директорию (создаём при необходимости)
+        и пишем файлы как <stem>_processed.parquet
+    """
+    if not input_files:
+        return []
+
+    if not output_arg:
+        return [infer_output_path(p) for p in input_files]
+
+    outp = Path(output_arg)
+    if not outp.is_absolute():
+        outp = project_root / outp
+
+    if len(input_files) == 1:
+        outp.parent.mkdir(parents=True, exist_ok=True)
+        return [outp]
+
+    # multi-input: output must be directory (или путь, который считаем директорией)
+    # Если указали файл с суффиксом .parquet — это неоднозначно и лучше упасть.
+    if outp.suffix.lower() == ".parquet":
+        raise ValueError(
+            f"--output={outp} выглядит как файл .parquet, но входов несколько ({len(input_files)}). "
+            "Укажи директорию для --output."
+        )
+
+    out_dir = outp
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    outs: List[Path] = []
+    for ip in input_files:
+        outs.append(out_dir / f"{ip.stem}_processed.parquet")
+    return outs
+
+
+def _upload_to_minio(output_path: Path) -> None:
+    import subprocess
+
+    minio_endpoint = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
+    minio_access_key = os.getenv("MINIO_ACCESS_KEY")
+    minio_secret_key = os.getenv("MINIO_SECRET_KEY")
+    bucket = os.getenv("MINIO_BUCKET", "media-intel")
+    alias = os.getenv("MINIO_ALIAS", "local")
+
+    if not minio_access_key or not minio_secret_key:
+        raise ValueError("Не заданы MINIO_ACCESS_KEY/MINIO_SECRET_KEY. Заполни .env (см. .env.example) и повтори.")
+
+    try:
+        subprocess.run(["mc", "--version"], check=True, capture_output=True, text=True)
+    except FileNotFoundError as e:
+        raise FileNotFoundError("Команда 'mc' не найдена. Установи MinIO Client (mc) и повтори.") from e
+
+    out_aliases = subprocess.run(["mc", "alias", "list"], check=True, capture_output=True, text=True).stdout
+    if f"{alias} " not in out_aliases and f"{alias}\t" not in out_aliases:
+        subprocess.run(
+            ["mc", "alias", "set", alias, minio_endpoint, minio_access_key, minio_secret_key],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    dst = f"{alias}/{bucket}/gold/{output_path.name}"
+    print(f"[INFO] Загружаем gold в MinIO: {dst}")
+    subprocess.run(["mc", "cp", str(output_path), dst], check=True)
+    print("[OK] Gold загружен в MinIO")
+
+
+def _process_one_file(input_path: Path, output_path: Path, with_actions: bool) -> None:
     print("[INFO] Преобразуем silver -> gold (summary + keywords)")
     print(f"silver: {input_path}")
 
@@ -668,15 +784,6 @@ def main() -> None:
 
     # 3) фильтрация низкокачественных записей
     df_silver = filter_low_quality_for_gold(df_silver)
-
-    # output path
-    if args.output:
-        output_path = Path(args.output)
-        if not output_path.is_absolute():
-            output_path = project_root / output_path
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-    else:
-        output_path = infer_output_path(input_path)
 
     if df_silver.empty:
         print("[WARN] После фильтрации quality не осталось строк. Сохраняем пустой gold.")
@@ -703,13 +810,13 @@ def main() -> None:
             if col not in df_gold.columns:
                 df_gold[col] = pd.Series(dtype=dtype)
 
-        if args.with_actions:
+        if with_actions:
             if "persons_actions" not in df_gold.columns:
                 df_gold["persons_actions"] = pd.Series(dtype="string")
             if "actions_verbs" not in df_gold.columns:
                 df_gold["actions_verbs"] = pd.Series(dtype="string")
     else:
-        # 4) summary + keywords (TF-IDF) + (как правило) nlp_text
+        # 4) summary + keywords
         df_gold = enrich_articles_with_summary_and_keywords(df_silver)
         if df_gold is None or not isinstance(df_gold, pd.DataFrame):
             raise RuntimeError(
@@ -718,9 +825,13 @@ def main() -> None:
             )
 
         # 5) извлечение сущностей (только если колонок нет)
-        df_gold = _safe_apply(df_gold, add_entities_persons_geo_from_text_if_missing, "add_entities_persons_geo_from_text_if_missing")
+        df_gold = _safe_apply(
+            df_gold,
+            add_entities_persons_geo_from_text_if_missing,
+            "add_entities_persons_geo_from_text_if_missing",
+        )
 
-        # 6) canonical columns для BI/CH
+        # 6) canonical columns
         df_gold = _safe_apply(df_gold, add_entities_persons_canon_column, "add_entities_persons_canon_column")
         df_gold = _safe_apply(df_gold, add_entities_geo_canon_column, "add_entities_geo_canon_column")
         df_gold = _safe_apply(df_gold, add_entities_orgs_canon_column, "add_entities_orgs_canon_column")
@@ -730,49 +841,43 @@ def main() -> None:
         df_gold["geo"] = df_gold.get("entities_geo_canon", df_gold.get("geo", "")).fillna("").astype(str)
 
         # 8) actions (опционально)
-        if args.with_actions:
+        if with_actions:
             df_gold = _safe_apply(df_gold, add_persons_actions_columns, "add_persons_actions_columns")
 
-        # 9) lang + keyphrases + sentiment (защита от None-возврата)
+        # 9) lang + keyphrases + sentiment
         df_gold = _safe_apply(df_gold, add_lang_keyphrases_sentiment, "add_lang_keyphrases_sentiment")
 
-        # гарантируем id в gold перед сохранением/загрузкой
+        # гарантируем id в gold
         df_gold = ensure_id_column(df_gold)
 
     print(f"gold:  {output_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df_gold.to_parquet(output_path, index=False)
 
-    if args.upload_minio:
-        import subprocess
 
-        minio_endpoint = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
-        minio_access_key = os.getenv("MINIO_ACCESS_KEY")
-        minio_secret_key = os.getenv("MINIO_SECRET_KEY")
-        bucket = os.getenv("MINIO_BUCKET", "media-intel")
-        alias = os.getenv("MINIO_ALIAS", "local")
+def main() -> None:
+    args = parse_args()
+    project_root = Path(__file__).resolve().parents[2]
 
-        if not minio_access_key or not minio_secret_key:
-            raise ValueError("Не заданы MINIO_ACCESS_KEY/MINIO_SECRET_KEY. Заполни .env (см. .env.example) и повтори.")
+    input_files = _expand_input_to_files(args.input, project_root)
+    if not input_files:
+        raise FileNotFoundError(f"Не найден входной файл/директория/шаблон: {args.input}")
 
-        try:
-            subprocess.run(["mc", "--version"], check=True, capture_output=True, text=True)
-        except FileNotFoundError as e:
-            raise FileNotFoundError("Команда 'mc' не найдена. Установи MinIO Client (mc) и повтори.") from e
+    output_paths = _resolve_output_paths(input_files, args.output, project_root)
 
-        out_aliases = subprocess.run(["mc", "alias", "list"], check=True, capture_output=True, text=True).stdout
-        if f"{alias} " not in out_aliases and f"{alias}\t" not in out_aliases:
-            subprocess.run(
-                ["mc", "alias", "set", alias, minio_endpoint, minio_access_key, minio_secret_key],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+    print(f"[INFO] Input silver files: {len(input_files)}")
+    for p in input_files[:10]:
+        print(f"  - {p}")
+    if len(input_files) > 10:
+        print("  ...")
 
-        dst = f"{alias}/{bucket}/gold/{output_path.name}"
-        print(f"[INFO] Загружаем gold в MinIO: {dst}")
-        subprocess.run(["mc", "cp", str(output_path), dst], check=True)
-        print("[OK] Gold загружен в MinIO")
+    # Прогоняем все входы
+    for ip, op in zip(input_files, output_paths):
+        _process_one_file(ip, op, with_actions=args.with_actions)
+
+        # upload per-file
+        if args.upload_minio:
+            _upload_to_minio(op)
 
 
 if __name__ == "__main__":

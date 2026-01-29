@@ -1,21 +1,22 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import json
+from pathlib import Path
 from urllib.parse import urlparse
 
 import pandas as pd
 
-from src.processing.stopwords_miner import MinerConfig, mine_tf_df, mine_tf_df_by_source
-from src.processing.stopwords_candidates import CandidateConfig, build_candidates
+from src.processing.domain_stopwords import DomainStopCfg, domain_specific_terms
+from src.processing.source_stopwords import SourceStopCfg, source_specific_terms
 from src.processing.stopwords_build import (
     BuildStopwordsConfig,
     build_stopwords_ru_v001,
+    build_stopwords_ru_v002,
     write_stopwords,
 )
-from src.processing.source_stopwords import SourceStopCfg, source_specific_terms
-from src.processing.domain_stopwords import DomainStopCfg, domain_specific_terms
+from src.processing.stopwords_candidates import CandidateConfig, build_candidates
+from src.processing.stopwords_miner import MinerConfig, mine_tf_df, mine_tf_df_by_source
 
 
 def _source_type_from_source(s: str) -> str:
@@ -236,10 +237,22 @@ def main():
     else:
         top_rss_sources = rss_sources.head(20).index.tolist()
 
-        dom_cfg = DomainStopCfg(df_ratio_hi=0.25, df_ratio_lo=0.03, tf_min=20, max_terms=200)
+        # Важно: dom_cfg не должен “протаскивать” общеязыковые слова (из/его/в/и/на…),
+        # поэтому включаем фильтр common_terms (реализован в domain_stopwords.py)
+        dom_cfg = DomainStopCfg(
+            df_ratio_hi=0.15,
+            df_ratio_lo=0.08,
+            tf_min=10,
+            max_terms=200,
+            filter_common_terms=True,
+            common_df_ratio_min=0.30,
+            common_tf_min=50,
+        )
 
         rss_out_dir = Path("config/stopwords/rss_domains")
         rss_out_dir.mkdir(parents=True, exist_ok=True)
+
+        nonempty_domains = 0
 
         for dom in top_rss_sources:
             cand = domain_specific_terms(stats_src, domain_source=str(dom), cfg=dom_cfg, lang="unknown")
@@ -255,13 +268,19 @@ def main():
             terms = cand["term"].astype(str).str.lower().tolist() if not cand.empty else []
             out_txt_dom.write_text("\n".join(terms) + ("\n" if terms else ""), encoding="utf-8")
 
-        print(f"[OK] Wrote domain RSS stopwords to: {rss_out_dir}")
+            if terms:
+                nonempty_domains += 1
+                print(f"[INFO] domain={dom} terms={len(terms)} sample={terms[:10]}")
+            else:
+                print(f"[INFO] domain={dom} terms=0")
+
+        print(f"[OK] Wrote domain RSS stopwords to: {rss_out_dir} (nonempty={nonempty_domains})")
 
     # -----------------------------
-    # 3) Итоговый стоп-лист (пока v002 = v001 по сборке; позже подключим auto в build)
+    # 3) Итоговый стоп-лист (v002: manual+auto+blacklists+auto source-blacklists) - whitelist
     # -----------------------------
     cfg_sw = BuildStopwordsConfig()
-    final_sw = build_stopwords_ru_v001(cfg_sw)
+    final_sw = build_stopwords_ru_v002(cfg_sw)
 
     out_txt = out_dir / "stopwords_ru_v002.txt"
     write_stopwords(out_txt, final_sw)
@@ -269,6 +288,37 @@ def main():
     print(f"[OK] Wrote: {out_txt} ({len(final_sw)} terms)")
     print("[INFO] stopwords_ru_v002 head:")
     print("\n".join(final_sw[:30]))
+
+    # (опционально) лог для контроля дельты
+    v001 = set(build_stopwords_ru_v001(cfg_sw))
+    v002 = set(final_sw)
+    added = sorted(v002 - v001)
+    if added:
+        print(f"[INFO] Added in v002 vs v001: {added[:50]} (total={len(added)})")
+
+    # -----------------------------
+    # DEBUG: сколько доменных RSS auto-листов и сколько терминов в них
+    # -----------------------------
+    rss_dom_dir = Path("config/stopwords/rss_domains")
+    dom_files = sorted(rss_dom_dir.glob("blacklist_ru_rss_*_auto.txt")) if rss_dom_dir.exists() else []
+    dom_nonempty = []
+    dom_terms = set()
+
+    for fp in dom_files:
+        lines = [ln.strip().lower() for ln in fp.read_text(encoding="utf-8").splitlines()]
+        lines = [ln for ln in lines if ln and not ln.startswith("#")]
+        if lines:
+            dom_nonempty.append(fp)
+            dom_terms.update(lines)
+
+    print(
+        f"[INFO] RSS domain auto-lists: files={len(dom_files)} "
+        f"nonempty={len(dom_nonempty)} uniq_terms={len(dom_terms)}"
+    )
+    if dom_nonempty:
+        print("[INFO] Sample nonempty domain files:")
+        for p in dom_nonempty[:5]:
+            print(f"  - {p}")
 
 
 if __name__ == "__main__":
