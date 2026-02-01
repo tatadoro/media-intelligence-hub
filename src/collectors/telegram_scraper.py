@@ -1103,6 +1103,7 @@ def main():
     batch_id = os.getenv("BATCH_ID") or datetime.now().isoformat()
     mih_paths = []
 
+    combined_records = []  # [COMBINED] накопление записей для общего raw по всем каналам
     try:
         for ch in channels:
             print("=" * 60)
@@ -1175,6 +1176,35 @@ def main():
 
                 if count > 0:
                     mih_path, mih_s3_key, debug_json, debug_txt = scraper.save_final_results()
+                    # [COMBINED] build MIH records from in-memory posts (works even when RAW_BACKEND=s3 and mih_path is empty)
+                    for _p in (scraper.posts or []):
+                        _text = _p.get("content") or _p.get("text") or ""
+                        _title = _p.get("title") or ("Telegram пост" if not _text else (_text.strip().splitlines()[0][:120] if _text.strip().splitlines() else "Telegram пост"))
+                        _link = _p.get("link") or _p.get("post_url") or ""
+                        _published = _p.get("published_at") or _p.get("datetime") or ""
+                        combined_records.append({
+                            "uid": _p.get("uid"),
+                            "source": _p.get("source") or f"telegram:{ch}",
+                            "channel": _p.get("channel") or ch,
+                            "link": _link,
+                            "title": _title,
+                            "published_at": _published,
+                            "content": _text,
+                            "batch_id": batch_id,
+                            "raw_text": _text,
+                            "raw_title": _title,
+                            "raw_url": _link,
+                            "raw_published_at": _published,
+                            "meta": {
+                                "tg_post_id": _p.get("post_id"),
+                                "views": _p.get("views"),
+                                "has_photo": _p.get("has_photo"),
+                                "has_video": _p.get("has_video"),
+                                "human_date": _p.get("human_date"),
+                                "extracted_at": _p.get("extracted_at"),
+                                "post_url": _p.get("post_url"),
+                            },
+                        })
                     if mih_path:
                         mih_paths.append(mih_path)
 
@@ -1264,8 +1294,8 @@ def main():
     except KeyboardInterrupt:
         print("\nПрервано пользователем")
 
-    if args.combined and mih_paths:
-        combined = []
+    if args.combined and (combined_records or mih_paths):
+        combined = list(combined_records)
         for pth in mih_paths:
             try:
                 with open(pth, "r", encoding="utf-8") as f:

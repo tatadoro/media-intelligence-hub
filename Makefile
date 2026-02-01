@@ -29,8 +29,7 @@ export
         superset-up superset-down superset-stop superset-ps superset-logs \
         superset-backup superset-backup-list superset-restore \
         etl-latest-rss etl-latest-tg etl-latest-all tg-etl-refresh \
-        stopwords-auto stopwords-auto-show \ 
-        dupes-json, report-json, topkw-json, hour-json
+        stopwords-auto stopwords-auto-show dupes-json report-json topkw-json hour-json
 
 # ------------------------------------------------------------
 # Настройки Python/путей по умолчанию
