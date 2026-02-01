@@ -88,3 +88,6 @@ temp_results_*_posts_*.json
 
 # local-only
 telegram_channels.txt
+
+# local backups
+src/collectors/*.bak.*
