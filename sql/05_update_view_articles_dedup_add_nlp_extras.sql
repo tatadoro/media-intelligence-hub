@@ -76,7 +76,7 @@ FROM
     ) AS max_loaded
     SELECT
         a.*,
-        if(empty(a.link), a.id, a.link) AS dedup_key,
+        coalesce(nullIf(a.link, ''), nullIf(a.id, ''), '') AS dedup_key,
         lengthUTF8(coalesce(a.clean_text, '')) AS clean_len,
         toUInt8(clean_len >= 40) AS has_body,
         coalesce(ll.loaded_at, toDateTime64('1970-01-01 00:00:00', 9, 'Europe/Moscow')) AS loaded_at,

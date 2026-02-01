@@ -4,7 +4,7 @@ DROP VIEW IF EXISTS articles_dedup;
 
 CREATE VIEW articles_dedup AS
 WITH
-  if(empty(link), id, link) AS dedup_key,
+  coalesce(nullIf(link, ''), nullIf(id, ''), '') AS dedup_key,
   lengthUTF8(coalesce(clean_text, '')) AS clean_len,
   (clean_len, published_at) AS score
 SELECT
