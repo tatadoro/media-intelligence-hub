@@ -29,9 +29,8 @@ export
         superset-up superset-down superset-stop superset-ps superset-logs \
         superset-backup superset-backup-list superset-restore \
         etl-latest-rss etl-latest-tg etl-latest-all tg-etl-refresh \
-        stopwords-auto stopwords-auto-show \
-        stopwords-stats stopwords-stats-show rss-domain-show \
-        gold-latest gold-all
+        stopwords-auto stopwords-auto-show \ 
+        dupes-json, report-json, topkw-json, hour-json
 
 # ------------------------------------------------------------
 # Настройки Python/путей по умолчанию
@@ -199,6 +198,10 @@ CH_PORT := $(or $(CH_PORT),18123)
 CH_TZ ?=
 CH_TZ := $(or $(CH_TZ),Europe/Belgrade)
 
+# NEW: формат вывода clickhouse-client для bash-скриптов (scripts/ch_run_sql.sh)
+# Пример: make dupes CH_FORMAT=JSONEachRow
+CH_FORMAT ?= TSVRaw
+
 # ------------------------------------------------------------
 # MinIO (переменные с fallback’ами) — также без рекурсии
 # ------------------------------------------------------------
@@ -238,6 +241,7 @@ env-check:
 	@echo "CH_DATABASE=$(CH_DB)"
 	@echo "CH_HOST=$(CH_HOST)"
 	@echo "CH_PORT=$(CH_PORT)"
+	@echo "CH_FORMAT=$(CH_FORMAT)"
 	@echo "CLICKHOUSE_USER=$(or $(CLICKHOUSE_USER),$(CH_USER))"
 	@echo "CLICKHOUSE_PASSWORD=$${CLICKHOUSE_PASSWORD:+(set)}"
 	@echo "CLICKHOUSE_PASSWORD_LEN=$${#CLICKHOUSE_PASSWORD}"
@@ -383,71 +387,6 @@ stopwords-auto:
 stopwords-auto-show:
 	@echo "[INFO] head:"; sed -n '1,50p' config/stopwords_auto_ru.txt || true
 
-# ============================================================
-# Stopwords stats (TF/DF mining) + source/domain candidates
-# ============================================================
-
-STOPWORDS_OUT_DIR ?= data/nlp/stopwords
-STOPWORDS_MAX_DOCS ?= 0
-STOPWORDS_MIN_CLEAN_CHARS ?= 400
-STOPWORDS_NO_LEMMATIZE_RU ?= 0
-
-# Построить статистику и кандидаты стоп-слов по silver (по умолчанию берём SILVER_GLOB)
-stopwords-stats:
-	@$(call banner,"Stopwords stats")
-	@set -e; \
-	SILVER_GLOB_IN="$(SILVER_GLOB)"; \
-	EXTRA=""; \
-	if [ "$(STOPWORDS_NO_LEMMATIZE_RU)" = "1" ]; then EXTRA="--no-lemmatize-ru"; fi; \
-	echo "[INFO] silver_glob=$$SILVER_GLOB_IN"; \
-	$(PYTHON) -m src.pipeline.silver_to_stopwords_stats_local \
-	  --silver-glob "$$SILVER_GLOB_IN" \
-	  --out-dir "$(STOPWORDS_OUT_DIR)" \
-	  --max-docs $(STOPWORDS_MAX_DOCS) \
-	  --min-clean-chars $(STOPWORDS_MIN_CLEAN_CHARS) \
-	  $$EXTRA
-
-# Быстрый просмотр результатов майнинга стоп-слов
-stopwords-stats-show:
-	@$(call banner,"Stopwords stats show")
-	@echo "[INFO] files:"; \
-	ls -1 $(STOPWORDS_OUT_DIR) 2>/dev/null || true
-	@echo
-	@echo "[INFO] global stopwords (v002):"; \
-	if [ -f "$(STOPWORDS_OUT_DIR)/stopwords_ru_v002.txt" ]; then \
-	  ls -lh "$(STOPWORDS_OUT_DIR)/stopwords_ru_v002.txt"; \
-	  wc -l "$(STOPWORDS_OUT_DIR)/stopwords_ru_v002.txt"; \
-	  sed -n '1,60p' "$(STOPWORDS_OUT_DIR)/stopwords_ru_v002.txt"; \
-	else \
-	  echo "[WARN] no stopwords_ru_v002.txt yet (run: make stopwords-stats)"; \
-	fi
-	@echo
-	@echo "[INFO] nonempty RSS domain auto-lists:"; \
-	for f in config/stopwords/rss_domains/blacklist_ru_rss_*_auto.txt 2>/dev/null; do \
-	  [ -f "$$f" ] || continue; \
-	  n=$$(wc -l < "$$f" | tr -d ' '); \
-	  if [ "$$n" -gt 0 ]; then echo "$$n  $$f"; fi; \
-	done | sort -nr | head -n 20 || true
-
-# Показать доменный RSS стоп-лист: make rss-domain-show DOMAIN=tvzvezda.ru
-rss-domain-show:
-	@$(call banner,"RSS domain stopwords")
-	@set -e; \
-	if [ -z "$(DOMAIN)" ]; then \
-	  echo "[ERROR] usage: make rss-domain-show DOMAIN=tvzvezda.ru"; \
-	  exit 1; \
-	fi; \
-	F="config/stopwords/rss_domains/blacklist_ru_rss_$(DOMAIN)_auto.txt"; \
-	echo "[INFO] file=$$F"; \
-	if [ -f "$$F" ]; then \
-	  wc -l "$$F"; \
-	  sed -n '1,120p' "$$F"; \
-	else \
-	  echo "[WARN] not found: $$F"; \
-	  echo "[HINT] available:"; \
-	  ls -1 config/stopwords/rss_domains/blacklist_ru_rss_*_auto.txt 2>/dev/null || true; \
-	fi
-
 # Топ ключевых слов
 topkw:
 	@$(call banner,"Top keywords")
@@ -477,6 +416,18 @@ dupes:
 report:
 	@$(call banner,"Report")
 	@bash scripts/ch_run_sql.sh sql/08_report.sql
+
+dupes-json:
+	@CH_FORMAT=JSONEachRow $(MAKE) dupes
+
+report-json:
+	@CH_FORMAT=JSONEachRow $(MAKE) report
+
+topkw-json:
+	@CH_FORMAT=JSONEachRow $(MAKE) topkw
+
+hour-json:
+	@CH_FORMAT=JSONEachRow $(MAKE) hour
 
 # ============================================================
 # Reports (Markdown)
@@ -527,45 +478,11 @@ gate:
 # Pipeline (silver->gold, gold->ClickHouse, полный ETL)
 # ============================================================
 
-# Silver -> Gold (локально)
-# Поддерживает:
-#   - IN=<файл>
-#   - IN=<glob> (например data/silver/articles_*_clean.json) — прогонит все совпадения
+# Silver -> Gold (локально), IN обязателен
 gold:
 	@$(call banner,"Silver -> gold")
-	@test -n "$(IN)" || (echo "[ERROR] Provide IN=<path_or_glob_to_silver>"; exit 1)
-	@set -e; \
-	if echo "$(IN)" | grep -qE '[*?\[]'; then \
-	  echo "[INFO] Detected glob IN=$(IN)"; \
-	  files="$$(ls -1 $(IN) 2>/dev/null || true)"; \
-	  test -n "$$files" || (echo "[ERROR] Glob matched no files: $(IN)"; exit 1); \
-	  for f in $$files; do \
-	    echo "[INFO] run: $$f"; \
-	    $(PYTHON) -m src.pipeline.silver_to_gold_local --input "$$f"; \
-	  done; \
-	else \
-	  $(PYTHON) -m src.pipeline.silver_to_gold_local --input "$(IN)"; \
-	fi
-
-# Silver -> Gold по последнему файлу из $(SILVER_GLOB)
-gold-latest:
-	@$(call banner,"Silver -> gold (latest)")
-	@set -e; \
-	IN_LATEST="$$(ls -1t $(SILVER_GLOB) 2>/dev/null | head -n 1)"; \
-	test -n "$$IN_LATEST" || (echo "[ERROR] No files matched SILVER_GLOB=$(SILVER_GLOB)"; exit 1); \
-	echo "[INFO] IN=$$IN_LATEST"; \
-	$(MAKE) gold IN="$$IN_LATEST"
-
-# Silver -> Gold по всем файлам из $(SILVER_GLOB)
-gold-all:
-	@$(call banner,"Silver -> gold (all)")
-	@set -e; \
-	files="$$(ls -1 $(SILVER_GLOB) 2>/dev/null || true)"; \
-	test -n "$$files" || (echo "[ERROR] No files matched SILVER_GLOB=$(SILVER_GLOB)"; exit 1); \
-	for f in $$files; do \
-	  echo "[INFO] run: $$f"; \
-	  $(PYTHON) -m src.pipeline.silver_to_gold_local --input "$$f"; \
-	done
+	@test -n "$(IN)" || (echo "[ERROR] Provide IN=<path_to_silver_json>"; exit 1)
+	@$(PYTHON) -m src.pipeline.silver_to_gold_local --input "$(IN)"
 
 # Gold -> ClickHouse, IN и BATCH_ID обязательны
 load:
@@ -574,29 +491,12 @@ load:
 	@test -n "$(BATCH_ID)" || (echo "[ERROR] Provide BATCH_ID=<iso_timestamp_utc>"; exit 1)
 	@$(PYTHON) -m src.pipeline.gold_to_clickhouse_local --input "$(IN)" --batch-id "$(BATCH_ID)"
 
-# Полный ETL (raw->silver->gold->ClickHouse)
-# По умолчанию:
-#   1) делает clean_raw_to_silver_local
-#   2) берёт последний silver из $(SILVER_GLOB)
-#   3) строит gold
-#   4) грузит последний gold в ClickHouse
-# Можно переопределить:
-#   - SILVER_GLOB=...
-#   - BATCH_ID=... (иначе автогенерится)
+# Полный ETL (raw->silver->gold->ClickHouse) “как есть”
 etl:
 	@$(call banner,"ETL (raw->silver->gold->clickhouse)")
-	@set -e; \
-	$(PYTHON) -m src.pipeline.clean_raw_to_silver_local; \
-	SILVER_FILE="$$(ls -1t $(SILVER_GLOB) 2>/dev/null | head -n 1)"; \
-	test -n "$$SILVER_FILE" || (echo "[ERROR] No files matched SILVER_GLOB=$(SILVER_GLOB)"; exit 1); \
-	echo "[INFO] SILVER_FILE=$$SILVER_FILE"; \
-	$(PYTHON) -m src.pipeline.silver_to_gold_local --input "$$SILVER_FILE"; \
-	GOLD_FILE="$$(ls -1t data/gold/*_processed.parquet 2>/dev/null | head -n 1)"; \
-	test -n "$$GOLD_FILE" || (echo "[ERROR] No gold files found in data/gold/*_processed.parquet"; exit 1); \
-	BATCH="$${BATCH_ID:-$$(date -u +%Y%m%d_%H%M%S)}"; \
-	echo "[INFO] GOLD_FILE=$$GOLD_FILE"; \
-	echo "[INFO] BATCH_ID=$$BATCH"; \
-	$(PYTHON) -m src.pipeline.gold_to_clickhouse_local --input "$$GOLD_FILE" --batch-id "$$BATCH"
+	@$(PYTHON) -m src.pipeline.clean_raw_to_silver_local
+	@$(PYTHON) -m src.pipeline.silver_to_gold_local
+	@$(PYTHON) -m src.pipeline.gold_to_clickhouse_local
 
 # Прогон ETL по “последним” данным (внутри логика выбора файла)
 etl-latest:

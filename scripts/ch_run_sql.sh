@@ -13,6 +13,9 @@ fi
 
 DATABASE="${CH_DATABASE:-${CH_DB:-${CLICKHOUSE_DB:-${CLICKHOUSE_DATABASE:-media_intel}}}}"
 
+# Output format for clickhouse-client (default: TSVRaw)
+FORMAT="${CH_FORMAT:-TSVRaw}"
+
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 <sql_file>" >&2
   exit 1
@@ -28,6 +31,7 @@ ch() {
   docker exec -i "$CONTAINER" clickhouse-client \
     --database "$DATABASE" \
     --user "$USER" --password "$PASSWORD" \
+    --format "$FORMAT" \
     "$@"
 }
 
