@@ -41,18 +41,13 @@ FROM
         a.*,
 
         /* ---- dedup_key ----
-           Telegram: source|published_at(ms)|hash(text) (id/link у тебя не уникальны)
-           Остальные источники: link (если есть) иначе id
+           Стабильный ключ дедупликации для всех источников:
+           1) link, если есть
+           2) иначе id
+           Это предотвращает ситуацию, когда один и тот же id “разъезжается”
+           по разным dedup_key из-за различий текста/хэша между загрузками.
         */
-        if(
-            a.source ILIKE '%telegram%',
-            concat(
-                a.source, '|',
-                toString(toUnixTimestamp64Milli(a.published_at)), '|',
-                toString(cityHash64(coalesce(a.clean_text, a.raw_text, a.title)))
-            ),
-            if(empty(a.link), a.id, a.link)
-        ) AS dedup_key,
+        coalesce(nullIf(a.link, ''), nullIf(a.id, ''), '') AS dedup_key,
 
         lengthUTF8(coalesce(a.clean_text, '')) AS clean_len,
 

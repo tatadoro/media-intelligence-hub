@@ -3,7 +3,7 @@ SELECT
   published_at AS ts,
   source,
   lowerUTF8(trim(k)) AS keyword
-FROM media_intel.articles
+FROM media_intel.articles_dedup
 ARRAY JOIN splitByChar(';', keywords) AS k
 WHERE trim(k) != '';
 
@@ -12,7 +12,7 @@ SELECT
   published_at AS ts,
   source,
   lowerUTF8(trim(k)) AS keyphrase
-FROM media_intel.articles
+FROM media_intel.articles_dedup
 ARRAY JOIN splitByChar(';', keyphrases) AS k
 WHERE trim(k) != '';
 
@@ -21,7 +21,7 @@ SELECT
   published_at AS ts,
   source,
   lowerUTF8(trim(p)) AS person
-FROM media_intel.articles
+FROM media_intel.articles_dedup
 ARRAY JOIN splitByChar(';', entities_persons_canon) AS p
 WHERE trim(p) != '';
 
@@ -30,7 +30,7 @@ SELECT
   published_at AS ts,
   source,
   lowerUTF8(trim(o)) AS org
-FROM media_intel.articles
+FROM media_intel.articles_dedup
 ARRAY JOIN splitByChar(';', entities_orgs_canon) AS o
 WHERE trim(o) != '';
 
@@ -39,7 +39,7 @@ SELECT
   published_at AS ts,
   source,
   lowerUTF8(trim(g)) AS geo
-FROM media_intel.articles
+FROM media_intel.articles_dedup
 ARRAY JOIN splitByChar(';', entities_geo_canon) AS g
 WHERE trim(g) != '';
 
@@ -49,7 +49,7 @@ SELECT
   source,
   lowerUTF8(trim(splitByChar(':', pa)[1])) AS person,
   lowerUTF8(trim(v)) AS verb
-FROM media_intel.articles
+FROM media_intel.articles_dedup
 ARRAY JOIN splitByChar('|', persons_actions) AS pa
 ARRAY JOIN splitByChar(',', splitByChar(':', pa)[2]) AS v
 WHERE persons_actions != '' AND position(pa, ':') > 0 AND trim(v) != '';
