@@ -349,6 +349,8 @@ views-bash:
 	@bash scripts/ch_run_sql.sh sql/00_views.sql
 	@bash scripts/ch_run_sql.sh sql/06_update_view_articles_dedup_score_prefers_nlp.sql
 	@bash scripts/ch_run_sql.sh sql/09_actions_views.sql
+	@bash scripts/ch_run_sql.sh sql/10_hourly_compat_views.sql
+	@bash scripts/ch_run_sql.sh sql/11_entities_events_views.sql
 
 views: views-bash
 hour: hour-bash
