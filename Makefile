@@ -25,11 +25,13 @@ export
         validate-gold validate gate etl-latest-strict env-check env-ensure \
         tg-raw tg-raw-latest tg-raw-latest-any tg-raw-latest-chan \
         tg-silver tg-silver-latest tg-gold tg-gold-latest \
-        tg-load tg-etl \
+        tg-load tg-etl tg-etl-refresh \
         superset-up superset-down superset-stop superset-ps superset-logs \
         superset-backup superset-backup-list superset-restore \
-        etl-latest-rss etl-latest-tg etl-latest-all tg-etl-refresh \
-        stopwords-auto stopwords-auto-show dupes-json report-json topkw-json hour-json
+        etl-latest-rss etl-latest-tg etl-latest-all \
+        stopwords-auto stopwords-auto-show dupes-json report-json topkw-json hour-json \
+        rss-raw rss-raw-latest rss-silver rss-silver-latest rss-gold rss-gold-latest rss-load rss-etl rss-etl-refresh \
+        ch ch-file
 
 # ------------------------------------------------------------
 # Настройки Python/путей по умолчанию
@@ -38,17 +40,23 @@ PYTHON      ?= python
 SILVER_GLOB ?= data/silver/articles_*_clean.json
 
 # --- Source-specific latest silver globs ---
-RSS_SILVER_GLOB ?= data/silver/articles_[0-9]*_clean.json
+# ВАЖНО: RSS и TG должны быть разными (иначе "latest rss" может схватить telegram)
+RSS_SILVER_GLOB ?= data/silver/articles_*_rss*_clean.json
 TG_SILVER_GLOB  ?= data/silver/articles_*telegram*_clean.json
 
+# ============================================================
+# RSS defaults (tg-style combined)
+# ============================================================
+RSS_RAW_DIR      ?= data/raw
+RSS_COMBINED     ?= 1          # 1 = сохраняем combined raw как articles_*_rss_combined.json
+RSS_RAW_BACKEND  ?= local      # для локальной разработки: raw кладём в data/raw
+
+RSS_RAW_COMBINED_GLOB    ?= $(RSS_RAW_DIR)/articles_*_rss_combined.json
+RSS_SILVER_COMBINED_GLOB ?= data/silver/articles_*_rss_combined*_clean.json
+RSS_GOLD_COMBINED_GLOB   ?= data/gold/articles_*_rss_combined*_processed.parquet
+
 etl-latest-rss:
-	@latest="$$(ls -1t $(RSS_SILVER_GLOB) 2>/dev/null | grep -v telegram | head -n 1)"; \
-	if [ -z "$$latest" ]; then \
-	  echo "[ERROR] No RSS silver files found (non-telegram): $(RSS_SILVER_GLOB)"; \
-	  exit 1; \
-	fi; \
-	echo "[INFO] Latest RSS silver: $$latest"
-	@$(MAKE) etl-latest-strict SILVER_GLOB='$(RSS_SILVER_GLOB)'
+	@$(MAKE) rss-etl STRICT=1
 
 etl-latest-tg:
 	@$(MAKE) tg-etl
@@ -61,6 +69,14 @@ tg-etl-refresh:
 	BATCH_ID="$$BATCH_ID" $(MAKE) tg-silver; \
 	BATCH_ID="$$BATCH_ID" $(MAKE) tg-gold; \
 	BATCH_ID="$$BATCH_ID" $(MAKE) tg-load; \
+	$(MAKE) refresh
+
+# NEW: RSS ETL + refresh (симметрия с tg-etl-refresh)
+rss-etl-refresh:
+	@set -e; \
+	BATCH_ID="$${BATCH_ID:-$$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; \
+	echo "[INFO] RSS ETL + refresh (tg-style). BATCH_ID=$$BATCH_ID"; \
+	BATCH_ID="$$BATCH_ID" $(MAKE) rss-etl STRICT="$(STRICT)"; \
 	$(MAKE) refresh
 
 etl-latest-all: etl-latest-rss etl-latest-tg
@@ -115,8 +131,6 @@ TG_GOLD_ANY_GLOB   ?= data/gold/articles_*_telegram*_processed.parquet
 
 # ------------------------------------------------------------
 # Telegram: сбор аргументов на уровне Make (без shell if)
-# Это убирает “странное поведение”, когда внезапно выбирается
-# channels-file несмотря на TG_FORCE_CHANNEL=1.
 # ------------------------------------------------------------
 TG_SCRAPER_ARGS := --target $(TG_TARGET) --out-dir $(TG_OUT_DIR) --debug-dir $(TG_DEBUG_DIR) --mih-schema $(TG_MIH_SCHEMA)
 
@@ -161,7 +175,6 @@ COMPOSE     := $(COMPOSE_BIN) --project-directory $(PROJECT_DIR) --env-file $(EN
 
 # ------------------------------------------------------------
 # Docker Compose для полного стека (core + Superset) — одна команда без orphan warning
-# Важно: используем safe-порядок запуска Superset (init отдельно).
 # ------------------------------------------------------------
 COMPOSE_ALL := COMPOSE_IGNORE_ORPHANS=1 $(COMPOSE_BIN) --project-directory $(PROJECT_DIR) --env-file $(ENV_FILE) \
                -f $(PROJECT_DIR)/docker-compose.yml \
@@ -177,50 +190,42 @@ COMPOSE_FULL := COMPOSE_IGNORE_ORPHANS=1 $(COMPOSE_BIN) --project-directory $(PR
 
 # ------------------------------------------------------------
 # ClickHouse (переменные с fallback’ами)
-# ВАЖНО: избегаем рекурсивных определений вида CH_USER ?= $(or $(CH_USER),...)
+# ВАЖНО: НЕ ссылаемся на CH_* внутри определения CH_* (иначе рекурсия)
 # ------------------------------------------------------------
-CH_DB ?=
-CH_DB := $(or $(CH_DATABASE),$(CLICKHOUSE_DB),media_intel)
+ENV_CH_DATABASE  := $(CH_DATABASE)
+ENV_CH_USER      := $(CH_USER)
+ENV_CH_PASSWORD  := $(CH_PASSWORD)
+ENV_CH_HOST      := $(CH_HOST)
+ENV_CH_PORT      := $(CH_PORT)
+ENV_CH_TZ        := $(CH_TZ)
 
-CH_USER ?=
-CH_USER := $(or $(CH_USER),$(CLICKHOUSE_USER),admin)
-
-CH_PASSWORD ?=
-CH_PASSWORD := $(or $(CH_PASSWORD),$(CLICKHOUSE_PASSWORD),admin12345)
-
-CH_HOST ?=
-CH_HOST := $(or $(CH_HOST),localhost)
-
-CH_PORT ?=
-CH_PORT := $(or $(CH_PORT),18123)
-
-CH_TZ ?=
-CH_TZ := $(or $(CH_TZ),Europe/Belgrade)
+CH_DB       := $(or $(ENV_CH_DATABASE),$(CLICKHOUSE_DB),media_intel)
+CH_USER     := $(or $(ENV_CH_USER),$(CLICKHOUSE_USER),admin)
+CH_PASSWORD := $(or $(ENV_CH_PASSWORD),$(CLICKHOUSE_PASSWORD),admin12345)
+CH_HOST     := $(or $(ENV_CH_HOST),localhost)
+CH_PORT     := $(or $(ENV_CH_PORT),18123)
+CH_TZ       := $(or $(ENV_CH_TZ),Europe/Belgrade)
 
 # NEW: формат вывода clickhouse-client для bash-скриптов (scripts/ch_run_sql.sh)
-# Пример: make dupes CH_FORMAT=JSONEachRow
 CH_FORMAT ?= TSVRaw
 
 # ------------------------------------------------------------
 # MinIO (переменные с fallback’ами) — также без рекурсии
 # ------------------------------------------------------------
-MINIO_ENDPOINT ?=
-MINIO_ENDPOINT := $(or $(MINIO_ENDPOINT),http://localhost:9000)
+ENV_MINIO_ENDPOINT   := $(MINIO_ENDPOINT)
+ENV_MINIO_ACCESS_KEY := $(MINIO_ACCESS_KEY)
+ENV_MINIO_SECRET_KEY := $(MINIO_SECRET_KEY)
+ENV_MINIO_BUCKET     := $(MINIO_BUCKET)
 
-MINIO_ACCESS_KEY ?=
-MINIO_ACCESS_KEY := $(or $(MINIO_ACCESS_KEY),admin)
-
-MINIO_SECRET_KEY ?=
-MINIO_SECRET_KEY := $(or $(MINIO_SECRET_KEY),admin12345)
-
-MINIO_BUCKET ?=
-MINIO_BUCKET := $(or $(MINIO_BUCKET),mih)
+MINIO_ENDPOINT   := $(or $(ENV_MINIO_ENDPOINT),http://localhost:9000)
+MINIO_ACCESS_KEY := $(or $(ENV_MINIO_ACCESS_KEY),admin)
+MINIO_SECRET_KEY := $(or $(ENV_MINIO_SECRET_KEY),admin12345)
+MINIO_BUCKET     := $(or $(ENV_MINIO_BUCKET),mih)
 
 # ============================================================
 # Helpers
 # ============================================================
 
-# Красивый баннер для логов make-таргетов
 define banner
 	@echo "============================================================"
 	@echo $(1)
@@ -231,7 +236,6 @@ endef
 # Env
 # ============================================================
 
-# Проверка ключевых переменных окружения (для диагностики)
 env-check:
 	@$(call banner,"Env check")
 	@echo "CH_USER=$(CH_USER)"
@@ -245,7 +249,6 @@ env-check:
 	@echo "CLICKHOUSE_PASSWORD=$${CLICKHOUSE_PASSWORD:+(set)}"
 	@echo "CLICKHOUSE_PASSWORD_LEN=$${#CLICKHOUSE_PASSWORD}"
 
-# Гарантия, что .env существует (иначе объясняем, что делать)
 env-ensure:
 	@$(call banner,"Ensure env")
 	@test -f .env || (echo "[ERROR] .env not found. Create it from .env.example"; exit 1)
@@ -254,24 +257,17 @@ env-ensure:
 # Docker (основной стек проекта: ClickHouse/MinIO/…)
 # ============================================================
 
-# Поднять инфраструктуру (core + Superset) в фоне, тихо (без orphan warning)
 up: env-ensure
 	@$(call banner,"Docker up (core + Superset + Airflow)")
 	@test -f docker-compose.superset.yml || (echo "[ERROR] docker-compose.superset.yml not found"; exit 1)
 	@test -f docker-compose.airflow.yml || (echo "[ERROR] docker-compose.airflow.yml not found"; exit 1)
 
-	# Базовые сервисы
 	@$(COMPOSE_FULL) up -d clickhouse minio superset-postgres superset-redis airflow-postgres
-
-	# One-off init контейнеры (должны завершиться успешно)
 	@$(COMPOSE_FULL) up superset-init
 	@$(COMPOSE_FULL) up airflow-init
-
-	# Основные сервисы
 	@$(COMPOSE_FULL) up -d superset airflow-webserver airflow-scheduler
 	@$(COMPOSE_FULL) ps
 
-# Остановить весь стек (core + Superset), volumes НЕ удаляем
 down:
 	@$(call banner,"Docker down (core + Superset + Airflow)")
 	@$(COMPOSE_FULL) down
@@ -280,17 +276,14 @@ ps:
 	@$(call banner,"Docker ps (core + Superset + Airflow)")
 	@$(COMPOSE_FULL) ps
 
-# Логи основного стека
 logs:
 	@$(call banner,"Docker logs")
 	@$(COMPOSE) logs -f --tail 200
 
-# Перезапуск контейнеров основного стека
 restart:
 	@$(call banner,"Docker restart")
 	@$(COMPOSE) restart
 
-# Сброс основного стека (ОПАСНО): удаляет volumes, данные пропадут
 reset:
 	@$(call banner,"Docker reset (DANGEROUS: down -v)")
 	@$(COMPOSE) down -v --remove-orphans
@@ -299,22 +292,18 @@ reset:
 # Wait/Init (MinIO/ClickHouse)
 # ============================================================
 
-# Дождаться готовности MinIO (healthcheck/ожидание порта)
 wait-minio:
 	@$(call banner,"Wait MinIO")
 	@bash scripts/wait_minio.sh
 
-# Дождаться готовности ClickHouse (healthcheck/ожидание порта)
 wait-clickhouse:
 	@$(call banner,"Wait ClickHouse")
 	@bash scripts/wait_clickhouse.sh
 
-# Создать bucket в MinIO (если ещё не создан)
 create-bucket:
 	@$(call banner,"Create bucket")
 	@bash scripts/create_bucket.sh
 
-# Полная инициализация инфраструктуры: up + ожидание + bucket
 init:
 	@$(call banner,"Init")
 	@$(MAKE) env-ensure
@@ -323,7 +312,6 @@ init:
 	@$(MAKE) wait-clickhouse
 	@$(MAKE) create-bucket
 
-# Bootstrap: init + применение схемы/вьюх ClickHouse
 bootstrap:
 	@$(call banner,"Bootstrap")
 	@$(MAKE) init
@@ -333,7 +321,17 @@ bootstrap:
 # ClickHouse SQL (DDL / views / checks / reports)
 # ============================================================
 
-# Применить базовую схему и вьюхи ClickHouse
+ch: env-ensure env-check
+	@docker exec -i clickhouse clickhouse-client \
+	  -u "$(CH_USER)" --password "$(CH_PASSWORD)" --database "$(CH_DB)" \
+	  --query "$(Q)"
+
+ch-file: env-ensure env-check
+	@test -n "$(F)" || (echo "[ERROR] Provide F=<path_to_sql_file>"; exit 1)
+	@docker exec -i clickhouse clickhouse-client \
+	  -u "$(CH_USER)" --password "$(CH_PASSWORD)" --database "$(CH_DB)" \
+	  --multiquery < "$(F)"
+
 ch-show-schema:
 	@$(call banner,"ClickHouse schema")
 	@bash scripts/ch_run_sql.sh sql/00_ddl.sql
@@ -342,12 +340,10 @@ ch-show-schema:
 	@bash scripts/ch_run_sql.sh sql/06_update_view_articles_dedup_score_prefers_nlp.sql
 	@bash scripts/ch_run_sql.sh sql/09_actions_views.sql
 
-# Пересоздать DDL (часто используют как “очистить и создать заново”)
 clean-sql:
 	@$(call banner,"SQL clean (DDL)")
 	@bash scripts/ch_run_sql.sh sql/00_ddl.sql
 
-# Пересоздать вьюхи ClickHouse
 views-bash:
 	@$(call banner,"Views (bash)")
 	@bash scripts/ch_run_sql.sh sql/00_views.sql
@@ -358,24 +354,19 @@ views: views-bash
 hour: hour-bash
 
 views-py: env-ensure env-check
-
 hour-py: env-ensure env-check
 
-.PHONY: refresh
 refresh: views hour
 	@echo "[INFO] refreshed: views + hourly aggregates"
 
-# Healthchecks SQL
 health:
 	@$(call banner,"Health checks")
 	@bash scripts/ch_run_sql.sh sql/01_healthcheck.sql
 
-# Контентные проверки качества (quality gate)
 quality:
 	@$(call banner,"Content quality checks")
 	@bash scripts/ch_run_sql.sh sql/02_content_quality.sql
 
-# Построить авто-стопслова по silver (IN=... или по SILVER_GLOB)
 stopwords-auto:
 	@set -e; \
 	IN="$(IN)"; \
@@ -386,32 +377,26 @@ stopwords-auto:
 stopwords-auto-show:
 	@echo "[INFO] head:"; sed -n '1,50p' config/stopwords_auto_ru.txt || true
 
-# Топ ключевых слов
 topkw:
 	@$(call banner,"Top keywords")
 	@bash scripts/ch_run_sql.sh sql/03_top_keywords.sql
 
-# Агрегация по часам
 hour-bash:
 	@$(call banner,"By hour (bash)")
 	@bash scripts/ch_run_sql.sh sql/04_by_hour.sql
 
-# Отчёт по batch-ам
 batches:
 	@$(call banner,"Batches")
 	@bash scripts/ch_run_sql.sh sql/05_batches.sql
 
-# “Выживаемость” (retention-like) отчёт
 survival:
 	@$(call banner,"Survival")
 	@bash scripts/ch_run_sql.sh sql/06_survival.sql
 
-# Дубликаты
 dupes:
 	@$(call banner,"Dupes")
 	@bash scripts/ch_run_sql.sh sql/07_dupes.sql
 
-# Сводный SQL-отчёт
 report:
 	@$(call banner,"Report")
 	@bash scripts/ch_run_sql.sh sql/08_report.sql
@@ -432,12 +417,10 @@ hour-json:
 # Reports (Markdown)
 # ============================================================
 
-# Сгенерировать Markdown-отчёт (Python модуль)
 md-report:
 	@$(call banner,"Markdown report")
 	@$(PYTHON) -m src.reporting.generate_report
 
-# Показать последние отчёты (20 штук)
 reports:
 	@$(call banner,"Reports list")
 	@ls -1t reports/*.md | head -n 20 || true
@@ -446,29 +429,89 @@ reports:
 # Collector / Validators
 # ============================================================
 
-# Запуск RSS сборщика -> raw
+# Запуск RSS сборщика -> raw (S3/MinIO или local — зависит от переменных)
 run:
 	@$(call banner,"Run RSS -> raw")
 	@$(PYTHON) -m src.collectors.rss_collector
 
-# Проверка silver-файла по контракту (IN обязателен)
+# ------------------------------------------------------------
+# RSS pipeline (tg-style combined)
+# ------------------------------------------------------------
+
+rss-raw:
+	@$(call banner,"RSS -> raw (tg-style combined, local)")
+	@RAW_BACKEND=$(RSS_RAW_BACKEND) RAW_DIR=$(RSS_RAW_DIR) RSS_COMBINED=$(RSS_COMBINED) \
+	  $(PYTHON) -m src.collectors.rss_collector
+
+# Latest RSS raw (важно: печатает ТОЛЬКО путь)
+rss-raw-latest:
+	@set -e; \
+	f="$$(ls -1t $(RSS_RAW_COMBINED_GLOB) 2>/dev/null | head -n 1)"; \
+	test -n "$$f" || (echo "[ERROR] No RSS combined raw found: $(RSS_RAW_COMBINED_GLOB)"; exit 1); \
+	echo "$$f"
+
+rss-silver:
+	@set -e; \
+	RAW_IN="$${RAW_IN:-}"; \
+	if [ -z "$$RAW_IN" ]; then RAW_IN="$$( $(MAKE) -s rss-raw-latest )"; fi; \
+	$(PYTHON) -m src.pipeline.clean_raw_to_silver_local --input "$$RAW_IN"
+
+rss-silver-latest:
+	@set -e; \
+	f="$$(ls -1t $(RSS_SILVER_COMBINED_GLOB) 2>/dev/null | head -n 1)"; \
+	test -n "$$f" || (echo "[ERROR] No RSS combined silver found: $(RSS_SILVER_COMBINED_GLOB)"; exit 1); \
+	echo "$$f"
+
+rss-gold:
+	@set -e; \
+	SILVER_IN="$${SILVER_IN:-}"; \
+	if [ -z "$$SILVER_IN" ]; then SILVER_IN="$$( $(MAKE) -s rss-silver-latest )"; fi; \
+	echo "[INFO] silver -> gold: $$SILVER_IN"; \
+	$(PYTHON) -m src.pipeline.silver_to_gold_local --input "$$SILVER_IN"
+
+rss-gold-latest:
+	@set -e; \
+	f="$$(ls -1t $(RSS_GOLD_COMBINED_GLOB) 2>/dev/null | head -n 1)"; \
+	test -n "$$f" || (echo "[ERROR] No RSS combined gold found: $(RSS_GOLD_COMBINED_GLOB)"; exit 1); \
+	echo "$$f"
+
+rss-load: env-ensure env-check
+	@set -e; \
+	BATCH_ID="$${BATCH_ID:-$$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; \
+	GOLD_IN="$${GOLD_IN:-}"; \
+	if [ -z "$$GOLD_IN" ]; then GOLD_IN="$$( $(MAKE) -s rss-gold-latest )"; fi; \
+	echo "[INFO] gold -> ClickHouse: $$GOLD_IN"; \
+	echo "[INFO] Using batch-id: $$BATCH_ID"; \
+	$(PYTHON) -m src.pipeline.gold_to_clickhouse_local --input "$$GOLD_IN" --batch-id "$$BATCH_ID"
+
+rss-etl:
+	@set -e; \
+	BATCH_ID="$${BATCH_ID:-$$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; \
+	echo "[INFO] RSS ETL (tg-style). BATCH_ID=$$BATCH_ID"; \
+	BATCH_ID="$$BATCH_ID" $(MAKE) rss-raw; \
+	BATCH_ID="$$BATCH_ID" $(MAKE) rss-silver; \
+	BATCH_ID="$$BATCH_ID" $(MAKE) rss-gold; \
+	BATCH_ID="$$BATCH_ID" $(MAKE) rss-load; \
+	if [ "$(STRICT)" = "1" ] || [ "$(STRICT)" = "true" ]; then $(MAKE) gate; fi
+
+# ------------------------------------------------------------
+# Validators
+# ------------------------------------------------------------
+
 validate-silver:
 	@$(call banner,"Validate silver")
 	@test -n "$(IN)" || (echo "[ERROR] Provide IN=<path_to_silver_json>"; exit 1)
 	@$(PYTHON) scripts/validate_silver.py --input "$(IN)"
 
-# Проверка gold-файла по контракту (IN обязателен)
 validate-gold:
 	@$(call banner,"Validate gold")
 	@test -n "$(IN)" || (echo "[ERROR] Provide IN=<path_to_gold_parquet>"; exit 1)
 	@$(PYTHON) scripts/validate_gold.py --input "$(IN)"
 
-# Проверка “последнего” silver-файла по glob
 validate:
 	@$(call banner,"Validate latest silver")
 	@$(PYTHON) scripts/validate_silver.py --input "$$(ls -1t $(SILVER_GLOB) | head -n 1)"
 
-# Запуск SQL-проверок качества как “гейт” (останавливает процесс при ошибках SQL)
 gate:
 	@$(call banner,"Quality gate")
 	@bash scripts/ch_run_sql.sh sql/02_content_quality.sql
@@ -477,32 +520,27 @@ gate:
 # Pipeline (silver->gold, gold->ClickHouse, полный ETL)
 # ============================================================
 
-# Silver -> Gold (локально), IN обязателен
 gold:
 	@$(call banner,"Silver -> gold")
 	@test -n "$(IN)" || (echo "[ERROR] Provide IN=<path_to_silver_json>"; exit 1)
 	@$(PYTHON) -m src.pipeline.silver_to_gold_local --input "$(IN)"
 
-# Gold -> ClickHouse, IN и BATCH_ID обязательны
 load:
 	@$(call banner,"Gold -> ClickHouse")
 	@test -n "$(IN)" || (echo "[ERROR] Provide IN=<path_to_gold_parquet>"; exit 1)
 	@test -n "$(BATCH_ID)" || (echo "[ERROR] Provide BATCH_ID=<iso_timestamp_utc>"; exit 1)
 	@$(PYTHON) -m src.pipeline.gold_to_clickhouse_local --input "$(IN)" --batch-id "$(BATCH_ID)"
 
-# Полный ETL (raw->silver->gold->ClickHouse) “как есть”
 etl:
 	@$(call banner,"ETL (raw->silver->gold->clickhouse)")
 	@$(PYTHON) -m src.pipeline.clean_raw_to_silver_local
 	@$(PYTHON) -m src.pipeline.silver_to_gold_local
 	@$(PYTHON) -m src.pipeline.gold_to_clickhouse_local
 
-# Прогон ETL по “последним” данным (внутри логика выбора файла)
 etl-latest:
 	@$(call banner,"ETL latest")
 	@$(PYTHON) -m src.pipeline.etl_latest
 
-# Строгий режим для etl-latest (STRICT=1)
 etl-latest-strict:
 	@$(MAKE) etl-latest STRICT=1
 
@@ -510,32 +548,13 @@ etl-latest-strict:
 # Telegram pipeline (collector -> raw -> silver -> gold -> ClickHouse)
 # ============================================================
 
-# Сбор Telegram -> raw (выбираем каналы из файла/списка/одного канала)
 tg-raw:
 	@set -e; \
 	BATCH_ID="$${BATCH_ID:-$$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; \
 	echo "[INFO] Telegram raw ingest. BATCH_ID=$$BATCH_ID"; \
-	echo "[INFO] TG_TARGET=$(TG_TARGET) TG_OUT_DIR=$(TG_OUT_DIR) TG_DEBUG_DIR=$(TG_DEBUG_DIR) TG_MIH_SCHEMA=$(TG_MIH_SCHEMA)"; \
-	echo "[INFO] TG_MIH_ONLY=$(TG_MIH_ONLY) TG_HEADLESS=$(TG_HEADLESS) TG_COMBINED=$(TG_COMBINED) TG_FORCE_CHANNEL=$(TG_FORCE_CHANNEL)"; \
-	echo "[INFO] TG_CHANNEL=$(TG_CHANNEL) TG_CHANNELS=$(TG_CHANNELS) TG_CHANNELS_FILE=$(TG_CHANNELS_FILE)"; \
-	ARGS=""; \
-	ARGS="$$ARGS --target $(TG_TARGET) --out-dir $(TG_OUT_DIR) --debug-dir $(TG_DEBUG_DIR) --mih-schema $(TG_MIH_SCHEMA)"; \
-	if [ "$(TG_MIH_ONLY)" = "1" ]; then ARGS="$$ARGS --mih-only"; fi; \
-	if [ "$(TG_HEADLESS)" = "1" ]; then ARGS="$$ARGS --headless"; fi; \
-	if [ "$(TG_COMBINED)" = "1" ]; then ARGS="$$ARGS --combined"; fi; \
-	if [ "$(TG_FORCE_CHANNEL)" = "1" ]; then \
-		ARGS="$$ARGS --channel $(TG_CHANNEL) --channels-file= --channels="; \
-	elif [ -n "$(TG_CHANNELS_FILE)" ] && [ -f "$(TG_CHANNELS_FILE)" ]; then \
-		ARGS="$$ARGS --channels-file $(TG_CHANNELS_FILE)"; \
-	elif [ -n "$(TG_CHANNELS)" ]; then \
-		ARGS="$$ARGS --channels $(TG_CHANNELS)"; \
-	else \
-		ARGS="$$ARGS --channel $(TG_CHANNEL)"; \
-	fi; \
-	echo "[INFO] TG args: $$ARGS"; \
-	BATCH_ID="$$BATCH_ID" $(PYTHON) -m src.collectors.telegram_scraper $$ARGS
+	echo "[INFO] TG args: $(TG_SCRAPER_ARGS)"; \
+	BATCH_ID="$$BATCH_ID" $(PYTHON) -m src.collectors.telegram_scraper $(TG_SCRAPER_ARGS)
 
-# Показать “последний” raw-файл Telegram (по логике TG_COMBINED/TG_CHANNEL)
 tg-raw-latest:
 	@set -e; \
 	if [ "$(TG_COMBINED)" = "1" ]; then \
@@ -552,21 +571,18 @@ tg-raw-latest:
 		echo "$$f"; \
 	fi
 
-# Показать “последний” raw-файл Telegram (любой канал) — fallback/диагностика
 tg-raw-latest-any:
 	@set -e; \
 	f="$$(ls -1t $(TG_RAW_ANY_GLOB) 2>/dev/null | head -n 1)"; \
-	if [ -z "$$f" ]; then echo "[ERROR] No Telegram raw files found: $(TG_RAW_ANY_GLOB)"; exit 1; fi; \
+	if [ -z "$$f" ]; then echo "[ERROR] No Telegram raw files found: $(TG_RAW_ANY_GLOB)"; exit 1); fi; \
 	echo "$$f"
 
-# Показать “последний” raw-файл Telegram для TG_CHANNEL (всегда по каналу, игнорируя TG_COMBINED)
 tg-raw-latest-chan:
 	@set -e; \
 	f="$$(ls -1t $(TG_RAW_CH_GLOB) 2>/dev/null | head -n 1)"; \
 	if [ -z "$$f" ]; then echo "[ERROR] No channel Telegram raw found for '$(TG_CHANNEL)': $(TG_RAW_CH_GLOB)"; exit 1; fi; \
 	echo "$$f"
 
-# Raw -> Silver для Telegram (по RAW_IN или берём latest; устойчиво)
 tg-silver:
 	@set -e; \
 	RAW_IN="$${RAW_IN:-}"; \
@@ -577,7 +593,6 @@ tg-silver:
 	echo "[INFO] raw -> silver: $$RAW_IN"; \
 	$(PYTHON) -m src.pipeline.clean_raw_to_silver_local --input "$$RAW_IN"
 
-# Показать “последний” silver-файл Telegram (по логике TG_COMBINED/TG_CHANNEL)
 tg-silver-latest:
 	@set -e; \
 	if [ "$(TG_COMBINED)" = "1" ]; then \
@@ -590,7 +605,6 @@ tg-silver-latest:
 		echo "$$f"; \
 	fi
 
-# Silver -> Gold для Telegram (по SILVER_IN или берём latest; устойчиво)
 tg-gold:
 	@set -e; \
 	SILVER_IN="$${SILVER_IN:-}"; \
@@ -601,7 +615,6 @@ tg-gold:
 	echo "[INFO] silver -> gold: $$SILVER_IN"; \
 	$(PYTHON) -m src.pipeline.silver_to_gold_local --input "$$SILVER_IN"
 
-# Показать “последний” gold-файл Telegram (по логике TG_COMBINED/TG_CHANNEL)
 tg-gold-latest:
 	@set -e; \
 	if [ "$(TG_COMBINED)" = "1" ]; then \
@@ -614,7 +627,6 @@ tg-gold-latest:
 		echo "$$f"; \
 	fi
 
-# Gold -> ClickHouse для Telegram (по GOLD_IN или берём latest; batch-id генерируем; устойчиво)
 tg-load: env-ensure env-check
 	@set -e; \
 	BATCH_ID="$${BATCH_ID:-$$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; \
@@ -627,7 +639,6 @@ tg-load: env-ensure env-check
 	echo "[INFO] Using batch-id: $$BATCH_ID"; \
 	$(PYTHON) -m src.pipeline.gold_to_clickhouse_local --input "$$GOLD_IN" --batch-id "$$BATCH_ID"
 
-# Полный Telegram ETL одной командой (все этапы под одним BATCH_ID)
 tg-etl:
 	@set -e; \
 	BATCH_ID="$${BATCH_ID:-$$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; \
@@ -641,21 +652,12 @@ tg-etl:
 # Superset (безопасные команды + бэкап/восстановление мета-БД)
 # ============================================================
 
-# Отдельный compose-файл для Superset.
-# Важно: здесь НЕТ down -v, чтобы случайно не стереть мета-БД (дашборды/чарты/DB connections).
 COMPOSE_SUPERSET := $(COMPOSE_BIN) --project-directory $(PROJECT_DIR) --env-file $(ENV_FILE) \
   -f $(PROJECT_DIR)/docker-compose.superset.yml
 
-# Каталог для бэкапов мета-БД Superset
 SUP_BACKUP_DIR ?= backups/superset
-
-# Путь к файлу для восстановления (передаётся как FILE=...)
 FILE ?=
 
-# Поднять Superset безопасно:
-# 1) postgres/redis (фон)
-# 2) init (one-off, создаёт структуру/админа)
-# 3) webserver superset (фон)
 superset-up: env-ensure
 	@$(call banner,"Superset up (safe)")
 	@test -f docker-compose.superset.yml || (echo "[ERROR] docker-compose.superset.yml not found"; exit 1)
@@ -664,28 +666,22 @@ superset-up: env-ensure
 	@$(COMPOSE_SUPERSET) up -d superset
 	@$(COMPOSE_SUPERSET) ps
 
-# Остановить Superset-стек безопасно (volumes сохраняем)
 superset-down:
 	@$(call banner,"Superset down (safe, keep volumes)")
 	@$(COMPOSE_SUPERSET) down
 
-# Остановить только superset-сервисы (без удаления контейнеров/volumes)
 superset-stop:
 	@$(call banner,"Superset stop (keep containers/volumes)")
 	@$(COMPOSE_SUPERSET) stop superset superset-init 2>/dev/null || true
 
-# Статус контейнеров Superset-стека
 superset-ps:
 	@$(call banner,"Superset ps")
 	@$(COMPOSE_SUPERSET) ps
 
-# Логи веб-сервиса Superset
 superset-logs:
 	@$(call banner,"Superset logs")
 	@$(COMPOSE_SUPERSET) logs --tail=200 superset
 
-# Бэкап мета-БД Superset (Postgres внутри superset-postgres).
-# Сохраняем в backups/superset/superset_meta_<UTC>.sql.gz
 superset-backup: env-ensure
 	@$(call banner,"Superset backup (metadata DB)")
 	@mkdir -p "$(SUP_BACKUP_DIR)"
@@ -703,15 +699,10 @@ superset-backup: env-ensure
 	  ' | gzip > "$$OUT"; \
 	  echo "[OK] $$OUT"
 
-# Показать список доступных бэкапов (самые новые сверху)
 superset-backup-list:
 	@$(call banner,"Superset backups")
 	@ls -1t "$(SUP_BACKUP_DIR)"/*.sql.gz 2>/dev/null || true
 
-# Восстановление мета-БД Superset из бэкапа.
-# ВНИМАНИЕ: это перезапишет текущую мета-БД (дашборды/чарты/DB connections).
-# Использование:
-#   make superset-restore FILE=backups/superset/superset_meta_YYYYmmddTHHMMSSZ.sql.gz
 superset-restore: env-ensure
 	@$(call banner,"Superset restore (metadata DB)")
 	@test -n "$(FILE)" || (echo "[ERROR] Usage: make superset-restore FILE=backups/superset/<file>.sql.gz"; exit 1)
@@ -752,8 +743,6 @@ superset-restore: env-ensure
 # Smoke-test
 # ============================================================
 
-# Smoke: сброс (опасно) + bootstrap + проверка MinIO + etl-latest
-# ВНИМАНИЕ: reset удаляет volumes основного стека, используйте осознанно.
 smoke: reset bootstrap
 	$(PYTHON) -m src.utils.s3_smoke_test
 	$(MAKE) etl-latest

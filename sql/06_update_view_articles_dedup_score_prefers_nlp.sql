@@ -10,6 +10,7 @@ SELECT
     argMax(link, score) AS link,
     argMax(published_at, score) AS published_at,
     argMax(source, score) AS source,
+    argMax(source_type, score) AS source_type,
     argMax(raw_text, score) AS raw_text,
     argMax(clean_text, score) AS clean_text,
     argMax(nlp_text, score) AS nlp_text,
@@ -40,13 +41,24 @@ FROM
     SELECT
         a.*,
 
-        /* ---- dedup_key ----
-           Стабильный ключ дедупликации для всех источников:
-           1) link, если есть
-           2) иначе id
-           Это предотвращает ситуацию, когда один и тот же id “разъезжается”
-           по разным dedup_key из-за различий текста/хэша между загрузками.
+        /* ---- source_type ---- */
+        if(
+          startsWith(a.source, 'telegram:'), 'telegram',
+          if(startsWith(a.source, 'rss:'), 'rss', 'unknown')
+        ) AS source_type,
+
+        /* ---- source_rank ----
+           ЖЕЛЕЗНЫЙ приоритет источника:
+           telegram > rss > unknown
+           Нужен, чтобы старые загрузки без префикса (unknown) не выигрывали у нормализованных rss:/telegram:.
         */
+        multiIf(
+          startsWith(a.source, 'telegram:'), 3,
+          startsWith(a.source, 'rss:'), 2,
+          1
+        ) AS source_rank,
+
+        /* ---- dedup_key ---- */
         coalesce(nullIf(a.link, ''), nullIf(a.id, ''), '') AS dedup_key,
 
         lengthUTF8(coalesce(a.clean_text, '')) AS clean_len,
@@ -86,6 +98,7 @@ FROM
 
         /* score: чем левее — тем важнее */
         (
+            source_rank,        /* сначала — тип источника */
             has_body,
             clean_len,
             has_nlp_extras,
@@ -97,5 +110,4 @@ FROM
         ) AS score
     FROM media_intel.articles AS a
 ) AS t
-GROUP BY dedup_key
-;
+GROUP BY dedup_key;
