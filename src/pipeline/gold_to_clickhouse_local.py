@@ -238,6 +238,8 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Загрузка gold Parquet в ClickHouse (локально) с batch_id + авто-колонками. "
             "После успешной загрузки пишет запись в media_intel.load_log (можно отключить флагом). "
+            "По умолчанию загрузка идемпотентна по object_name (если уже есть в load_log, повторно не грузим). "
+            "Чтобы форсировать перезаливку, используйте --force-load или env MIH_FORCE_LOAD=1."
         )
     )
     p.add_argument("--input", required=True, help="Путь к gold parquet")
@@ -253,6 +255,11 @@ def parse_args() -> argparse.Namespace:
         "--no-load-log",
         action="store_true",
         help="Не писать запись в таблицу load_log после загрузки parquet",
+    )
+    p.add_argument(
+        "--force-load",
+        action="store_true",
+        help="Форсировать загрузку даже если object_name уже есть в load_log (аналог MIH_FORCE_LOAD=1)",
     )
     return p.parse_args()
 
@@ -275,6 +282,34 @@ def main() -> None:
         raise FileNotFoundError(input_path)
 
     object_name = input_path.name
+
+    # ------------------------------------------------------------------
+    # Идемпотентность по object_name:
+    # если этот parquet уже загружали (есть запись в load_log), повторно не вставляем,
+    # иначе появляются дубли в articles при повторных запусках.
+    # ------------------------------------------------------------------
+    force = bool(getattr(args, "force_load", False)) or (os.getenv("MIH_FORCE_LOAD", "0") == "1")
+    if not force:
+        try:
+            obj_esc = _sql_escape(object_name)
+            q = (
+                f"SELECT count() "
+                f"FROM {args.database}.load_log "
+                f"WHERE layer='gold' AND object_name='{obj_esc}' "
+                f"FORMAT TSVRaw"
+            )
+            out = ch_query(args, q).strip()
+            already = int(out) if out else 0
+            if already > 0:
+                print(
+                    f"[INFO] Skip load: object already loaded in load_log: {object_name} "
+                    f"(use --force-load or MIH_FORCE_LOAD=1 to force)"
+                )
+                return
+        except Exception as e:
+            # Если проверка не удалась (например, нет таблицы load_log), не блокируем загрузку.
+            print(f"[WARN] Не смогли проверить идемпотентность через load_log для {object_name}: {e}")
+
     temp_paths: list[Path] = []
 
     # 1) ingest_object_name
