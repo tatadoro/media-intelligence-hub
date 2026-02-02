@@ -25,6 +25,24 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow"
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
 
+      # Timezone (UI + schedule semantics)
+      AIRFLOW__CORE__DEFAULT_TIMEZONE: "Europe/Vilnius"
+
+      # (Optional) Email defaults (used by email_on_failure, etc.)
+      AIRFLOW__EMAIL__EMAIL_BACKEND: "airflow.utils.email.send_email_smtp"
+      AIRFLOW__EMAIL__EMAIL_CONN_ID: "smtp_default"
+      AIRFLOW__EMAIL__DEFAULT_EMAIL_ON_FAILURE: "False"
+      AIRFLOW__EMAIL__DEFAULT_EMAIL_ON_RETRY: "False"
+
+      # SMTP (EmailOperator / send_email_smtp)
+      AIRFLOW__SMTP__SMTP_HOST: ${SMTP_HOST}
+      AIRFLOW__SMTP__SMTP_PORT: "${SMTP_PORT:-587}"
+      AIRFLOW__SMTP__SMTP_USER: ${SMTP_USER}
+      AIRFLOW__SMTP__SMTP_PASSWORD: ${SMTP_PASSWORD}
+      AIRFLOW__SMTP__SMTP_MAIL_FROM: ${SMTP_MAIL_FROM}
+      AIRFLOW__SMTP__SMTP_STARTTLS: "${SMTP_STARTTLS:-True}"
+      AIRFLOW__SMTP__SMTP_SSL: "${SMTP_SSL:-False}"
+
       # Make "python -m src...." work from anywhere in Airflow containers
       PYTHONPATH: /opt/mih
 
@@ -36,11 +54,30 @@ services:
 
       # MinIO endpoint inside docker network (avoid "localhost" from inside containers)
       MINIO_ENDPOINT: ${MINIO_ENDPOINT_DOCKER:-http://minio:9000}
+
+      # HuggingFace/Transformers cache (speed up NLP models loading)
+      HF_HOME: /opt/airflow/.cache/huggingface
+      TRANSFORMERS_CACHE: /opt/airflow/.cache/huggingface/transformers
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      HF_HUB_DISABLE_SYMLINKS_WARNING: "1"
+
+      # Offline mode flags (kept consistent across airflow containers)
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
+      TRANSFORMERS_OFFLINE: "${TRANSFORMERS_OFFLINE:-0}"
+
+      # Reduce RAM spikes for numpy/torch/tokenizers
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      VECLIB_MAXIMUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      TOKENIZERS_PARALLELISM: "false"
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./airflow/logs:/opt/airflow/logs
       - ./airflow/plugins:/opt/airflow/plugins
       - ./:/opt/mih
+      - hf_cache:/opt/airflow/.cache/huggingface
 
     # IMPORTANT: bash receives ONE script string via -c
     entrypoint: ["/bin/bash"]
@@ -68,12 +105,30 @@ services:
       - airflow-postgres
     env_file:
       - .env
-    working_dir: /opt/mih  
+    working_dir: /opt/mih
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow"
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
-   
+
+      # Timezone (UI + schedule semantics)
+      AIRFLOW__CORE__DEFAULT_TIMEZONE: "Europe/Vilnius"
+
+      # (Optional) Email defaults (used by email_on_failure, etc.)
+      AIRFLOW__EMAIL__EMAIL_BACKEND: "airflow.utils.email.send_email_smtp"
+      AIRFLOW__EMAIL__EMAIL_CONN_ID: "smtp_default"
+      AIRFLOW__EMAIL__DEFAULT_EMAIL_ON_FAILURE: "False"
+      AIRFLOW__EMAIL__DEFAULT_EMAIL_ON_RETRY: "False"
+
+      # SMTP (EmailOperator / send_email_smtp)
+      AIRFLOW__SMTP__SMTP_HOST: ${SMTP_HOST}
+      AIRFLOW__SMTP__SMTP_PORT: "${SMTP_PORT:-587}"
+      AIRFLOW__SMTP__SMTP_USER: ${SMTP_USER}
+      AIRFLOW__SMTP__SMTP_PASSWORD: ${SMTP_PASSWORD}
+      AIRFLOW__SMTP__SMTP_MAIL_FROM: ${SMTP_MAIL_FROM}
+      AIRFLOW__SMTP__SMTP_STARTTLS: "${SMTP_STARTTLS:-True}"
+      AIRFLOW__SMTP__SMTP_SSL: "${SMTP_SSL:-False}"
+
       PYTHONPATH: /opt/mih
 
       # Always use docker-host for ClickHouse from containers
@@ -83,6 +138,24 @@ services:
       CLICKHOUSE_PORT: "${CH_PORT_DOCKER:-8123}"
 
       MINIO_ENDPOINT: ${MINIO_ENDPOINT_DOCKER:-http://minio:9000}
+
+      # HuggingFace/Transformers cache (speed up NLP models loading)
+      HF_HOME: /opt/airflow/.cache/huggingface
+      TRANSFORMERS_CACHE: /opt/airflow/.cache/huggingface/transformers
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      HF_HUB_DISABLE_SYMLINKS_WARNING: "1"
+
+      # Offline mode flags (kept consistent across airflow containers)
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
+      TRANSFORMERS_OFFLINE: "${TRANSFORMERS_OFFLINE:-0}"
+
+      # Reduce RAM spikes for numpy/torch/tokenizers
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      VECLIB_MAXIMUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      TOKENIZERS_PARALLELISM: "false"
     ports:
       - "${AIRFLOW_WEBSERVER_PORT:-8080}:8080"
     volumes:
@@ -91,6 +164,7 @@ services:
       - ./airflow/plugins:/opt/airflow/plugins
       - ./:/opt/mih
       - /var/run/docker.sock:/var/run/docker.sock
+      - hf_cache:/opt/airflow/.cache/huggingface
     command: webserver
     restart: unless-stopped
 
@@ -104,11 +178,29 @@ services:
       - airflow-postgres
     env_file:
       - .env
-    working_dir: /opt/mih  
+    working_dir: /opt/mih
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow"
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+
+      # Timezone (UI + schedule semantics)
+      AIRFLOW__CORE__DEFAULT_TIMEZONE: "Europe/Vilnius"
+
+      # (Optional) Email defaults (used by email_on_failure, etc.)
+      AIRFLOW__EMAIL__EMAIL_BACKEND: "airflow.utils.email.send_email_smtp"
+      AIRFLOW__EMAIL__EMAIL_CONN_ID: "smtp_default"
+      AIRFLOW__EMAIL__DEFAULT_EMAIL_ON_FAILURE: "False"
+      AIRFLOW__EMAIL__DEFAULT_EMAIL_ON_RETRY: "False"
+
+      # SMTP (EmailOperator / send_email_smtp)
+      AIRFLOW__SMTP__SMTP_HOST: ${SMTP_HOST}
+      AIRFLOW__SMTP__SMTP_PORT: "${SMTP_PORT:-587}"
+      AIRFLOW__SMTP__SMTP_USER: ${SMTP_USER}
+      AIRFLOW__SMTP__SMTP_PASSWORD: ${SMTP_PASSWORD}
+      AIRFLOW__SMTP__SMTP_MAIL_FROM: ${SMTP_MAIL_FROM}
+      AIRFLOW__SMTP__SMTP_STARTTLS: "${SMTP_STARTTLS:-True}"
+      AIRFLOW__SMTP__SMTP_SSL: "${SMTP_SSL:-False}"
 
       PYTHONPATH: /opt/mih
 
@@ -119,14 +211,34 @@ services:
       CLICKHOUSE_PORT: "${CH_PORT_DOCKER:-8123}"
 
       MINIO_ENDPOINT: ${MINIO_ENDPOINT_DOCKER:-http://minio:9000}
+
+      # HuggingFace/Transformers cache (speed up NLP models loading)
+      HF_HOME: /opt/airflow/.cache/huggingface
+      TRANSFORMERS_CACHE: /opt/airflow/.cache/huggingface/transformers
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      HF_HUB_DISABLE_SYMLINKS_WARNING: "1"
+
+      # Offline mode flags
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
+      TRANSFORMERS_OFFLINE: "${TRANSFORMERS_OFFLINE:-0}"
+
+      # Reduce RAM spikes for numpy/torch/tokenizers
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      VECLIB_MAXIMUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      TOKENIZERS_PARALLELISM: "false"
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./airflow/logs:/opt/airflow/logs
       - ./airflow/plugins:/opt/airflow/plugins
       - ./:/opt/mih
       - /var/run/docker.sock:/var/run/docker.sock
+      - hf_cache:/opt/airflow/.cache/huggingface
     command: scheduler
     restart: unless-stopped
 
 volumes:
   airflow_pgdata:
+  hf_cache:

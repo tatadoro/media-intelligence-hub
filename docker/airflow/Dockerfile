@@ -13,3 +13,4 @@ COPY requirements.txt /tmp/requirements.txt
 
 # Ставим зависимости проекта в окружение Airflow
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
+RUN pip install --no-cache-dir pymorphy3 pymorphy3-dicts-ru
