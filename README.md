@@ -20,18 +20,16 @@
 
 ## Архитектура (MVP)
 
+```md
 ```mermaid
 flowchart LR
-  A[Источники: RSS/API/парсеры] --> B[RAW: JSON/Parquet<br/>S3/MinIO или локально]
-  B --> C[SILVER: cleaned/enriched<br/>нормализация текста + базовые поля]
-  C --> D[GOLD: features<br/>summary + keywords + (опционально) NER/sentiment/actions]
+  A[Источники: RSS, API, парсеры] --> B[RAW: JSON или Parquet, MinIO или локально]
+  B --> C[SILVER: очищенный текст, нормализованные поля]
+  C --> D[GOLD: фичи, summary и keywords]
   D --> E[ClickHouse: витрины]
-  E --> F[SQL checks / views]
-  E --> G[Markdown report]
-  E --> H[Superset dashboards]
-  D --> I[Airflow DAG]
-  I --> E
-```
+  E --> F[SQL проверки и представления]
+  E --> G[Markdown отчёт]
+  E --> H[Superset дашборды]
 
 Ключевые принципы:
 - **Слои данных** разделены по ответственности: *raw* (как пришло), *silver* (чисто и стабильно), *gold* (готово для аналитики).
