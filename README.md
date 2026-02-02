@@ -14,6 +14,7 @@
 - **Отчётность**:
   - Markdown‑отчёт (генерация из ClickHouse по окну времени),
   - BI‑дашборды в Apache Superset поверх витрин/представлений.
+- **Оркестрация**: запуск пайплайна в Airflow (DAG), локальные прогоны остаются доступными для отладки.
 
 ---
 
@@ -23,11 +24,13 @@
 flowchart LR
   A[Источники: RSS/API/парсеры] --> B[RAW: JSON/Parquet<br/>S3/MinIO или локально]
   B --> C[SILVER: cleaned/enriched<br/>нормализация текста + базовые поля]
-  C --> D[GOLD: features<br/>summary + keywords + агрегаты]
+  C --> D[GOLD: features<br/>summary + keywords + (опционально) NER/sentiment/actions]
   D --> E[ClickHouse: витрины]
   E --> F[SQL checks / views]
   E --> G[Markdown report]
   E --> H[Superset dashboards]
+  D --> I[Airflow DAG]
+  I --> E
 ```
 
 Ключевые принципы:
@@ -112,11 +115,18 @@ flowchart LR
 
 Проект намеренно держит NLP‑часть **опциональной**: базовый ETL работает без «тяжёлых» зависимостей, а расширенные поля (тональность, NER‑фичи и т.п.) заполняются при наличии библиотек.
 
-Минимум для корректной работы тональности на русском (через `transformers`):
+### Tonality (RU) через Transformers
+Минимум для корректной работы тональности на русском:
 - `transformers`, `torch`, `sentencepiece`
 
-Первый запуск может скачать модель в кэш Hugging Face (это нормально). На macOS обычно используется ускорение `mps`.
+Первый запуск может скачать модель в кэш Hugging Face. В Docker‑окружении кэш вынесен в отдельный volume и шарится между контейнерами Airflow, чтобы избежать повторных загрузок и ускорить прогон.
 
+Для воспроизводимости предусмотрены переменные окружения:
+- `HF_HOME` и `TRANSFORMERS_CACHE` — путь к кэшу;
+- `HF_HUB_OFFLINE=1` и `TRANSFORMERS_OFFLINE=1` — строгий офлайн‑режим (включается после прогрева кэша);
+- `TOKENIZERS_PARALLELISM=false` и ограничения потоков (`OMP_NUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`, `MKL_NUM_THREADS=1`) — чтобы снизить нагрузку и избежать OOM‑kill в контейнерах при параллельных задачах.
+
+### Морфология (лемматизация/действия)
 Для морфологии (лемматизация в эвристиках/действиях):
 - `pymorphy2`, `pymorphy2-dicts-ru`
 
@@ -177,11 +187,13 @@ Superset подключается к ClickHouse и использует витр
 5) открыть Superset и собрать/посмотреть дашборды;
 6) (опционально) сгенерировать Markdown‑отчёт из ClickHouse.
 
+Важно: если Airflow вынесен в отдельный compose‑файл (например, `docker-compose.airflow.yml`), то команды нужно запускать с флагом `-f`, либо пользоваться `Makefile`, где это уже зашито.
+
 UI по умолчанию (если не переопределено в `.env`):
-- Airflow: `http://localhost:${AIRFLOW_WEBSERVER_PORT:-8080}`
+- Airflow: `http://localhost:${AIRFLOW_WEBSERVER_PORT:-8080}` (таймзона UI и семантика расписания: `Europe/Vilnius`)
 - Superset: `http://localhost:${SUPERSET_PORT:-18088}`
 
-> Подробные команды остаются в `Makefile` и скриптах репозитория (цель — один‑два «make …» для типового сценария).
+> Подробные команды остаются в `Makefile` и скриптах репозитория (цель — один‑два `make …` для типового сценария).
 
 ---
 
