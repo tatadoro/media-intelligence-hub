@@ -31,12 +31,6 @@ def compute_batch_id(**context):
     return {"batch_id": batch_id}
 
 
-compute_batch_id_task = PythonOperator(
-    task_id="compute_batch_id",
-    python_callable=compute_batch_id,
-)
-
-
 def precheck_latest_silver(**context) -> None:
     """
     Логируем выбранный silver и быстро проверяем, что файл не legacy:
@@ -96,22 +90,31 @@ def precheck_latest_silver(**context) -> None:
     logging.info("Silver precheck OK (%s records scanned).", checked)
 
 
-def pick_latest_silver_file() -> str:
+def pick_latest_silver_file(
+    silver_glob: str = "articles_*.json",
+    exclude_contains: str | None = None,
+) -> str:
     """
     Возвращает относительный путь (от /opt/mih) к самому свежему silver JSON-файлу.
 
-    ВАЖНО: чтобы не подхватить legacy/тестовые файлы, берём только articles_*.json.
+    ВАЖНО:
+    - silver_glob ограничивает выборку (TG/RSS можно развести по шаблонам)
+    - exclude_contains отсекает файлы по подстроке (опционально)
     """
     if not SILVER_DIR.exists():
         raise FileNotFoundError(f"Silver dir not found: {SILVER_DIR}")
 
-    candidates = sorted(
-        SILVER_DIR.glob("articles_*.json"),
-        key=lambda p: p.stat().st_mtime,
-    )
+    candidates = []
+    for p in SILVER_DIR.glob(silver_glob):
+        if exclude_contains and (exclude_contains in p.name):
+            continue
+        candidates.append(p)
+
+    candidates = sorted(candidates, key=lambda p: p.stat().st_mtime)
+
     if not candidates:
         raise FileNotFoundError(
-            f"No silver files found in: {SILVER_DIR}. Expected pattern: articles_*.json"
+            f"No silver files found in: {SILVER_DIR}. Expected pattern: {silver_glob}"
         )
 
     latest = candidates[-1]
@@ -223,196 +226,216 @@ default_args = {
 
 REPORT_LAST_HOURS = int(os.getenv("REPORT_LAST_HOURS", "1"))
 
-with DAG(
-    dag_id="mih_etl_latest_strict",
-    default_args=default_args,
-    description="MIH ETL: latest silver -> gold -> clickhouse -> reports (strict)",
-    start_date=pendulum.datetime(2025, 12, 16, 0, 0, 0, tz="Europe/Belgrade"),
-    schedule="@hourly",
-    catchup=False,
-    max_active_runs=1,
-    tags=["mih"],
-    params={"report_last_hours": REPORT_LAST_HOURS},
-) as dag:
-    # --- waiters (infra readiness) ---
-    # ВАЖНО: внутри контейнера нельзя полагаться на make wait-*, потому что:
-    # - wait-minio в Makefile делает curl на localhost:9000 (а надо на minio:9000)
-    # - wait-clickhouse в Makefile использует docker exec (в контейнере docker обычно нет)
-    wait_clickhouse = BashOperator(
-        task_id="wait_clickhouse",
-        bash_command=(
-            "set -euo pipefail; "
-            "HOST=${CH_HOST:-${CLICKHOUSE_HOST:-clickhouse}}; "
-            "PORT=${CH_PORT:-${CLICKHOUSE_PORT:-8123}}; "
-            "USER=${CH_USER:-${CLICKHOUSE_USER:-}}; "
-            "PASS=${CH_PASSWORD:-${CLICKHOUSE_PASSWORD:-}}; "
-            "echo \"[INFO] Waiting for ClickHouse at http://${HOST}:${PORT}/ping\"; "
-            "for i in $(seq 1 30); do "
-            "  if [ -n \"$USER$PASS\" ]; then "
-            "    curl -sfS -u \"$USER:$PASS\" \"http://${HOST}:${PORT}/ping\" >/dev/null && echo \"[OK] ClickHouse ready\" && exit 0; "
-            "  else "
-            "    curl -sfS \"http://${HOST}:${PORT}/ping\" >/dev/null && echo \"[OK] ClickHouse ready\" && exit 0; "
-            "  fi; "
-            "  sleep 1; "
-            "done; "
-            "echo \"[ERROR] ClickHouse not ready (timeout)\"; exit 1"
-        ),
-    )
 
-    wait_minio = BashOperator(
-        task_id="wait_minio",
-        bash_command=(
-            "set -euo pipefail; "
-            "echo \"[INFO] Waiting for MinIO at http://minio:9000/minio/health/ready\"; "
-            "for i in $(seq 1 30); do "
-            "  curl -sfS http://minio:9000/minio/health/ready >/dev/null && echo \"[OK] MinIO ready\" && exit 0; "
-            "  sleep 1; "
-            "done; "
-            "echo \"[ERROR] MinIO not ready (timeout)\"; exit 1"
-        ),
-    )
+def make_dag(
+    dag_id: str,
+    silver_glob: str,
+    exclude_contains: str | None,
+    tags: list[str],
+) -> DAG:
+    with DAG(
+        dag_id=dag_id,
+        default_args=default_args,
+        description="MIH ETL: latest silver -> gold -> clickhouse -> reports (strict)",
+        start_date=pendulum.datetime(2025, 12, 16, 0, 0, 0, tz="Europe/Vilnius"),
+        schedule="@hourly",
+        catchup=False,
+        max_active_runs=1,
+        tags=tags,
+        params={"report_last_hours": REPORT_LAST_HOURS},
+    ) as dag:
+        # --- waiters (infra readiness) ---
+        wait_clickhouse = BashOperator(
+            task_id="wait_clickhouse",
+            bash_command=(
+                "set -euo pipefail; "
+                "HOST=${CH_HOST:-${CLICKHOUSE_HOST:-clickhouse}}; "
+                "PORT=${CH_PORT:-${CLICKHOUSE_PORT:-8123}}; "
+                "USER=${CH_USER:-${CLICKHOUSE_USER:-}}; "
+                "PASS=${CH_PASSWORD:-${CLICKHOUSE_PASSWORD:-}}; "
+                "echo \"[INFO] Waiting for ClickHouse at http://${HOST}:${PORT}/ping\"; "
+                "for i in $(seq 1 30); do "
+                "  if [ -n \"$USER$PASS\" ]; then "
+                "    curl -sfS -u \"$USER:$PASS\" \"http://${HOST}:${PORT}/ping\" >/dev/null && echo \"[OK] ClickHouse ready\" && exit 0; "
+                "  else "
+                "    curl -sfS \"http://${HOST}:${PORT}/ping\" >/dev/null && echo \"[OK] ClickHouse ready\" && exit 0; "
+                "  fi; "
+                "  sleep 1; "
+                "done; "
+                "echo \"[ERROR] ClickHouse not ready (timeout)\"; exit 1"
+            ),
+        )
 
-    # --- pick/precheck/validate silver ---
-    pick_latest_silver = PythonOperator(
-        task_id="pick_latest_silver",
-        python_callable=pick_latest_silver_file,
-    )
+        wait_minio = BashOperator(
+            task_id="wait_minio",
+            bash_command=(
+                "set -euo pipefail; "
+                "echo \"[INFO] Waiting for MinIO at http://minio:9000/minio/health/ready\"; "
+                "for i in $(seq 1 30); do "
+                "  curl -sfS http://minio:9000/minio/health/ready >/dev/null && echo \"[OK] MinIO ready\" && exit 0; "
+                "  sleep 1; "
+                "done; "
+                "echo \"[ERROR] MinIO not ready (timeout)\"; exit 1"
+            ),
+        )
 
-    precheck_silver = PythonOperator(
-        task_id="precheck_silver",
-        python_callable=precheck_latest_silver,
-    )
+        # --- pick/precheck/validate silver ---
+        pick_latest_silver = PythonOperator(
+            task_id="pick_latest_silver",
+            python_callable=pick_latest_silver_file,
+            op_kwargs={"silver_glob": silver_glob, "exclude_contains": exclude_contains},
+        )
 
-    validate_silver = BashOperator(
-        task_id="validate_silver",
-        bash_command=(
-            "cd /opt/mih && "
-            "make validate-silver IN=\"{{ ti.xcom_pull(task_ids='pick_latest_silver') }}\""
-        ),
-    )
+        precheck_silver = PythonOperator(
+            task_id="precheck_silver",
+            python_callable=precheck_latest_silver,
+        )
 
-    # --- silver -> gold ---
-    silver_to_gold = BashOperator(
-        task_id="silver_to_gold",
-        bash_command=(
-            "cd /opt/mih && "
-            "python -m src.pipeline.silver_to_gold_local "
-            "--input \"{{ ti.xcom_pull(task_ids='pick_latest_silver') }}\""
-            "--with-actions"
-        ),
-    )
+        validate_silver = BashOperator(
+            task_id="validate_silver",
+            bash_command=(
+                "cd /opt/mih && "
+                "make validate-silver IN=\"{{ ti.xcom_pull(task_ids='pick_latest_silver') }}\""
+            ),
+        )
 
-    compute_gold_path_task = PythonOperator(
-        task_id="compute_gold_path",
-        python_callable=compute_gold_path,
-    )
+        # --- silver -> gold ---
+        silver_to_gold = BashOperator(
+            task_id="silver_to_gold",
+            bash_command=(
+                "cd /opt/mih && "
+                "python -m src.pipeline.silver_to_gold_local "
+                "--input \"{{ ti.xcom_pull(task_ids='pick_latest_silver') }}\" "
+                "--with-actions"
+            ),
+        )
 
-    # --- guard: do nothing if gold is empty ---
-    gold_non_empty_task = ShortCircuitOperator(
-        task_id="gold_non_empty",
-        python_callable=gold_non_empty,
-    )
+        compute_gold_path_task = PythonOperator(
+            task_id="compute_gold_path",
+            python_callable=compute_gold_path,
+        )
 
-    validate_gold = BashOperator(
-        task_id="validate_gold",
-        bash_command=(
-            "cd /opt/mih && "
-            "make validate-gold IN=\"{{ ti.xcom_pull(task_ids='compute_gold_path') }}\""
-        ),
-    )
+        gold_non_empty_task = ShortCircuitOperator(
+            task_id="gold_non_empty",
+            python_callable=gold_non_empty,
+        )
 
-    quality_gate = BashOperator(
-        task_id="quality_gate",
-        bash_command=(
-            "cd /opt/mih && "
-            "make gate IN=\"{{ ti.xcom_pull(task_ids='compute_gold_path') }}\" STRICT=1"
-        ),
-    )
+        validate_gold = BashOperator(
+            task_id="validate_gold",
+            bash_command=(
+                "cd /opt/mih && "
+                "make validate-gold IN=\"{{ ti.xcom_pull(task_ids='compute_gold_path') }}\""
+            ),
+        )
 
-    delete_batch_in_ch = BashOperator(
-        task_id="delete_batch_in_ch",
-        bash_command=(
-            "set -euo pipefail; cd /opt/mih; "
-            "BATCH_ID=\"{{ ti.xcom_pull(task_ids='compute_batch_id')['batch_id'] }}\"; "
-            "TMP_SQL=$(mktemp); "
-            "printf \"ALTER TABLE articles DELETE WHERE batch_id='%s';\\n\" \"$BATCH_ID\" > \"$TMP_SQL\"; "
-            "./scripts/ch_run_sql.sh \"$TMP_SQL\"; rm -f \"$TMP_SQL\""
-        ),
-    )
+        quality_gate = BashOperator(
+            task_id="quality_gate",
+            bash_command=(
+                "cd /opt/mih && "
+                "make gate IN=\"{{ ti.xcom_pull(task_ids='compute_gold_path') }}\" STRICT=1"
+            ),
+        )
 
-    # --- load to clickhouse ---
-    load_to_clickhouse = BashOperator(
-        task_id="load_to_clickhouse",
-        bash_command=(
-            "cd /opt/mih && "
-            "python -m src.pipeline.gold_to_clickhouse_local "
-            "--input \"{{ ti.xcom_pull(task_ids='compute_gold_path') }}\" "
-            "--batch-id \"{{ ti.xcom_pull(task_ids='compute_batch_id', key='batch_id') }}\""
-        ),
-    )
+        compute_batch_id_task = PythonOperator(
+            task_id="compute_batch_id",
+            python_callable=compute_batch_id,
+        )
 
-    # --- sql + md report ---
-    sql_reports = BashOperator(
-        task_id="sql_reports",
-        bash_command="cd /opt/mih && make report",
-    )
+        delete_batch_in_ch = BashOperator(
+            task_id="delete_batch_in_ch",
+            bash_command=(
+                "set -euo pipefail; cd /opt/mih; "
+                "BATCH_ID=\"{{ ti.xcom_pull(task_ids='compute_batch_id')['batch_id'] }}\"; "
+                "TMP_SQL=$(mktemp); "
+                "printf \"ALTER TABLE articles DELETE WHERE batch_id='%s';\\n\" \"$BATCH_ID\" > \"$TMP_SQL\"; "
+                "./scripts/ch_run_sql.sh \"$TMP_SQL\"; rm -f \"$TMP_SQL\""
+            ),
+        )
 
-    compute_report_window_task = PythonOperator(
-        task_id="compute_report_window",
-        python_callable=compute_report_window,
-        op_kwargs={"last_hours": "{{ params.report_last_hours }}"},
-    )
+        load_to_clickhouse = BashOperator(
+            task_id="load_to_clickhouse",
+            bash_command=(
+                "cd /opt/mih && "
+                "python -m src.pipeline.gold_to_clickhouse_local "
+                "--input \"{{ ti.xcom_pull(task_ids='compute_gold_path') }}\" "
+                "--batch-id \"{{ ti.xcom_pull(task_ids='compute_batch_id', key='batch_id') }}\""
+            ),
+        )
 
-    md_report = BashOperator(
-        task_id="md_report",
-        do_xcom_push=True,
-        bash_command=(
-            "set -euo pipefail; "
-            "cd /opt/mih; "
-            "python -m src.reporting.generate_report "
-            "--from \"{{ (ti.xcom_pull(task_ids='compute_report_window') or {})['dt_from'] }}\" "
-            "--to \"{{ (ti.xcom_pull(task_ids='compute_report_window') or {})['dt_to'] }}\" "
-            "--table articles 1>&2; "
-            "REPORT_FILE=$(ls -1t reports/daily_report_*.md | head -n 1); "
-            "echo \"${REPORT_FILE}\""
-        ),
-    )
+        sql_reports = BashOperator(
+            task_id="sql_reports",
+            bash_command="cd /opt/mih && make report",
+        )
 
-    # --- upload report to MinIO ---
-    # best-effort: если в airflow-контейнере нет mc, не валим DAG
-    upload_report_to_minio = BashOperator(
-        task_id="upload_report_to_minio",
-        bash_command=(
-            "set -euo pipefail; "
-            "cd /opt/mih; "
-            "REPORT_FILE=\"{{ (ti.xcom_pull(task_ids='md_report') or '') | trim }}\"; "
-            "if [ -z \"${REPORT_FILE}\" ]; then "
-            "  echo \"[ERROR] md_report XCom is empty; cannot upload deterministically\" 1>&2; "
-            "  exit 1; "
-            "fi; "
-            "DT_FROM=\"{{ ti.xcom_pull(task_ids='compute_report_window')['dt_from'] }}\"; "
-            "DT_TO=\"{{ ti.xcom_pull(task_ids='compute_report_window')['dt_to'] }}\"; "
-            "echo \"[INFO] Uploading report: ${REPORT_FILE} (dt_from=${DT_FROM}, dt_to=${DT_TO})\" 1>&2; "
-            "python -m src.utils.minio_reports "
-            "--last-hours '{{ params.report_last_hours }}' "
-            "--report-path \"${REPORT_FILE}\" "
-            "--dt-from \"${DT_FROM}\" "
-            "--dt-to \"${DT_TO}\""
-        ),
-        params={"report_last_hours": 1},
-    )
+        compute_report_window_task = PythonOperator(
+            task_id="compute_report_window",
+            python_callable=compute_report_window,
+            op_kwargs={"last_hours": "{{ params.report_last_hours }}"},
+        )
 
-    # --- minimal observability log (best-effort) ---
-    quality_summary_log = BashOperator(
-        task_id="quality_summary_log",
-        bash_command="cd /opt/mih && make health && make quality || true",
-    )
+        md_report = BashOperator(
+            task_id="md_report",
+            do_xcom_push=True,
+            bash_command=(
+                "set -euo pipefail; "
+                "cd /opt/mih; "
+                "python -m src.reporting.generate_report "
+                "--from \"{{ (ti.xcom_pull(task_ids='compute_report_window') or {})['dt_from'] }}\" "
+                "--to \"{{ (ti.xcom_pull(task_ids='compute_report_window') or {})['dt_to'] }}\" "
+                "--table articles 1>&2; "
+                "REPORT_FILE=$(ls -1t reports/daily_report_*.md | head -n 1); "
+                "echo \"${REPORT_FILE}\""
+            ),
+        )
 
-    # --- Dependencies ---
-    wait_clickhouse >> wait_minio >> pick_latest_silver
-    pick_latest_silver >> precheck_silver >> validate_silver >> silver_to_gold >> compute_gold_path_task
+        upload_report_to_minio = BashOperator(
+            task_id="upload_report_to_minio",
+            bash_command=(
+                "set -euo pipefail; "
+                "cd /opt/mih; "
+                "REPORT_FILE=\"{{ (ti.xcom_pull(task_ids='md_report') or '') | trim }}\"; "
+                "if [ -z \"${REPORT_FILE}\" ]; then "
+                "  echo \"[ERROR] md_report XCom is empty; cannot upload deterministically\" 1>&2; "
+                "  exit 1; "
+                "fi; "
+                "DT_FROM=\"{{ ti.xcom_pull(task_ids='compute_report_window')['dt_from'] }}\"; "
+                "DT_TO=\"{{ ti.xcom_pull(task_ids='compute_report_window')['dt_to'] }}\"; "
+                "echo \"[INFO] Uploading report: ${REPORT_FILE} (dt_from=${DT_FROM}, dt_to=${DT_TO})\" 1>&2; "
+                "python -m src.utils.minio_reports "
+                "--last-hours '{{ params.report_last_hours }}' "
+                "--report-path \"${REPORT_FILE}\" "
+                "--dt-from \"${DT_FROM}\" "
+                "--dt-to \"${DT_TO}\""
+            ),
+            params={"report_last_hours": 1},
+        )
 
-    compute_gold_path_task >> gold_non_empty_task
-    gold_non_empty_task >> validate_gold >> quality_gate >> compute_batch_id_task >> delete_batch_in_ch >> load_to_clickhouse
+        quality_summary_log = BashOperator(
+            task_id="quality_summary_log",
+            bash_command="cd /opt/mih && make health && make quality || true",
+        )
 
-    load_to_clickhouse >> sql_reports >> compute_report_window_task >> md_report >> upload_report_to_minio >> quality_summary_log
+        wait_clickhouse >> wait_minio >> pick_latest_silver
+        pick_latest_silver >> precheck_silver >> validate_silver >> silver_to_gold >> compute_gold_path_task
+
+        compute_gold_path_task >> gold_non_empty_task
+        gold_non_empty_task >> validate_gold >> quality_gate >> compute_batch_id_task >> delete_batch_in_ch >> load_to_clickhouse
+
+        load_to_clickhouse >> sql_reports >> compute_report_window_task >> md_report >> upload_report_to_minio >> quality_summary_log
+
+    return dag
+
+
+dag_tg = make_dag(
+    dag_id="mih_etl_latest_strict_tg",
+    silver_glob="articles_*_telegram_*_clean.json",
+    exclude_contains=None,
+    tags=["mih", "tg"],
+)
+
+dag_rss = make_dag(
+    dag_id="mih_etl_latest_strict_rss",
+    silver_glob="articles_[0-9]*_clean.json",
+    exclude_contains="telegram",
+    tags=["mih", "rss"],
+)

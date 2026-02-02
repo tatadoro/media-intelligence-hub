@@ -277,6 +277,24 @@ def save_dataframe_to_json(
     return str(filename)
 
 
+def save_combined_dataframe_to_json(df: pd.DataFrame, raw_dir_cfg: str, now_utc: datetime) -> str:
+    """
+    TG-style combined raw (один файл на прогон):
+    data/raw/articles_YYYYMMDD_HHMMSS_rss_combined.json
+
+    ВАЖНО: имя начинается с articles_*.json, чтобы clean_raw_to_silver_local мог
+    выбирать latest по той же логике, что и в TG.
+    """
+    raw_dir = BASE_DIR / raw_dir_cfg
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    ts_str = now_utc.strftime("%Y%m%d_%H%M%S")
+    filename = raw_dir / f"articles_{ts_str}_rss_combined.json"
+
+    df.to_json(filename, orient="records", force_ascii=False, indent=2)
+    return str(filename)
+
+
 def save_raw_to_s3(df: pd.DataFrame, source_name: str, now_utc: datetime) -> str:
     """
     Сохраняем сырые статьи в raw-зону Data Lake (MinIO).
@@ -328,9 +346,7 @@ def collect_one_source(
             df = _fallback_items_to_df(items, source_name=name)
         else:
             head = content[:200].decode("utf-8", errors="replace").replace("\n", " ")
-            print(
-                f"[WARN] Got 0 items. status={status}, content-type={content_type}, final_url={final_url}"
-            )
+            print(f"[WARN] Got 0 items. status={status}, content-type={content_type}, final_url={final_url}")
             print(f"[WARN] Response head: {head}")
 
     return df
@@ -340,6 +356,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Collect RSS sources -> raw (S3/MinIO or local).")
     p.add_argument("--only", type=str, default=None, help="Collect only one source by name (e.g. rbc.ru)")
     p.add_argument("--check", action="store_true", help="Fetch+parse only; do not save")
+    p.add_argument(
+        "--combined",
+        action="store_true",
+        help="Save one combined local raw JSON per run (tg-style): data/raw/articles_<ts>_rss_combined.json",
+    )
     return p.parse_args()
 
 
@@ -347,8 +368,10 @@ def main() -> None:
     args = parse_args()
     settings = load_settings()
 
-    raw_backend = _get_raw_backend(settings)
-    raw_dir_cfg = _get_raw_dir(settings)
+    # Позволяем управлять поведением из окружения (Makefile/Airflow), не ломая settings.yaml
+    raw_backend = (os.getenv("RAW_BACKEND") or "").strip().lower() or _get_raw_backend(settings)
+    raw_dir_cfg = (os.getenv("RAW_DIR") or "").strip() or _get_raw_dir(settings)
+
     sources = _get_rss_sources(settings)
 
     # Fallback: если sources.rss не задан — оставим поведение “один источник”
@@ -382,12 +405,20 @@ def main() -> None:
         print("[WARN] No enabled RSS sources found. Check config/settings.yaml")
         return
 
+    # TG-style combined: включается флагом --combined или env RSS_COMBINED=1/true/yes
+    combined = bool(args.combined) or os.getenv("RSS_COMBINED", "").strip() in {"1", "true", "True", "yes", "Yes"}
+
     http_cfg = HttpCfg()
     session = make_session(http_cfg)
 
+    # Один batch_id и один now_utc на весь прогон (как в TG)
+    run_now_utc = datetime.now(timezone.utc)
+    batch_id = os.getenv("BATCH_ID") or run_now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    combined_dfs: list[pd.DataFrame] = []
+
     for src in run_sources:
-        now_utc = datetime.now(timezone.utc)
-        batch_id = os.getenv("BATCH_ID") or now_utc.isoformat()
+        now_utc = run_now_utc
 
         name = str(src.get("name") or "").strip()
         url = str(src.get("url") or "").strip()
@@ -414,6 +445,9 @@ def main() -> None:
 
         print("[RSS] Converting feed to DataFrame ...")
         print(f"[RSS] Got {len(df)} items")
+
+        if not df.empty:
+            combined_dfs.append(df)
 
         items_found = int(len(df))
         items_saved = 0
@@ -451,12 +485,19 @@ def main() -> None:
 
             if raw_backend in ("local", "both"):
                 try:
-                    print("[SAVE] Saving local backup JSON ...")
-                    filename = save_dataframe_to_json(df, raw_dir_cfg, source_name=name, now_utc=now_utc)
-                    print(f"[SAVE] Saved local copy with {len(df)} items to {filename}")
-                    saved_any = True
-                    if not raw_object_name:
-                        raw_object_name = filename
+                    if combined:
+                        # В combined-режиме локальный файл сохраняем один раз после цикла.
+                        # Здесь помечаем, что локальное сохранение будет выполнено позже.
+                        saved_any = True
+                        if not raw_object_name:
+                            raw_object_name = "local:combined_pending"
+                    else:
+                        print("[SAVE] Saving local backup JSON ...")
+                        filename = save_dataframe_to_json(df, raw_dir_cfg, source_name=name, now_utc=now_utc)
+                        print(f"[SAVE] Saved local copy with {len(df)} items to {filename}")
+                        saved_any = True
+                        if not raw_object_name:
+                            raw_object_name = filename
                 except Exception as e:
                     save_errors.append(f"local:{type(e).__name__}:{e}")
 
@@ -493,6 +534,16 @@ def main() -> None:
             "raw_object_name": raw_object_name,
         }
         _insert_coverage_row(coverage_row)
+
+    # Сохраняем один combined local raw по итогам прогона (tg-style)
+    if not args.check and combined and raw_backend in ("local", "both"):
+        if combined_dfs:
+            df_all = pd.concat(combined_dfs, ignore_index=True)
+            print("[SAVE] Saving combined local raw JSON (tg-style) ...")
+            combined_path = save_combined_dataframe_to_json(df_all, raw_dir_cfg=raw_dir_cfg, now_utc=run_now_utc)
+            print(f"[SAVE] Saved combined local raw with {len(df_all)} items to {combined_path}")
+        else:
+            print("[WARN] combined enabled, but no items collected; combined file not saved")
 
     # не закрываем session явно: requests.Session закроется при завершении процесса
 

@@ -31,7 +31,8 @@ export
         etl-latest-rss etl-latest-tg etl-latest-all \
         stopwords-auto stopwords-auto-show dupes-json report-json topkw-json hour-json \
         rss-raw rss-raw-latest rss-silver rss-silver-latest rss-gold rss-gold-latest rss-load rss-etl rss-etl-refresh \
-        ch ch-file
+        ch ch-file \
+        ch-running-check ch-http-ping
 
 # ------------------------------------------------------------
 # Настройки Python/путей по умолчанию
@@ -191,7 +192,15 @@ COMPOSE_FULL := COMPOSE_IGNORE_ORPHANS=1 $(COMPOSE_BIN) --project-directory $(PR
 # ------------------------------------------------------------
 # ClickHouse (переменные с fallback’ами)
 # ВАЖНО: НЕ ссылаемся на CH_* внутри определения CH_* (иначе рекурсия)
+#
+# ВАЖНО 2: когда make запускается ВНУТРИ контейнера (airflow-webserver),
+# localhost указывает на сам контейнер, поэтому для ping нужен clickhouse:8123.
+# На хосте, наоборот, используем localhost:18123 (проброшенный порт).
 # ------------------------------------------------------------
+
+# Определяем, выполняемся ли мы внутри Docker-контейнера
+IN_DOCKER := $(shell test -f /.dockerenv && echo 1 || echo 0)
+
 ENV_CH_DATABASE  := $(CH_DATABASE)
 ENV_CH_USER      := $(CH_USER)
 ENV_CH_PASSWORD  := $(CH_PASSWORD)
@@ -202,12 +211,24 @@ ENV_CH_TZ        := $(CH_TZ)
 CH_DB       := $(or $(ENV_CH_DATABASE),$(CLICKHOUSE_DB),media_intel)
 CH_USER     := $(or $(ENV_CH_USER),$(CLICKHOUSE_USER),admin)
 CH_PASSWORD := $(or $(ENV_CH_PASSWORD),$(CLICKHOUSE_PASSWORD),admin12345)
-CH_HOST     := $(or $(ENV_CH_HOST),localhost)
-CH_PORT     := $(or $(ENV_CH_PORT),18123)
+
+ifeq ($(IN_DOCKER),1)
+  # Внутри docker-сети: имя сервиса + внутренний порт
+  CH_HOST := $(or $(ENV_CH_HOST),clickhouse)
+  CH_PORT := $(or $(ENV_CH_PORT),8123)
+else
+  # На хосте: проброшенный порт
+  CH_HOST := $(or $(ENV_CH_HOST),localhost)
+  CH_PORT := $(or $(ENV_CH_PORT),18123)
+endif
+
 CH_TZ       := $(or $(ENV_CH_TZ),Europe/Belgrade)
 
 # NEW: формат вывода clickhouse-client для bash-скриптов (scripts/ch_run_sql.sh)
 CH_FORMAT ?= TSVRaw
+
+# NEW: безопасный способ определить running контейнер ClickHouse (а не stopped/exited)
+CH_CONTAINER_ID ?= $(shell docker ps -q --filter "name=^/clickhouse$$" --filter "status=running" | head -n 1)
 
 # ------------------------------------------------------------
 # MinIO (переменные с fallback’ами) — также без рекурсии
@@ -233,6 +254,36 @@ define banner
 endef
 
 # ============================================================
+# ClickHouse readiness helpers (для gate и любых SQL проверок)
+# ============================================================
+
+# Определяем, что make выполняется внутри Docker-контейнера (airflow-webserver и т.п.)
+IN_DOCKER := $(shell test -f /.dockerenv && echo 1 || echo 0)
+
+# В docker-сети ClickHouse доступен по имени сервиса и внутреннему порту
+CH_DOCKER_HOST ?= clickhouse
+CH_DOCKER_PORT ?= 8123
+
+# Для ping выбираем корректный адрес:
+# - внутри Docker: clickhouse:8123
+# - на хосте: $(CH_HOST):$(CH_PORT)
+CH_PING_HOST := $(if $(filter 1,$(IN_DOCKER)),$(CH_DOCKER_HOST),$(CH_HOST))
+CH_PING_PORT := $(if $(filter 1,$(IN_DOCKER)),$(CH_DOCKER_PORT),$(CH_PORT))
+
+# Проверяем, что clickhouse контейнер реально RUNNING (иначе docker exec даст "container is not running")
+ch-running-check:
+	@if [ -z "$(CH_CONTAINER_ID)" ]; then \
+	  echo "[ERROR] ClickHouse container 'clickhouse' is not running."; \
+	  docker ps -a --filter "name=clickhouse" --format "table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}"; \
+	  exit 1; \
+	fi
+
+# Более стабильная проверка: ping по HTTP
+ch-http-ping:
+	@curl -sfS "http://$(CH_PING_HOST):$(CH_PING_PORT)/ping" >/dev/null || \
+	  (echo "[ERROR] ClickHouse ping failed at http://$(CH_PING_HOST):$(CH_PING_PORT)/ping"; exit 1)
+
+# ============================================================
 # Env
 # ============================================================
 
@@ -245,6 +296,7 @@ env-check:
 	@echo "CH_HOST=$(CH_HOST)"
 	@echo "CH_PORT=$(CH_PORT)"
 	@echo "CH_FORMAT=$(CH_FORMAT)"
+	@echo "CH_CONTAINER_ID=$(CH_CONTAINER_ID)"
 	@echo "CLICKHOUSE_USER=$(or $(CLICKHOUSE_USER),$(CH_USER))"
 	@echo "CLICKHOUSE_PASSWORD=$${CLICKHOUSE_PASSWORD:+(set)}"
 	@echo "CLICKHOUSE_PASSWORD_LEN=$${#CLICKHOUSE_PASSWORD}"
@@ -321,12 +373,12 @@ bootstrap:
 # ClickHouse SQL (DDL / views / checks / reports)
 # ============================================================
 
-ch: env-ensure env-check
+ch: env-ensure env-check ch-running-check
 	@docker exec -i clickhouse clickhouse-client \
 	  -u "$(CH_USER)" --password "$(CH_PASSWORD)" --database "$(CH_DB)" \
 	  --query "$(Q)"
 
-ch-file: env-ensure env-check
+ch-file: env-ensure env-check ch-running-check
 	@test -n "$(F)" || (echo "[ERROR] Provide F=<path_to_sql_file>"; exit 1)
 	@docker exec -i clickhouse clickhouse-client \
 	  -u "$(CH_USER)" --password "$(CH_PASSWORD)" --database "$(CH_DB)" \
@@ -514,7 +566,12 @@ validate:
 	@$(call banner,"Validate latest silver")
 	@$(PYTHON) scripts/validate_silver.py --input "$$(ls -1t $(SILVER_GLOB) | head -n 1)"
 
-gate:
+# ВАЖНО: gate должен быть устойчивым и не падать из-за "docker exec в stopped контейнер".
+# Поэтому:
+# 1) сначала проверяем, что контейнер clickhouse RUNNING
+# 2) затем делаем /ping (host/port выбираются автоматически: хост vs контейнер)
+# 3) и только потом запускаем SQL проверки
+gate: ch-running-check ch-http-ping
 	@$(call banner,"Quality gate")
 	@bash scripts/ch_run_sql.sh sql/02_content_quality.sql
 
@@ -573,10 +630,11 @@ tg-raw-latest:
 		echo "$$f"; \
 	fi
 
+# FIX: убран лишний символ ')' в блоке if (он ломал таргет)
 tg-raw-latest-any:
 	@set -e; \
 	f="$$(ls -1t $(TG_RAW_ANY_GLOB) 2>/dev/null | head -n 1)"; \
-	if [ -z "$$f" ]; then echo "[ERROR] No Telegram raw files found: $(TG_RAW_ANY_GLOB)"; exit 1); fi; \
+	if [ -z "$$f" ]; then echo "[ERROR] No Telegram raw files found: $(TG_RAW_ANY_GLOB)"; exit 1; fi; \
 	echo "$$f"
 
 tg-raw-latest-chan:
