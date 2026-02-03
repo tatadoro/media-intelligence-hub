@@ -1,0 +1,12 @@
+natasha
+
+langid>=1.1.6
+yake>=0.4.8
+
+transformers>=4.41.0
+torch>=2.1.0
+sentencepiece
+
+pymorphy2
+pymorphy2-dicts-ru
+setuptools<81

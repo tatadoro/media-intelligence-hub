@@ -3,7 +3,12 @@ set -euo pipefail
 
 MINIO_ENDPOINT="${MINIO_ENDPOINT:-http://localhost:9000}"
 MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY:-admin}"
-MINIO_SECRET_KEY="${MINIO_SECRET_KEY:-admin12345}"
+MINIO_SECRET_KEY="${MINIO_SECRET_KEY:-}"
+
+if [ -z "${MINIO_SECRET_KEY}" ]; then
+  echo "[ERROR] MINIO_SECRET_KEY is not set. Export MINIO_SECRET_KEY (or fill .env) and retry." >&2
+  exit 1
+fi
 MINIO_BUCKET="${MINIO_BUCKET:-mih}"
 
 echo "[INFO] Ensuring MinIO bucket: ${MINIO_BUCKET} at ${MINIO_ENDPOINT}"

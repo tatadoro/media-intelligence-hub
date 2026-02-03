@@ -37,7 +37,7 @@ export
 # ------------------------------------------------------------
 # Настройки Python/путей по умолчанию
 # ------------------------------------------------------------
-PYTHON      ?= python
+PYTHON      ?= python3
 SILVER_GLOB ?= data/silver/articles_*_clean.json
 
 # --- Source-specific latest silver globs ---
@@ -210,7 +210,7 @@ ENV_CH_TZ        := $(CH_TZ)
 
 CH_DB       := $(or $(ENV_CH_DATABASE),$(CLICKHOUSE_DB),media_intel)
 CH_USER     := $(or $(ENV_CH_USER),$(CLICKHOUSE_USER),admin)
-CH_PASSWORD := $(or $(ENV_CH_PASSWORD),$(CLICKHOUSE_PASSWORD),admin12345)
+CH_PASSWORD := $(or $(ENV_CH_PASSWORD),$(CLICKHOUSE_PASSWORD))
 
 ifeq ($(IN_DOCKER),1)
   # Внутри docker-сети: имя сервиса + внутренний порт
@@ -240,7 +240,7 @@ ENV_MINIO_BUCKET     := $(MINIO_BUCKET)
 
 MINIO_ENDPOINT   := $(or $(ENV_MINIO_ENDPOINT),http://localhost:9000)
 MINIO_ACCESS_KEY := $(or $(ENV_MINIO_ACCESS_KEY),admin)
-MINIO_SECRET_KEY := $(or $(ENV_MINIO_SECRET_KEY),admin12345)
+MINIO_SECRET_KEY := $(or $(ENV_MINIO_SECRET_KEY))
 MINIO_BUCKET     := $(or $(ENV_MINIO_BUCKET),mih)
 
 # ============================================================
@@ -300,6 +300,7 @@ env-check:
 	@echo "CLICKHOUSE_USER=$(or $(CLICKHOUSE_USER),$(CH_USER))"
 	@echo "CLICKHOUSE_PASSWORD=$${CLICKHOUSE_PASSWORD:+(set)}"
 	@echo "CLICKHOUSE_PASSWORD_LEN=$${#CLICKHOUSE_PASSWORD}"
+	@$(PYTHON) scripts/env_check.py
 
 env-ensure:
 	@$(call banner,"Ensure env")

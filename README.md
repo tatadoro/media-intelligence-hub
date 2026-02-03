@@ -112,16 +112,40 @@ flowchart LR
 
 Проект намеренно держит NLP‑часть **опциональной**: базовый ETL работает без «тяжёлых» зависимостей, а расширенные поля (тональность, NER‑фичи и т.п.) заполняются при наличии библиотек.
 
+Установка:
+```bash
+# Важно: используйте python3 -m pip, чтобы ставить в то же окружение, из которого запускается пайплайн
+python3 -m pip install -r requirements-base.txt
+# опционально, для NLP-фич
+python3 -m pip install -r requirements-nlp.txt
+```
+
+Опциональные NLP-зависимости (при отсутствии пайплайн не падает, поля остаются пустыми/нейтральными):
+- **NER (персоны/гео):** `natasha`
+- **Sentiment (RU):** `transformers`, `torch`, `sentencepiece`
+- **Keyphrases (YAKE):** `yake` *(если используешь этот путь в будущем)*
+- **Lang detect:** `langid`
+
 ### Tonality (RU) через Transformers
 Минимум для корректной работы тональности на русском:
 - `transformers`, `torch`, `sentencepiece`
 
 Первый запуск может скачать модель в кэш Hugging Face. В Docker‑окружении кэш вынесен в отдельный volume и шарится между контейнерами Airflow, чтобы избежать повторных загрузок и ускорить прогон.
+Если `transformers` установлены, TG‑источники принудительно используют Transformers (без падения в лексикон), чтобы избежать низкого `confidence` на коротких/шумных текстах.
 
 Для воспроизводимости предусмотрены переменные окружения:
 - `HF_HOME` и `TRANSFORMERS_CACHE` — путь к кэшу;
 - `HF_HUB_OFFLINE=1` и `TRANSFORMERS_OFFLINE=1` — строгий офлайн‑режим (включается после прогрева кэша);
 - `TOKENIZERS_PARALLELISM=false` и ограничения потоков (`OMP_NUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`, `MKL_NUM_THREADS=1`) — чтобы снизить нагрузку и избежать OOM‑kill в контейнерах при параллельных задачах.
+
+Прогрев модели вручную (один раз, чтобы потом работать офлайн):
+```bash
+python3 - <<'PY'
+from transformers import pipeline
+pipe = pipeline("text-classification", model="cointegrated/rubert-tiny-sentiment-balanced", tokenizer="cointegrated/rubert-tiny-sentiment-balanced", truncation=True)
+print(pipe("Тестовый текст."))
+PY
+```
 
 ### Морфология (лемматизация/действия)
 Для морфологии (лемматизация в эвристиках/действиях):
@@ -131,6 +155,16 @@ flowchart LR
 - зафиксировать `setuptools<81` (у `pymorphy2` встречается предупреждение про `pkg_resources`, которое в будущих версиях `setuptools` может стать ошибкой).
 
 Важно: `dostoevsky` в проекте не является обязательной и по умолчанию не используется (часто требует сборки `fasttext`/C++ и дополнительных build‑зависимостей; на Python 3.12/macOS нередко не ставится «в один шаг»). Поэтому в MVP тональность реализована через `transformers`.
+
+### NLP coverage и quality gate
+В проекте есть скрипты для оценки покрытия NLP и пороговой проверки качества:
+```bash
+python3 scripts/nlp_coverage_report.py
+python3 scripts/nlp_quality_gate.py
+```
+Результаты пишутся в `reports/nlp_coverage_report_<YYYY-MM-DD>.md` и `.json`.
+Пороги можно переопределить:
+`NLP_LANG_OK_MIN`, `NLP_KP_OK_MIN`, `NLP_SENT_OK_MIN`.
 
 ---
 

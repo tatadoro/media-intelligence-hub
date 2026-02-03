@@ -18,7 +18,7 @@ from src.processing.entity_canon import (
     canon_persons_batch_semicolon,
 )
 from src.processing.nlp_extras import add_lang_keyphrases_sentiment
-from src.processing.ner import extract_persons_geo as ner_extract_persons_geo
+from src.processing.ner import extract_persons_orgs_geo as ner_extract_persons_orgs_geo
 from src.processing.summarization import enrich_articles_with_summary_and_keywords
 
 CH_TZ = "Europe/Moscow"
@@ -105,6 +105,37 @@ def _uniq_keep_order(items: List[str]) -> List[str]:
             seen.add(x)
             out.append(x)
     return out
+
+
+def _print_nlp_health(df: pd.DataFrame) -> None:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return
+
+    total = len(df)
+
+    def _ratio_ok(col: str) -> str:
+        if col not in df.columns:
+            return "n/a"
+        s = df[col].fillna(0)
+        try:
+            ok = (s.astype(int) > 0).sum()
+        except Exception:
+            ok = (s == 1).sum()
+        return f"{ok}/{total} ({ok / total:.0%})"
+
+    def _ratio_lang() -> str:
+        if "lang" not in df.columns:
+            return "n/a"
+        s = df["lang"].fillna("").astype(str)
+        ok = ((s != "") & (s != "unknown")).sum()
+        return f"{ok}/{total} ({ok / total:.0%})"
+
+    print(
+        "[NLP] health: "
+        f"lang_ok={_ratio_lang()} "
+        f"keyphrases_ok={_ratio_ok('keyphrases_ok')} "
+        f"sentiment_ok={_ratio_ok('sentiment_ok')}"
+    )
 
 
 def _split_sentences(text: str) -> List[str]:
@@ -353,18 +384,24 @@ def add_persons_actions_columns(df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------
 def add_entities_persons_geo_from_text_if_missing(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Гарантирует наличие entities_persons/entities_geo.
-    Если этих колонок нет — извлекаем NER из текста (nlp_text -> clean_text -> raw_text).
+    Гарантирует наличие entities_persons/entities_orgs/entities_geo.
+    Если колонок нет — извлекаем NER из текста (nlp_text -> clean_text -> raw_text).
     """
     out = df.copy()
 
-    # Если обе колонки есть — ничего не делаем
-    if "entities_persons" in out.columns and "entities_geo" in out.columns:
+    # Если все колонки есть — ничего не делаем
+    if (
+        "entities_persons" in out.columns
+        and "entities_geo" in out.columns
+        and "entities_orgs" in out.columns
+    ):
         return out
 
     if out.empty:
         if "entities_persons" not in out.columns:
             out["entities_persons"] = pd.Series(dtype="string")
+        if "entities_orgs" not in out.columns:
+            out["entities_orgs"] = pd.Series(dtype="string")
         if "entities_geo" not in out.columns:
             out["entities_geo"] = pd.Series(dtype="string")
         return out
@@ -379,16 +416,20 @@ def add_entities_persons_geo_from_text_if_missing(df: pd.DataFrame) -> pd.DataFr
     text_s = text_s.fillna("").astype(str)
 
     persons_out: List[str] = []
+    orgs_out: List[str] = []
     geo_out: List[str] = []
 
     for t in text_s.tolist():
-        p, g = ner_extract_persons_geo(t)
+        p, o, g = ner_extract_persons_orgs_geo(t)
         persons_out.append(p or "")
+        orgs_out.append(o or "")
         geo_out.append(g or "")
 
     # не затираем существующее, добавляем только отсутствующее
     if "entities_persons" not in out.columns:
         out["entities_persons"] = persons_out
+    if "entities_orgs" not in out.columns:
+        out["entities_orgs"] = orgs_out
     if "entities_geo" not in out.columns:
         out["entities_geo"] = geo_out
 
@@ -772,6 +813,11 @@ def _process_one_file(input_path: Path, output_path: Path, with_actions: bool) -
     print(f"silver: {input_path}")
 
     df_silver = load_silver_df(input_path)
+    _validate_required_columns(
+        df_silver,
+        ["id", "title", "link", "source", "published_at", "clean_text"],
+        context="silver",
+    )
 
     # 1) нормализуем время
     df_silver = normalize_published_at(df_silver)
@@ -846,6 +892,7 @@ def _process_one_file(input_path: Path, output_path: Path, with_actions: bool) -
 
         # 9) lang + keyphrases + sentiment
         df_gold = _safe_apply(df_gold, add_lang_keyphrases_sentiment, "add_lang_keyphrases_sentiment")
+        _print_nlp_health(df_gold)
 
         # гарантируем id в gold
         df_gold = ensure_id_column(df_gold)
@@ -853,6 +900,22 @@ def _process_one_file(input_path: Path, output_path: Path, with_actions: bool) -
     print(f"gold:  {output_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df_gold.to_parquet(output_path, index=False)
+
+
+def _validate_required_columns(df: pd.DataFrame, required: List[str], *, context: str) -> None:
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"[ERROR] {context} data is missing required columns: {missing}. "
+            f"Available columns: {sorted(df.columns.tolist())}"
+        )
+
+    empty_cols = [c for c in required if df[c].isna().all()]
+    if empty_cols:
+        raise ValueError(
+            f"[ERROR] {context} data has empty required columns: {empty_cols}. "
+            "Ensure the upstream step populates these fields."
+        )
 
 
 def main() -> None:

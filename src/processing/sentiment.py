@@ -72,6 +72,8 @@ class SentimentResult:
     label: str              # 'pos'|'neu'|'neg' или '' если не считали
     score: Optional[float]  # None, если не посчиталось; иначе [-1..1], для neu обычно 0.0
     ok: bool                # True, если реально считали (текст достаточный + модель/лексикон отработали)
+    confidence: Optional[float]  # 0..1, None если не посчитали
+    source: str             # transformers|lexicon|empty
 
 
 def _norm(text: str) -> str:
@@ -128,11 +130,11 @@ def _lexicon_sentiment(text: str) -> SentimentResult:
     """
     t = _norm(text)
     if not t:
-        return SentimentResult("", None, False)
+        return SentimentResult("", None, False, None, "empty")
 
     toks = [m.group(0) for m in _TOKEN_RE.finditer(t)]
     if not toks:
-        return SentimentResult("", None, False)
+        return SentimentResult("", None, False, None, "empty")
 
     score = 0.0
     window_neg = 0
@@ -164,10 +166,10 @@ def _lexicon_sentiment(text: str) -> SentimentResult:
     score = max(-1.0, min(1.0, score / 3.0))
 
     if score > 0.15:
-        return SentimentResult("pos", float(score), True)
+        return SentimentResult("pos", float(score), True, min(1.0, abs(score)), "lexicon")
     if score < -0.15:
-        return SentimentResult("neg", float(score), True)
-    return SentimentResult("neu", 0.0, True)
+        return SentimentResult("neg", float(score), True, min(1.0, abs(score)), "lexicon")
+    return SentimentResult("neu", 0.0, True, 0.1, "lexicon")
 
 
 def analyze_sentiment(
@@ -175,6 +177,7 @@ def analyze_sentiment(
     *,
     min_chars: int = 120,
     min_tokens: int = 8,
+    force_transformers: bool = False,
 ) -> SentimentResult:
     """
     Главная функция sentiment.
@@ -183,14 +186,17 @@ def analyze_sentiment(
     """
     t = _norm(text)
     if not t:
-        return SentimentResult("", None, False)
+        return SentimentResult("", None, False, None, "empty")
 
     # quality gate: короткие тексты не считаем, чтобы не плодить "нейтрал 0.0" по мусору
     toks = [m.group(0) for m in _TOKEN_RE.finditer(t)]
     if len(t) < min_chars or len(toks) < min_tokens:
-        return SentimentResult("", None, False)
+        return SentimentResult("", None, False, None, "empty")
 
     pipe = _get_tf_pipe()
+    if pipe is None and force_transformers:
+        return SentimentResult("", None, False, None, "transformers_missing")
+
     if pipe is not None:
         try:
             r = pipe(t[:2000])[0]
@@ -198,12 +204,13 @@ def analyze_sentiment(
             prob = float(r.get("score", 0.0))
 
             if "pos" in label_raw or "positive" in label_raw:
-                return SentimentResult("pos", prob, True)
+                return SentimentResult("pos", prob, True, prob, "transformers")
             if "neg" in label_raw or "negative" in label_raw:
-                return SentimentResult("neg", -prob, True)
-            return SentimentResult("neu", 0.0, True)
+                return SentimentResult("neg", -prob, True, prob, "transformers")
+            return SentimentResult("neu", 0.0, True, prob, "transformers")
         except Exception:
-            # fallback to lexicon
+            if force_transformers:
+                return SentimentResult("", None, False, None, "transformers_error")
             return _lexicon_sentiment(t)
 
     return _lexicon_sentiment(t)

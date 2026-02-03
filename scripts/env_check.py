@@ -23,6 +23,9 @@ REQUIRED_ENV_BASE = [
     # MinIO (compose)
     "MINIO_ROOT_USER",
     "MINIO_ROOT_PASSWORD",
+    # Superset (compose)
+    "SUPERSET_SECRET_KEY",
+    "SUPERSET_ADMIN_PASSWORD",
     # Airflow secrets (compose)
     "AIRFLOW__CORE__FERNET_KEY",
     "AIRFLOW__WEBSERVER__SECRET_KEY",
@@ -58,7 +61,7 @@ PAIRS = [
     ("CLICKHOUSE_PASSWORD", "CH_PASSWORD"),
 ]
 
-PLACEHOLDERS = {"__FILL_ME__", "__REPLACE_ME__", "FILL_ME", "REPLACE_ME"}
+PLACEHOLDERS = {"__FILL_ME__", "__REPLACE_ME__", "FILL_ME", "REPLACE_ME", "change-me-please"}
 
 RE_KV = re.compile(r"^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$")
 

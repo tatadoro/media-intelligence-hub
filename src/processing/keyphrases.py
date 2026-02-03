@@ -10,12 +10,27 @@ We keep the implementation simple and deterministic:
 
 from __future__ import annotations
 
+import os
 import re
 from collections import Counter
+from functools import lru_cache
+from pathlib import Path
 from typing import Iterable, List, Tuple, Dict, Set, Optional
 
 
 _WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё]+", re.UNICODE)
+
+# --- Optional lemmatizer (ru) ---
+_LEMMA_ERROR: Optional[str] = None
+try:
+    import pymorphy3  # type: ignore
+
+    _LEMMA_OK = True
+    _LEMMA = pymorphy3.MorphAnalyzer(lang="ru")
+except Exception as e:
+    _LEMMA_OK = False
+    _LEMMA = None
+    _LEMMA_ERROR = repr(e)
 
 # Часто встречающиеся одиночные слова, которые почти всегда мусор как "ключевая фраза"
 _GENERIC_SINGLE: Set[str] = {
@@ -66,6 +81,92 @@ _STOP_BY_LANG: Dict[str, Set[str]] = {
     "en": _EN_STOP,
 }
 
+# Доменные стоп-термины (новости/медиа), которые часто шумят в keyphrases
+_DOMAIN_STOP: Set[str] = {
+    # ru
+    "новость",
+    "сообщить",
+    "сообщать",
+    "заявить",
+    "заявлять",
+    "рассказать",
+    "говорить",
+    "сказать",
+    "пояснить",
+    "уточнить",
+    "отметить",
+    "подчеркнуть",
+    "источник",
+    "агентство",
+    "редакция",
+    "интервью",
+    "обзор",
+    # en
+    "news",
+    "report",
+    "reported",
+    "says",
+    "said",
+    "sources",
+    "according",
+    "statement",
+    "interview",
+}
+
+_DOMAIN_STOP_RU: Set[str] = set()
+
+
+def _load_ru_domain_stopwords() -> Set[str]:
+    env_path = os.getenv("MIH_STOPWORDS_RU_PATH", "").strip()
+    if env_path:
+        p = Path(env_path)
+    else:
+        repo_root = Path(__file__).resolve().parents[2]
+        p = repo_root / "data" / "nlp" / "stopwords" / "stopwords_ru_v002.txt"
+        if not p.exists():
+            p = repo_root / "data" / "nlp" / "stopwords" / "stopwords_ru_v001.txt"
+
+    if not p.exists() or not p.is_file():
+        return set()
+
+    stop: Set[str] = set()
+    try:
+        for line in p.read_text(encoding="utf-8").splitlines():
+            s = line.strip().lower()
+            if not s or s.startswith("#"):
+                continue
+            stop.add(s)
+    except Exception:
+        return set()
+
+    return stop
+
+
+def _ensure_domain_stopwords_loaded() -> None:
+    global _DOMAIN_STOP_RU
+    if _DOMAIN_STOP_RU:
+        return
+    _DOMAIN_STOP_RU = _load_ru_domain_stopwords()
+
+
+def _get_stop_set(lang: str) -> Set[str]:
+    base = set(_STOP_BY_LANG.get(lang, set()))
+    if lang == "ru":
+        _ensure_domain_stopwords_loaded()
+        base |= _DOMAIN_STOP_RU
+    return base
+
+
+@lru_cache(maxsize=200_000)
+def _lemma_token_ru(tok: str) -> str:
+    if not _LEMMA_OK or _LEMMA is None:
+        return tok
+    parses = _LEMMA.parse(tok)
+    if not parses:
+        return tok
+    best = parses[0]
+    return (best.normal_form or tok).strip()
+
 
 def _norm_phrase(s: str) -> str:
     s = s.strip().lower()
@@ -73,8 +174,11 @@ def _norm_phrase(s: str) -> str:
     return s
 
 
-def _tokenize(text: str) -> List[str]:
-    return [m.group(0).lower() for m in _WORD_RE.finditer(text or "")]
+def _tokenize(text: str, *, lang: str = "ru", lemmatize_ru: bool = True) -> List[str]:
+    tokens = [m.group(0).lower() for m in _WORD_RE.finditer(text or "")]
+    if lang == "ru" and lemmatize_ru and _LEMMA_OK:
+        tokens = [_lemma_token_ru(t) for t in tokens if t]
+    return tokens
 
 
 def _is_bad_keyword(phrase: str, lang: str) -> bool:
@@ -83,20 +187,22 @@ def _is_bad_keyword(phrase: str, lang: str) -> bool:
         return True
 
     toks = p.split()
+    stop = _get_stop_set(lang)
     if len(toks) == 1:
         t = toks[0]
         # слишком короткие
         if len(t) < 2:
             return True
         # стоп-слова и "генерик"
-        if t in _STOP_BY_LANG.get(lang, set()):
+        if t in stop:
             return True
         if t in _GENERIC_SINGLE:
             return True
+        if t in _DOMAIN_STOP:
+            return True
 
-    # если все токены — стоп-слова
-    stop = _STOP_BY_LANG.get(lang, set())
-    if stop and all(t in stop for t in toks):
+    # если все токены — стоп-слова или доменные
+    if stop and all(t in stop or t in _DOMAIN_STOP for t in toks):
         return True
 
     return False
@@ -141,15 +247,19 @@ def extract_keyphrases(
     lang: str = "ru",
     top_k: int = 15,
     ngrams: Tuple[int, ...] = (1, 2, 3),
+    max_ngram: Optional[int] = None,
+    lemmatize_ru: bool = True,
 ) -> List[str]:
     """
     Извлекает ключевые фразы из текста.
     Возвращает список строк (фраз).
     """
     lang = (lang or "ru").lower()
-    stop = _STOP_BY_LANG.get(lang, set())
+    if max_ngram is not None and max_ngram >= 1:
+        ngrams = tuple(range(1, int(max_ngram) + 1))
+    stop = _get_stop_set(lang)
 
-    tokens = _tokenize(text)
+    tokens = _tokenize(text, lang=lang, lemmatize_ru=lemmatize_ru)
     if not tokens:
         return []
 
@@ -167,11 +277,11 @@ def extract_keyphrases(
     return cand[:top_k]
 
 
-def postprocess_keyphrases(keyphrases: Iterable[str]) -> str:
+def postprocess_keyphrases(keyphrases: Iterable[str]) -> List[str]:
     """
-    Нормализует и склеивает ключевые фразы в строку (как у тебя в пайплайне).
+    Нормализует и дедупит ключевые фразы. Возвращает список.
     """
-    uniq = []
+    uniq: List[str] = []
     seen = set()
     for k in keyphrases or []:
         k2 = _norm_phrase(k)
@@ -179,4 +289,4 @@ def postprocess_keyphrases(keyphrases: Iterable[str]) -> str:
             continue
         seen.add(k2)
         uniq.append(k2)
-    return ";".join(uniq)
+    return uniq

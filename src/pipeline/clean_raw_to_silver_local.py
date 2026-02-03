@@ -11,6 +11,15 @@ import pandas as pd
 
 from src.processing.cleaning import clean_articles_df
 
+REQUIRED_RAW_COLUMNS = [
+    "id",
+    "title",
+    "link",
+    "source",
+    "published_at",
+    "raw_text",
+]
+
 
 def find_latest_raw_file(raw_dir: Path) -> Path:
     """
@@ -100,6 +109,32 @@ def transform_raw_to_silver(input_path: Path, output_path: Path) -> None:
 
     df = pd.DataFrame(raw_data)
 
+    # Telegram/raw источники иногда приходят без id. Проставим fallback:
+    # 1) uid
+    # 2) link/raw_url
+    # 3) стабильный индексный id
+    if "id" not in df.columns or df["id"].isna().all():
+        if "uid" in df.columns:
+            df["id"] = df["uid"].astype(str)
+        elif "link" in df.columns:
+            df["id"] = df["link"].astype(str)
+        elif "raw_url" in df.columns:
+            df["id"] = df["raw_url"].astype(str)
+        else:
+            df["id"] = [f"raw_{i}" for i in range(len(df))]
+    else:
+        # дособерём пустые id из uid/link/raw_url
+        missing = df["id"].isna() | (df["id"].astype(str).str.strip() == "")
+        if missing.any():
+            if "uid" in df.columns:
+                df.loc[missing, "id"] = df.loc[missing, "uid"].astype(str)
+            elif "link" in df.columns:
+                df.loc[missing, "id"] = df.loc[missing, "link"].astype(str)
+            elif "raw_url" in df.columns:
+                df.loc[missing, "id"] = df.loc[missing, "raw_url"].astype(str)
+
+    _validate_required_columns(df, REQUIRED_RAW_COLUMNS, context="raw")
+
     df_clean = clean_articles_df(
         df,
         text_column="raw_text",  # важно, чтобы совпадало с названием колонки в rss_collector
@@ -134,6 +169,22 @@ def build_output_path_from_input(input_path: Path) -> Path:
     project_root = Path(__file__).resolve().parents[2]
     silver_dir = project_root / "data" / "silver"
     return silver_dir / filename_clean
+
+
+def _validate_required_columns(df: pd.DataFrame, required: list[str], *, context: str) -> None:
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"[ERROR] {context} data is missing required columns: {missing}. "
+            f"Available columns: {sorted(df.columns.tolist())}"
+        )
+
+    empty_cols = [c for c in required if df[c].isna().all()]
+    if empty_cols:
+        raise ValueError(
+            f"[ERROR] {context} data has empty required columns: {empty_cols}. "
+            "Ensure the source provides these fields."
+        )
 
 
 def main() -> None:

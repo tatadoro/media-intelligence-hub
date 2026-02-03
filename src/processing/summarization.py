@@ -10,6 +10,7 @@ Goals:
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -116,6 +117,38 @@ RU_STOPWORDS = {
     "сегодня",
     "вчера",
     "завтра",
+}
+
+# Доменные стоп-термины (новости/медиа), которые часто шумят в keywords
+DOMAIN_STOP_TERMS = {
+    # ru
+    "новость",
+    "сообщить",
+    "сообщать",
+    "заявить",
+    "заявлять",
+    "рассказать",
+    "говорить",
+    "сказать",
+    "пояснить",
+    "уточнить",
+    "отметить",
+    "подчеркнуть",
+    "источник",
+    "агентство",
+    "редакция",
+    "интервью",
+    "обзор",
+    # en
+    "news",
+    "report",
+    "reported",
+    "says",
+    "said",
+    "sources",
+    "according",
+    "statement",
+    "interview",
 }
 
 # ----------------------------
@@ -288,6 +321,45 @@ _FALLBACK_BAD_START = {
     "до",
 }
 
+_GENERIC_ENTITY_SINGLE = {
+    # ru
+    "президент",
+    "премьер",
+    "министр",
+    "глава",
+    "лидер",
+    "депутат",
+    "сенатор",
+    "губернатор",
+    "мэр",
+    "суд",
+    "судья",
+    "прокуратура",
+    "полиция",
+    "ведомство",
+    "агентство",
+    "комитет",
+    "служба",
+    "группа",
+    "компания",
+    "холдинг",
+    # en
+    "president",
+    "prime",
+    "minister",
+    "leader",
+    "governor",
+    "mayor",
+    "court",
+    "police",
+    "agency",
+    "committee",
+    "service",
+    "group",
+    "company",
+    "holding",
+}
+
 
 def normalize_entity(s: str) -> str:
     s = (s or "").strip()
@@ -349,6 +421,8 @@ def extract_entities_ner(text: str, *, max_per_type: int = 10) -> Dict[str, List
         val = normalize_entity(norm or span.text)
         if not val or len(val) < 2:
             continue
+        if val.lower() in _GENERIC_ENTITY_SINGLE:
+            continue
         if span.type == "PER":
             persons.append(val)
         elif span.type == "ORG":
@@ -373,6 +447,8 @@ def extract_entities_fallback(text: str, *, max_per_type: int = 10) -> Dict[str,
         c2 = normalize_entity(c)
         if not c2:
             continue
+        if c2.lower() in _GENERIC_ENTITY_SINGLE:
+            continue
         first = _norm_word(c2.split()[0])
         if first in _FALLBACK_BAD_START:
             continue
@@ -386,9 +462,18 @@ def extract_entities_fallback(text: str, *, max_per_type: int = 10) -> Dict[str,
 
 def extract_entities(text: str, *, max_per_type: int = 10) -> Dict[str, List[str]]:
     ent = extract_entities_ner(text, max_per_type=max_per_type)
-    if ent["persons"] or ent["orgs"] or ent["geo"]:
-        return ent
-    return extract_entities_fallback(text, max_per_type=max_per_type)
+    fallback = extract_entities_fallback(text, max_per_type=max_per_type)
+
+    # Merge: fill empty types from fallback, otherwise union unique (lightly)
+    out = {"persons": [], "orgs": [], "geo": []}
+    for k in ("persons", "orgs", "geo"):
+        items = ent.get(k, [])
+        if items:
+            merged = _uniq_keep_order(items + fallback.get(k, []))
+            out[k] = merged[:max_per_type]
+        else:
+            out[k] = fallback.get(k, [])[:max_per_type]
+    return out
 
 
 def _sentence_entity_bonus(sentences: List[str], top_entities: List[str]) -> np.ndarray:
@@ -418,6 +503,10 @@ class SummaryConfig:
     redundancy_threshold: float = 0.65  # cosine sim; lower => more diverse
     entity_bonus_weight: float = 0.25   # bonus per entity hit (relative)
     max_entities_for_bonus: int = 6
+    min_sentence_chars: int = 25
+    min_sentence_tokens: int = 5
+    diversity_lambda: float = 0.7       # MMR penalty for similarity
+    entity_repeat_penalty: float = 0.15 # penalty per repeated entity
 
 
 def extractive_summary(text: str, cfg: SummaryConfig = SummaryConfig()) -> str:
@@ -431,6 +520,24 @@ def extractive_summary(text: str, cfg: SummaryConfig = SummaryConfig()) -> str:
     sentences = split_into_sentences(text)
     if not sentences:
         return ""
+
+    # Filter out low-signal sentences
+    def _good_sentence(s: str) -> bool:
+        s = s.strip()
+        if len(s) < cfg.min_sentence_chars:
+            return False
+        toks = [m.group(0) for m in _TOKEN_RE.finditer(s)]
+        if len(toks) < cfg.min_sentence_tokens:
+            return False
+        # too much punctuation/noise
+        punct = sum(1 for ch in s if ch in "!?:;…")
+        if punct >= max(4, len(s) // 25):
+            return False
+        return True
+
+    filtered = [s for s in sentences if _good_sentence(s)]
+    if filtered:
+        sentences = filtered
 
     # Short texts: return as-is (but clipped)
     if len(sentences) <= cfg.max_sentences:
@@ -468,25 +575,43 @@ def extractive_summary(text: str, cfg: SummaryConfig = SummaryConfig()) -> str:
 
     order = np.argsort(-scores)
 
+    # MMR selection with entity repeat penalty
+    sent_entities: List[List[str]] = []
+    for s in sentences:
+        ent_s = extract_entities_fallback(s, max_per_type=5).get("persons", [])
+        ent_s = [normalize_entity(x).lower() for x in ent_s if x]
+        sent_entities.append(ent_s)
+
     chosen: List[int] = []
-    for idx in order:
-        if len(chosen) >= cfg.max_sentences:
-            break
+    used_entities: set[str] = set()
 
-        if not chosen:
-            chosen.append(int(idx))
-            continue
-
-        sims = cosine_similarity(X[idx], X[chosen]).ravel()
-        if np.max(sims) < cfg.redundancy_threshold:
-            chosen.append(int(idx))
-
-    if len(chosen) < cfg.max_sentences:
+    for _ in range(min(cfg.max_sentences, len(sentences))):
+        best_idx = None
+        best_score = None
         for idx in order:
-            if int(idx) not in chosen:
-                chosen.append(int(idx))
-                if len(chosen) >= cfg.max_sentences:
-                    break
+            if int(idx) in chosen:
+                continue
+            base = scores[idx]
+            if chosen:
+                sims = cosine_similarity(X[idx], X[chosen]).ravel()
+                max_sim = float(np.max(sims)) if sims.size else 0.0
+            else:
+                max_sim = 0.0
+
+            # penalty for repeated entities
+            repeats = sum(1 for e in sent_entities[idx] if e in used_entities)
+            pen = cfg.entity_repeat_penalty * repeats
+
+            mmr = float(base) - cfg.diversity_lambda * max_sim - pen
+            if best_score is None or mmr > best_score:
+                best_score = mmr
+                best_idx = int(idx)
+
+        if best_idx is None:
+            break
+        chosen.append(best_idx)
+        for e in sent_entities[best_idx]:
+            used_entities.add(e)
 
     chosen_sorted = sorted(chosen)
     summary = " ".join(sentences[i] for i in chosen_sorted).strip()
@@ -524,6 +649,8 @@ def _postfilter_terms(terms: List[str], cfg: KeywordsConfig) -> List[str]:
         if not t:
             continue
         if len(t) < cfg.min_term_len:
+            continue
+        if t in DOMAIN_STOP_TERMS:
             continue
         if t.startswith("слово "):
             continue
@@ -576,6 +703,25 @@ def _postfilter_terms(terms: List[str], cfg: KeywordsConfig) -> List[str]:
     return selected
 
 
+def _fallback_keywords(texts: Sequence[str], cfg: KeywordsConfig) -> List[str]:
+    """
+    Simple per-document fallback: pick top tokens by frequency.
+    Used when TF-IDF is unstable on tiny batches.
+    """
+    results: List[str] = []
+    for t in texts:
+        norm = normalize_for_tfidf(t, keep_pos=("NOUN", "ADJF", "ADJS"))
+        toks = [x for x in norm.split() if x]
+        if not toks:
+            results.append("")
+            continue
+        counts = Counter(toks)
+        cand = [w for w, _ in counts.most_common(cfg.top_k * 5)]
+        cand = _postfilter_terms(cand, cfg)
+        results.append("; ".join(cand[: cfg.top_k]))
+    return results
+
+
 def extract_keywords_tfidf(texts: Sequence[str], cfg: KeywordsConfig = KeywordsConfig()) -> List[str]:
     """
     Global TF-IDF over a batch of documents, then top-k terms per document.
@@ -583,13 +729,21 @@ def extract_keywords_tfidf(texts: Sequence[str], cfg: KeywordsConfig = KeywordsC
     """
     norm_texts = [normalize_for_tfidf(t, keep_pos=("NOUN", "ADJF", "ADJS")) for t in texts]
 
+    if len(texts) < 3:
+        return _fallback_keywords(texts, cfg)
+
+    max_df = 1.0 if len(texts) < 5 else cfg.max_df
+
     vect = TfidfVectorizer(
         max_features=cfg.max_features,
         ngram_range=cfg.ngram_range,
         min_df=cfg.min_df,
-        max_df=cfg.max_df,
+        max_df=max_df,
     )
-    X = vect.fit_transform(norm_texts)
+    try:
+        X = vect.fit_transform(norm_texts)
+    except ValueError:
+        return _fallback_keywords(texts, cfg)
     feat = np.array(vect.get_feature_names_out())
 
     results: List[str] = []

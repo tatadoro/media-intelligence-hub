@@ -1,0 +1,26 @@
+{
+  "date": "2026-02-03",
+  "rss": {
+    "total": 48,
+    "lang_ok": 48,
+    "keyphrases_ok": 48,
+    "sentiment_ok": 48,
+    "lang_ok_ratio": 1.0,
+    "keyphrases_ok_ratio": 1.0,
+    "sentiment_ok_ratio": 1.0
+  },
+  "telegram": {
+    "total": 17,
+    "lang_ok": 17,
+    "keyphrases_ok": 17,
+    "sentiment_ok": 17,
+    "lang_ok_ratio": 1.0,
+    "keyphrases_ok_ratio": 1.0,
+    "sentiment_ok_ratio": 1.0
+  },
+  "thresholds": {
+    "lang_ok_ratio_min": 0.9,
+    "keyphrases_ok_ratio_min": 0.8,
+    "sentiment_ok_ratio_min": 0.15
+  }
+}

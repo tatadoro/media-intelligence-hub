@@ -250,7 +250,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--host", default=os.getenv("CH_HOST_DOCKER", "clickhouse"))
     p.add_argument("--port", type=int, default=int(os.getenv("CH_PORT_DOCKER", "8123")))
     p.add_argument("--user", default=os.getenv("CH_USER", "admin"))
-    p.add_argument("--password", default=os.getenv("CH_PASSWORD", "admin12345"))
+    p.add_argument("--password", default=os.getenv("CH_PASSWORD", ""))
     p.add_argument(
         "--no-load-log",
         action="store_true",
@@ -266,6 +266,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    if not args.password:
+        raise SystemExit(
+            "ClickHouse password is not set. Set CH_PASSWORD (or CLICKHOUSE_PASSWORD) in environment / .env."
+        )
 
     # clickhouse-client внутри контейнера: если ходим в тот же контейнер — лучше localhost + native port
     if args.host == args.container:

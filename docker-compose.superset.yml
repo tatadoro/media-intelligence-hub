@@ -42,9 +42,9 @@ services:
     environment:
       SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
 
-      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-change-me-please}
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:?set SUPERSET_SECRET_KEY in .env}
       SUPERSET_ADMIN_USERNAME: ${SUPERSET_ADMIN_USERNAME:-admin}
-      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD:-admin}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD:?set SUPERSET_ADMIN_PASSWORD in .env}
       SUPERSET_ADMIN_EMAIL: ${SUPERSET_ADMIN_EMAIL:-admin@example.com}
       SUPERSET_ADMIN_FIRSTNAME: ${SUPERSET_ADMIN_FIRSTNAME:-Superset}
       SUPERSET_ADMIN_LASTNAME: ${SUPERSET_ADMIN_LASTNAME:-Admin}
@@ -79,7 +79,7 @@ services:
     environment:
       SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
 
-      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-change-me-please}
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:?set SUPERSET_SECRET_KEY in .env}
 
       SQLALCHEMY_DATABASE_URI: >-
         postgresql+psycopg2://${SUPERSET_PG_USER:-superset}:${SUPERSET_PG_PASSWORD:-superset}@superset-postgres:5432/${SUPERSET_PG_DB:-superset}
