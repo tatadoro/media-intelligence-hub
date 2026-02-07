@@ -100,3 +100,8 @@ src/collectors/*.bak.*
 # offline wheels (kept outside git by default)
 vendor/wheels/**
 !vendor/wheels/.gitkeep
+# Local backups
+*.bak
+
+# Local wheels cache (UI offline)
+vendor/
