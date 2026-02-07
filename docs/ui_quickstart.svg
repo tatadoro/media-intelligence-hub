@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="220" viewBox="0 0 900 220" role="img" aria-label="UI quick start">
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="220" viewBox="0 0 980 220" role="img" aria-label="UI quick start">
   <style>
-    .box { fill: #f7f7f2; stroke: #1b1b1b; stroke-width: 2; rx: 10; }
+    .box { fill: #f7f7f2; stroke: #1b1b1b; stroke-width: 2; }
     .title { font: 600 16px "Helvetica Neue", Arial, sans-serif; fill: #1b1b1b; }
     .cmd { font: 13px "SFMono-Regular", Menlo, Consolas, monospace; fill: #1b1b1b; }
     .arrow { stroke: #1b1b1b; stroke-width: 2.5; marker-end: url(#arrowhead); }
@@ -11,19 +11,19 @@
     </marker>
   </defs>
 
-  <rect class="box" x="40" y="50" width="240" height="120" />
-  <text class="title" x="60" y="80">1) Prepare wheels</text>
-  <text class="cmd" x="60" y="108">bash scripts/build_ui_wheels.sh</text>
+  <rect class="box" x="30" y="50" width="260" height="120" rx="10" ry="10" />
+  <text class="title" x="50" y="80">1) Prepare wheels</text>
+  <text class="cmd" x="50" y="108">bash scripts/build_ui_wheels.sh</text>
 
-  <line class="arrow" x1="285" y1="110" x2="365" y2="110" />
+  <line class="arrow" x1="295" y1="110" x2="355" y2="110" />
 
-  <rect class="box" x="370" y="50" width="240" height="120" />
-  <text class="title" x="390" y="80">2) Check UI</text>
-  <text class="cmd" x="390" y="108">bash scripts/check_ui.sh</text>
+  <rect class="box" x="360" y="50" width="260" height="120" rx="10" ry="10" />
+  <text class="title" x="380" y="80">2) Check UI</text>
+  <text class="cmd" x="380" y="108">bash scripts/check_ui.sh</text>
 
-  <line class="arrow" x1="615" y1="110" x2="695" y2="110" />
+  <line class="arrow" x1="625" y1="110" x2="685" y2="110" />
 
-  <rect class="box" x="700" y="50" width="160" height="120" />
-  <text class="title" x="720" y="80">3) Run</text>
-  <text class="cmd" x="720" y="108">bash run_app.command</text>
-</svg>
+  <rect class="box" x="690" y="50" width="260" height="120" rx="10" ry="10" />
+  <text class="title" x="710" y="80">3) Run</text>
+  <text class="cmd" x="710" y="108">bash run_app.command</text>
+</svg> 
