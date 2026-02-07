@@ -272,6 +272,10 @@ UI редактирует файлы:
 Проверка локального UI (без сети):
 - `scripts/check_ui.sh`
 
+Проверка на утечки секретов (gitleaks):
+- `gitleaks detect --no-git --source . --config gitleaks.toml --report-format json --report-path /tmp/gitleaks-worktree.json`
+- `gitleaks detect --config gitleaks.toml --report-format json --report-path /tmp/gitleaks-history.json`
+
 
 
 ### Offline‑режим и безопасность
