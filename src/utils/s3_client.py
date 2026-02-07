@@ -4,8 +4,6 @@ import os
 import io
 import yaml
 import re
-import boto3
-from botocore.config import Config
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
@@ -59,6 +57,14 @@ MINIO_SECURE = (os.getenv("MINIO_SECURE") or _resolve(storage_cfg.get("secure", 
 
 def get_s3_client():
     """Создаём и возвращаем клиент S3 (MinIO) с параметрами из .env и settings.yaml."""
+    try:
+        import boto3
+        from botocore.config import Config
+    except Exception as e:
+        raise RuntimeError(
+            "boto3/botocore are required for S3/MinIO access. "
+            "Install requirements-base.txt or set RAW_BACKEND=local."
+        ) from e
     access_key = MINIO_ACCESS_KEY
     secret_key = MINIO_SECRET_KEY
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Set, Optional
+import os
 import re
 
 # --- optional morphology (better for Russian lexicon fallback) ---
@@ -97,12 +98,20 @@ _TF_PIPE = None
 _TF_AVAILABLE: Optional[bool] = None
 
 
+def _tf_disabled() -> bool:
+    v = os.getenv("MIH_DISABLE_TRANSFORMERS", "").strip().lower()
+    return v in {"1", "true", "yes"}
+
+
 def _get_tf_pipe():
     """
     Ленивая инициализация transformers pipeline.
     Возвращает None, если transformers/модель недоступны.
     """
     global _TF_PIPE, _TF_AVAILABLE
+    if _tf_disabled():
+        _TF_AVAILABLE = False
+        return None
     if _TF_AVAILABLE is False:
         return None
     if _TF_PIPE is not None:
@@ -192,6 +201,9 @@ def analyze_sentiment(
     toks = [m.group(0) for m in _TOKEN_RE.finditer(t)]
     if len(t) < min_chars or len(toks) < min_tokens:
         return SentimentResult("", None, False, None, "empty")
+
+    if _tf_disabled():
+        return _lexicon_sentiment(t)
 
     pipe = _get_tf_pipe()
     if pipe is None and force_transformers:

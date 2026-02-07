@@ -1,0 +1,9 @@
+streamlit>=1.31
+pandas
+PyYAML
+feedparser
+requests
+python-dotenv
+beautifulsoup4
+setuptools
+wheel

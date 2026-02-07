@@ -1,6 +1,7 @@
 # Virtual environments
 venv/
 .venv/
+.venv_ui/
 env/
 
 # Python cache / bytecode
@@ -91,3 +92,11 @@ telegram_channels.txt
 
 # local backups
 src/collectors/*.bak.*
+
+# local UI runtime
+.home/
+.streamlit/
+
+# offline wheels (kept outside git by default)
+vendor/wheels/**
+!vendor/wheels/.gitkeep

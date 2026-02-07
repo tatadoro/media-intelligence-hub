@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -191,6 +192,31 @@ def feed_to_dataframe(feed: feedparser.FeedParserDict, source_name: str) -> pd.D
         )
 
     return pd.DataFrame(items)
+
+
+def _norm_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def _log_raw_text_stats(df: pd.DataFrame, source_name: str) -> None:
+    if df.empty or "raw_text" not in df.columns or "title" not in df.columns:
+        return
+    raw = df["raw_text"].astype(str).apply(_norm_text)
+    title = df["title"].astype(str).apply(_norm_text)
+
+    total = int(len(df))
+    empty = int((raw == "").sum())
+    same_as_title = int((raw == title).sum())
+
+    print(
+        f"[RSS] raw_text stats for {source_name}: total={total}, "
+        f"empty={empty}, same_as_title={same_as_title}"
+    )
+    if total > 0 and same_as_title / total >= 0.8:
+        print(
+            "[WARN] raw_text mostly equals title. This RSS feed likely provides only titles/teasers. "
+            "Use raw->raw_enriched (body fetch) to get full text."
+        )
 
 
 def _looks_like_html(content: bytes) -> bool:
@@ -442,6 +468,7 @@ def main() -> None:
         raw_object_name = ""
 
         df = collect_one_source(session, name=name, url=url, http_cfg=http_cfg)
+        _log_raw_text_stats(df, source_name=name)
 
         print("[RSS] Converting feed to DataFrame ...")
         print(f"[RSS] Got {len(df)} items")
